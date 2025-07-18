@@ -5,7 +5,8 @@ library(ggplot2)
 library(knitr)
 
 # Function to detect outlier countries within each HS6 code
-detect_outlier_countries <- function(data, method = "all") {
+detect_outlier_countries <- function(data, method = "consensus", threshold_iqr = 1.5, 
+                                   threshold_z = 3, threshold_mad = 3.5) {
   
   # Calculate outlier metrics for each country-HS6 combination
   outlier_analysis <- data %>%
@@ -21,27 +22,40 @@ detect_outlier_countries <- function(data, method = "all") {
       q1 = quantile(unit_value, 0.25, na.rm = TRUE),
       q3 = quantile(unit_value, 0.75, na.rm = TRUE),
       iqr = q3 - q1,
-      lower_fence = q1 - 1.5 * iqr,
-      upper_fence = q3 + 1.5 * iqr,
+      lower_fence = q1 - threshold_iqr * iqr,
+      upper_fence = q3 + threshold_iqr * iqr,
       is_outlier_iqr = unit_value < lower_fence | unit_value > upper_fence,
       
       # Z-score method
       z_score = (unit_value - mean_uv) / sd_uv,
-      is_outlier_zscore = abs(z_score) > 3,
+      is_outlier_zscore = abs(z_score) > threshold_z,
       
       # Modified Z-score (MAD method)
       mad_uv = mad(unit_value, na.rm = TRUE),
       modified_z_score = ifelse(mad_uv > 0, 
                                 0.6745 * (unit_value - median_uv) / mad_uv, 
                                 0),
-      is_outlier_mad = abs(modified_z_score) > 3.5,
+      is_outlier_mad = abs(modified_z_score) > threshold_mad,
       
       # Deviation metrics
       pct_deviation_from_median = (unit_value - median_uv) / median_uv * 100,
       
       # Consensus outlier (flagged by at least 2 methods)
-      outlier_count = is_outlier_iqr + is_outlier_zscore + is_outlier_mad,
-      is_outlier = outlier_count >= 2
+      outlier_count = is_outlier_iqr + is_outlier_zscore + is_outlier_mad
+    )
+  
+  # Determine final outlier status based on method choice
+  outlier_analysis <- outlier_analysis %>%
+    mutate(
+      is_outlier = case_when(
+        method == "iqr" ~ is_outlier_iqr,
+        method == "zscore" ~ is_outlier_zscore,
+        method == "mad" ~ is_outlier_mad,
+        method == "consensus" ~ outlier_count >= 2,
+        method == "strict" ~ outlier_count == 3,
+        method == "any" ~ outlier_count >= 1,
+        TRUE ~ outlier_count >= 2  # default to consensus
+      )
     ) %>%
     ungroup()
   
@@ -53,8 +67,8 @@ create_outlier_report <- function(outlier_data) {
   
   # Report 1: Outlier countries by HS6
   outlier_countries_by_hs6 <- outlier_data %>%
-    filter(is_outlier) %>%
-    arrange(hs6, desc(abs(pct_deviation_from_median))) %>%
+    filter(.data$is_outlier == TRUE) %>%
+    arrange(.data$hs6, desc(abs(.data$pct_deviation_from_median))) %>%
     select(
       hs6, exporter, unit_value, median_uv, 
       pct_deviation_from_median, z_score, modified_z_score,
@@ -72,7 +86,7 @@ create_outlier_report <- function(outlier_data) {
     group_by(hs6) %>%
     summarise(
       n_exporters = n_distinct(exporter),
-      n_outlier_countries = sum(is_outlier),
+      n_outlier_countries = sum(.data$is_outlier, na.rm = TRUE),
       pct_outlier_countries = round(n_outlier_countries / n_exporters * 100, 1),
       median_unit_value = round(median(unit_value, na.rm = TRUE), 2),
       cv_unit_value = round(sd(unit_value, na.rm = TRUE) / mean(unit_value, na.rm = TRUE), 3),
@@ -88,11 +102,11 @@ create_outlier_report <- function(outlier_data) {
     group_by(exporter) %>%
     summarise(
       n_hs6_exported = n(),
-      n_times_outlier = sum(is_outlier),
+      n_times_outlier = sum(.data$is_outlier, na.rm = TRUE),
       pct_products_outlier = round(n_times_outlier / n_hs6_exported * 100, 1),
       avg_abs_deviation = round(mean(abs(pct_deviation_from_median), na.rm = TRUE), 1),
-      n_high_outlier = sum(is_outlier & pct_deviation_from_median > 0),
-      n_low_outlier = sum(is_outlier & pct_deviation_from_median < 0),
+      n_high_outlier = sum(.data$is_outlier & pct_deviation_from_median > 0, na.rm = TRUE),
+      n_low_outlier = sum(.data$is_outlier & pct_deviation_from_median < 0, na.rm = TRUE),
       total_trade_value = sum(value, na.rm = TRUE)
     ) %>%
     filter(n_times_outlier > 0) %>%
@@ -208,7 +222,7 @@ for (hs6_code in top_hs6_codes) {
 # Additional analysis: Bilateral outlier patterns
 # Check if certain country pairs consistently show outlier behavior
 bilateral_patterns <- outlier_results %>%
-  filter(is_outlier) %>%
+  filter(.data$is_outlier == TRUE) %>%
   group_by(exporter) %>%
   summarise(
     outlier_hs6_codes = paste(unique(hs6), collapse = ", "),
