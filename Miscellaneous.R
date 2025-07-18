@@ -66,9 +66,8 @@ detect_outlier_countries <- function(data, method = "consensus", threshold_iqr =
 create_outlier_report <- function(outlier_data) {
   
   # Report 1: Outlier countries by HS6
-  outlier_countries_by_hs6 <- outlier_data %>%
-    filter(.data$is_outlier == TRUE) %>%
-    arrange(.data$hs6, desc(abs(.data$pct_deviation_from_median))) %>%
+  outlier_countries_by_hs6 <- outlier_data[outlier_data$is_outlier == TRUE, ] %>%
+    arrange(hs6, desc(abs(pct_deviation_from_median))) %>%
     select(
       hs6, exporter, unit_value, median_uv, 
       pct_deviation_from_median, z_score, modified_z_score,
@@ -86,7 +85,7 @@ create_outlier_report <- function(outlier_data) {
     group_by(hs6) %>%
     summarise(
       n_exporters = n_distinct(exporter),
-      n_outlier_countries = sum(.data$is_outlier, na.rm = TRUE),
+      n_outlier_countries = sum(is_outlier, na.rm = TRUE),
       pct_outlier_countries = round(n_outlier_countries / n_exporters * 100, 1),
       median_unit_value = round(median(unit_value, na.rm = TRUE), 2),
       cv_unit_value = round(sd(unit_value, na.rm = TRUE) / mean(unit_value, na.rm = TRUE), 3),
@@ -102,11 +101,11 @@ create_outlier_report <- function(outlier_data) {
     group_by(exporter) %>%
     summarise(
       n_hs6_exported = n(),
-      n_times_outlier = sum(.data$is_outlier, na.rm = TRUE),
+      n_times_outlier = sum(is_outlier, na.rm = TRUE),
       pct_products_outlier = round(n_times_outlier / n_hs6_exported * 100, 1),
       avg_abs_deviation = round(mean(abs(pct_deviation_from_median), na.rm = TRUE), 1),
-      n_high_outlier = sum(.data$is_outlier & pct_deviation_from_median > 0, na.rm = TRUE),
-      n_low_outlier = sum(.data$is_outlier & pct_deviation_from_median < 0, na.rm = TRUE),
+      n_high_outlier = sum(is_outlier & pct_deviation_from_median > 0, na.rm = TRUE),
+      n_low_outlier = sum(is_outlier & pct_deviation_from_median < 0, na.rm = TRUE),
       total_trade_value = sum(value, na.rm = TRUE)
     ) %>%
     filter(n_times_outlier > 0) %>%
