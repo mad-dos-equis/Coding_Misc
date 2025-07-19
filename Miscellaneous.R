@@ -69,15 +69,22 @@ detect_outlier_countries <- function(data, method = "consensus", threshold_iqr =
 # Create focused report on U.S. outliers
 create_us_outlier_report <- function(outlier_data) {
   
+  # Check if description column exists
+  has_description <- "description" %in% names(outlier_data)
+  
   # Report 1: U.S. outlier products
   us_outliers <- outlier_data %>%
     filter(is_us_outlier) %>%
     arrange(desc(abs(pct_deviation_from_median))) %>%
-    select(
-      hs6, unit_value, median_uv, 
-      pct_deviation_from_median, z_score, modified_z_score,
-      value, quantity, n_exporters, outlier_count
-    ) %>%
+    {if(has_description) {
+      select(., hs6, description, unit_value, median_uv, 
+             pct_deviation_from_median, z_score, modified_z_score,
+             value, quantity, n_exporters, outlier_count)
+    } else {
+      select(., hs6, unit_value, median_uv, 
+             pct_deviation_from_median, z_score, modified_z_score,
+             value, quantity, n_exporters, outlier_count)
+    }} %>%
     mutate(
       outlier_direction = ifelse(pct_deviation_from_median > 0, 
                                 "Above Market", "Below Market"),
@@ -122,8 +129,13 @@ create_us_outlier_report <- function(outlier_data) {
   # Report 4: HS6 codes where U.S. is most unusual
   us_deviation_by_hs6 <- outlier_data %>%
     filter(is_us) %>%
-    select(hs6, unit_value, median_uv, pct_deviation_from_median, 
-           n_exporters, is_outlier, value) %>%
+    {if(has_description) {
+      select(., hs6, description, unit_value, median_uv, pct_deviation_from_median, 
+             n_exporters, is_outlier, value)
+    } else {
+      select(., hs6, unit_value, median_uv, pct_deviation_from_median, 
+             n_exporters, is_outlier, value)
+    }} %>%
     arrange(desc(abs(pct_deviation_from_median)))
   
   return(list(
@@ -148,8 +160,13 @@ plot_us_vs_others <- function(data, hs6_code, save_plot = FALSE) {
       label = ifelse(is_us | is_outlier, exporter, "")
     )
   
-  # Get US position
+  # Get US position and description if available
   us_data <- plot_data %>% filter(is_us)
+  description_text <- if("description" %in% names(plot_data)) {
+    unique(plot_data$description)[1]
+  } else {
+    ""
+  }
   
   p <- ggplot(plot_data, aes(x = reorder(exporter, unit_value), y = unit_value)) +
     geom_hline(yintercept = unique(plot_data$median_uv), 
@@ -176,9 +193,12 @@ plot_us_vs_others <- function(data, hs6_code, save_plot = FALSE) {
     ) +
     labs(
       title = paste("Unit Value Comparison for HS6:", hs6_code),
-      subtitle = paste("U.S. Price:", round(us_data$unit_value, 2), 
-                      "| Median:", round(unique(plot_data$median_uv), 2),
-                      "| U.S. Deviation:", round(us_data$pct_deviation_from_median, 1), "%"),
+      subtitle = paste(
+        if(description_text != "") paste0("Product: ", description_text, "\n") else "",
+        "U.S. Price:", round(us_data$unit_value, 2), 
+        "| Median:", round(unique(plot_data$median_uv), 2),
+        "| U.S. Deviation:", round(us_data$pct_deviation_from_median, 1), "%"
+      ),
       x = "Countries (ordered by unit value)",
       y = "Unit Value",
       color = "Country Type"
@@ -194,17 +214,33 @@ plot_us_vs_others <- function(data, hs6_code, save_plot = FALSE) {
 
 # Create a detailed comparison table for specific HS6
 create_hs6_comparison <- function(data, hs6_code) {
+  has_description <- "description" %in% names(data)
+  
   hs6_data <- data %>% 
     filter(hs6 == hs6_code) %>%
     arrange(desc(unit_value)) %>%
-    select(exporter, unit_value, value, quantity, 
-           pct_deviation_from_median, is_outlier) %>%
+    {if(has_description) {
+      select(., exporter, unit_value, value, quantity, 
+             pct_deviation_from_median, is_outlier, description)
+    } else {
+      select(., exporter, unit_value, value, quantity, 
+             pct_deviation_from_median, is_outlier)
+    }} %>%
     mutate(
       rank = row_number(),
       unit_value = round(unit_value, 2),
       pct_deviation = paste0(round(pct_deviation_from_median, 1), "%"),
       is_usa = exporter %in% c("United States", "USA", "US")
     )
+  
+  # Move description to the front if it exists
+  if(has_description) {
+    hs6_data <- hs6_data %>%
+      select(rank, exporter, description, everything())
+  } else {
+    hs6_data <- hs6_data %>%
+      select(rank, exporter, everything())
+  }
   
   return(hs6_data)
 }
@@ -234,7 +270,13 @@ cat("=== U.S. EXPORT PRICE ANALYSIS ===\n")
 print(us_reports$us_summary)
 
 cat("\n=== TOP 10 U.S. OUTLIER PRODUCTS ===\n")
-print(head(us_reports$us_outliers, 10))
+if("description" %in% names(us_reports$us_outliers)) {
+  print(us_reports$us_outliers %>% 
+          select(hs6, description, pct_deviation_from_median, outlier_direction, price_ratio) %>%
+          head(10))
+} else {
+  print(head(us_reports$us_outliers, 10))
+}
 
 cat("\n=== COUNTRY COMPARISON (Outlier Rates) ===\n")
 us_rank <- us_reports$country_comparison %>% 
@@ -259,6 +301,9 @@ if (nrow(us_reports$us_outliers) > 0) {
   comparison_table <- create_hs6_comparison(outlier_results, biggest_outlier_hs6)
   
   cat("\n=== DETAILED COMPARISON FOR HS6", biggest_outlier_hs6, "===\n")
+  if("description" %in% names(comparison_table)) {
+    cat("Product:", unique(comparison_table$description)[1], "\n")
+  }
   cat("Product where U.S. has largest deviation from market price\n")
   print(comparison_table)
 }
