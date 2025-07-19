@@ -2,212 +2,263 @@
 library(dplyr)
 library(tidyr)
 library(ggplot2)
+library(knitr)
 
-# Function to detect outlier HS6 products for a single exporter
-detect_outlier_products_single_country <- function(data, method = "all") {
+# Function to detect outlier countries within each HS6 code
+detect_outlier_countries <- function(data, method = "consensus", threshold_iqr = 1.5, 
+                                   threshold_z = 3, threshold_mad = 3.5) {
   
-  # Since we have one exporter, we look for outlier products instead
+  # Calculate outlier metrics for each country-HS6 combination
   outlier_analysis <- data %>%
+    group_by(hs6) %>%
     mutate(
-      # Log transform to handle skewed price distributions
-      log_unit_value = log(unit_value + 1),
+      # Basic statistics
+      n_exporters = n_distinct(exporter),
+      median_uv = median(unit_value, na.rm = TRUE),
+      mean_uv = mean(unit_value, na.rm = TRUE),
+      sd_uv = sd(unit_value, na.rm = TRUE),
       
-      # Overall statistics across all products
-      median_uv_all = median(unit_value, na.rm = TRUE),
-      mean_uv_all = mean(unit_value, na.rm = TRUE),
-      sd_uv_all = sd(unit_value, na.rm = TRUE),
-      
-      median_log_uv = median(log_unit_value, na.rm = TRUE),
-      mean_log_uv = mean(log_unit_value, na.rm = TRUE),
-      sd_log_uv = sd(log_unit_value, na.rm = TRUE),
-      
-      # IQR method on log scale
-      q1 = quantile(log_unit_value, 0.25, na.rm = TRUE),
-      q3 = quantile(log_unit_value, 0.75, na.rm = TRUE),
+      # IQR method
+      q1 = quantile(unit_value, 0.25, na.rm = TRUE),
+      q3 = quantile(unit_value, 0.75, na.rm = TRUE),
       iqr = q3 - q1,
-      lower_fence = q1 - 1.5 * iqr,
-      upper_fence = q3 + 1.5 * iqr,
-      is_outlier_iqr = log_unit_value < lower_fence | log_unit_value > upper_fence,
+      lower_fence = q1 - threshold_iqr * iqr,
+      upper_fence = q3 + threshold_iqr * iqr,
+      is_outlier_iqr = unit_value < lower_fence | unit_value > upper_fence,
       
-      # Z-score on log scale
-      z_score = (log_unit_value - mean_log_uv) / sd_log_uv,
-      is_outlier_zscore = abs(z_score) > 3,
+      # Z-score method
+      z_score = (unit_value - mean_uv) / sd_uv,
+      is_outlier_zscore = abs(z_score) > threshold_z,
       
-      # MAD on log scale
-      mad_log_uv = mad(log_unit_value, na.rm = TRUE),
-      modified_z_score = ifelse(mad_log_uv > 0, 
-                                0.6745 * (log_unit_value - median_log_uv) / mad_log_uv, 
+      # Modified Z-score (MAD method)
+      mad_uv = mad(unit_value, na.rm = TRUE),
+      modified_z_score = ifelse(mad_uv > 0, 
+                                0.6745 * (unit_value - median_uv) / mad_uv, 
                                 0),
-      is_outlier_mad = abs(modified_z_score) > 3.5,
+      is_outlier_mad = abs(modified_z_score) > threshold_mad,
       
       # Deviation metrics
-      pct_deviation_from_median = (unit_value - median_uv_all) / median_uv_all * 100,
+      pct_deviation_from_median = (unit_value - median_uv) / median_uv * 100,
       
-      # Consensus outlier
-      outlier_count = is_outlier_iqr + is_outlier_zscore + is_outlier_mad,
-      is_outlier = outlier_count >= 2
+      # Consensus outlier (flagged by at least 2 methods)
+      outlier_count = is_outlier_iqr + is_outlier_zscore + is_outlier_mad
     )
   
-  return(outlier_analysis)
-}
-
-# Function to detect outliers within product categories (2-digit HS)
-detect_outliers_by_category <- function(data) {
-  
-  # Extract 2-digit HS code for category grouping
-  data <- data %>%
-    mutate(hs2 = substr(hs6, 1, 2))
-  
-  outlier_analysis <- data %>%
-    group_by(hs2) %>%
+  # Determine final outlier status based on method choice
+  outlier_analysis <- outlier_analysis %>%
     mutate(
-      n_products_in_category = n(),
-      median_uv_category = median(unit_value, na.rm = TRUE),
-      mean_uv_category = mean(unit_value, na.rm = TRUE),
-      sd_uv_category = sd(unit_value, na.rm = TRUE),
-      
-      # Category-specific outlier detection
-      z_score_category = (unit_value - mean_uv_category) / sd_uv_category,
-      
-      # IQR within category
-      q1_cat = quantile(unit_value, 0.25, na.rm = TRUE),
-      q3_cat = quantile(unit_value, 0.75, na.rm = TRUE),
-      iqr_cat = q3_cat - q1_cat,
-      is_outlier_within_category = unit_value < (q1_cat - 1.5 * iqr_cat) | 
-                                   unit_value > (q3_cat + 1.5 * iqr_cat),
-      
-      pct_deviation_from_category = (unit_value - median_uv_category) / median_uv_category * 100
+      is_outlier = case_when(
+        method == "iqr" ~ is_outlier_iqr,
+        method == "zscore" ~ is_outlier_zscore,
+        method == "mad" ~ is_outlier_mad,
+        method == "consensus" ~ outlier_count >= 2,
+        method == "strict" ~ outlier_count == 3,
+        method == "any" ~ outlier_count >= 1,
+        TRUE ~ outlier_count >= 2  # default to consensus
+      ),
+      # Flag if this is a U.S. outlier
+      is_us = (exporter == "United States" | exporter == "USA" | 
+               exporter == "US" | exporter == "United States of America"),
+      is_us_outlier = is_us & is_outlier
     ) %>%
     ungroup()
   
   return(outlier_analysis)
 }
 
-# Create summary reports for single country analysis
-create_single_country_report <- function(outlier_data) {
+# Create focused report on U.S. outliers
+create_us_outlier_report <- function(outlier_data) {
   
-  # Report 1: Outlier products
-  outlier_products <- outlier_data %>%
-    filter(is_outlier) %>%
+  # Report 1: U.S. outlier products
+  us_outliers <- outlier_data %>%
+    filter(is_us_outlier) %>%
     arrange(desc(abs(pct_deviation_from_median))) %>%
-    select(hs6, unit_value, value, quantity, 
-           pct_deviation_from_median, z_score, outlier_count) %>%
+    select(
+      hs6, unit_value, median_uv, 
+      pct_deviation_from_median, z_score, modified_z_score,
+      value, quantity, n_exporters, outlier_count
+    ) %>%
     mutate(
-      outlier_type = ifelse(pct_deviation_from_median > 0, "Unusually High", "Unusually Low"),
+      outlier_direction = ifelse(pct_deviation_from_median > 0, 
+                                "Above Market", "Below Market"),
       pct_deviation_from_median = round(pct_deviation_from_median, 1),
-      z_score = round(z_score, 2)
+      z_score = round(z_score, 2),
+      modified_z_score = round(modified_z_score, 2),
+      price_ratio = round(unit_value / median_uv, 2)
     )
   
-  # Report 2: Summary statistics
-  summary_stats <- outlier_data %>%
+  # Report 2: Summary of U.S. performance
+  us_summary <- outlier_data %>%
+    filter(is_us) %>%
     summarise(
-      total_products = n(),
-      total_outliers = sum(is_outlier),
-      outlier_rate = round(total_outliers / total_products * 100, 2),
-      median_unit_value = median(unit_value, na.rm = TRUE),
-      mean_unit_value = mean(unit_value, na.rm = TRUE),
-      cv = sd(unit_value, na.rm = TRUE) / mean(unit_value, na.rm = TRUE)
+      total_hs6_exported = n(),
+      n_outlier_products = sum(is_outlier),
+      outlier_rate = round(n_outlier_products / total_hs6_exported * 100, 1),
+      n_above_market = sum(is_outlier & pct_deviation_from_median > 0),
+      n_below_market = sum(is_outlier & pct_deviation_from_median < 0),
+      avg_deviation_when_outlier = round(
+        mean(abs(pct_deviation_from_median[is_outlier]), na.rm = TRUE), 1
+      ),
+      total_trade_value = sum(value, na.rm = TRUE)
     )
   
-  # Report 3: Distribution of outlier scores
-  outlier_distribution <- table(outlier_data$outlier_count)
+  # Report 3: Comparison with other major exporters
+  country_comparison <- outlier_data %>%
+    group_by(exporter) %>%
+    summarise(
+      n_products = n(),
+      n_outliers = sum(is_outlier),
+      outlier_rate = round(n_outliers / n_products * 100, 1),
+      avg_abs_deviation = round(mean(abs(pct_deviation_from_median), na.rm = TRUE), 1),
+      total_value = sum(value, na.rm = TRUE)
+    ) %>%
+    filter(n_products >= 10) %>%  # Only countries with substantial exports
+    arrange(desc(outlier_rate)) %>%
+    mutate(
+      is_us = exporter %in% c("United States", "USA", "US", "United States of America"),
+      rank_by_outlier_rate = row_number()
+    )
+  
+  # Report 4: HS6 codes where U.S. is most unusual
+  us_deviation_by_hs6 <- outlier_data %>%
+    filter(is_us) %>%
+    select(hs6, unit_value, median_uv, pct_deviation_from_median, 
+           n_exporters, is_outlier, value) %>%
+    arrange(desc(abs(pct_deviation_from_median)))
   
   return(list(
-    outlier_products = outlier_products,
-    summary_stats = summary_stats,
-    outlier_distribution = outlier_distribution
+    us_outliers = us_outliers,
+    us_summary = us_summary,
+    country_comparison = country_comparison,
+    us_all_products = us_deviation_by_hs6
   ))
 }
 
-# Visualize price distribution
-plot_price_distribution <- function(data, log_scale = TRUE) {
+# Function to visualize U.S. vs others for specific HS6
+plot_us_vs_others <- function(data, hs6_code, save_plot = FALSE) {
   
-  if (log_scale) {
-    p <- ggplot(data, aes(x = log(unit_value + 1))) +
-      geom_histogram(bins = 50, fill = "skyblue", alpha = 0.7) +
-      geom_vline(xintercept = median(log(data$unit_value + 1)), 
-                 color = "red", linetype = "dashed") +
-      theme_minimal() +
-      labs(title = "Distribution of Log Unit Values",
-           subtitle = "Red line shows median",
-           x = "Log(Unit Value + 1)", y = "Count")
-  } else {
-    p <- ggplot(data, aes(x = unit_value)) +
-      geom_histogram(bins = 50, fill = "skyblue", alpha = 0.7) +
-      geom_vline(xintercept = median(data$unit_value), 
-                 color = "red", linetype = "dashed") +
-      theme_minimal() +
-      labs(title = "Distribution of Unit Values",
-           subtitle = "Red line shows median",
-           x = "Unit Value", y = "Count")
+  plot_data <- data %>% 
+    filter(hs6 == hs6_code) %>%
+    mutate(
+      country_type = case_when(
+        is_us ~ "United States",
+        is_outlier ~ "Other Outlier Countries",
+        TRUE ~ "Other Countries"
+      ),
+      label = ifelse(is_us | is_outlier, exporter, "")
+    )
+  
+  # Get US position
+  us_data <- plot_data %>% filter(is_us)
+  
+  p <- ggplot(plot_data, aes(x = reorder(exporter, unit_value), y = unit_value)) +
+    geom_hline(yintercept = unique(plot_data$median_uv), 
+               linetype = "dashed", color = "blue", alpha = 0.5) +
+    geom_hline(yintercept = unique(plot_data$lower_fence), 
+               linetype = "dotted", color = "gray", alpha = 0.5) +
+    geom_hline(yintercept = unique(plot_data$upper_fence), 
+               linetype = "dotted", color = "gray", alpha = 0.5) +
+    geom_point(aes(color = country_type, size = value), alpha = 0.7) +
+    geom_text(aes(label = label), vjust = -0.5, hjust = 0.5, 
+              angle = 45, size = 3) +
+    scale_color_manual(values = c(
+      "United States" = "red",
+      "Other Outlier Countries" = "orange", 
+      "Other Countries" = "gray60"
+    )) +
+    scale_size_continuous(name = "Trade Value", labels = scales::comma) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      legend.position = "bottom",
+      legend.box = "vertical"
+    ) +
+    labs(
+      title = paste("Unit Value Comparison for HS6:", hs6_code),
+      subtitle = paste("U.S. Price:", round(us_data$unit_value, 2), 
+                      "| Median:", round(unique(plot_data$median_uv), 2),
+                      "| U.S. Deviation:", round(us_data$pct_deviation_from_median, 1), "%"),
+      x = "Countries (ordered by unit value)",
+      y = "Unit Value",
+      color = "Country Type"
+    )
+  
+  if (save_plot) {
+    ggsave(paste0("us_vs_others_hs6_", hs6_code, ".png"), p, 
+           width = 10, height = 6, dpi = 300)
   }
   
   return(p)
 }
 
-# Time series analysis if you have temporal data
-analyze_temporal_outliers <- function(data, date_column = "date") {
-  if (date_column %in% names(data)) {
-    temporal_analysis <- data %>%
-      group_by(hs6) %>%
-      arrange(!!sym(date_column)) %>%
-      mutate(
-        # Calculate rolling statistics
-        rolling_mean = zoo::rollmean(unit_value, k = 3, fill = NA, align = "right"),
-        pct_change = (unit_value - lag(unit_value)) / lag(unit_value) * 100,
-        
-        # Flag sudden price changes
-        is_price_spike = abs(pct_change) > 50  # 50% change threshold
-      ) %>%
-      ungroup()
-    
-    return(temporal_analysis)
-  } else {
-    message("No date column found for temporal analysis")
-    return(data)
-  }
+# Create a detailed comparison table for specific HS6
+create_hs6_comparison <- function(data, hs6_code) {
+  hs6_data <- data %>% 
+    filter(hs6 == hs6_code) %>%
+    arrange(desc(unit_value)) %>%
+    select(exporter, unit_value, value, quantity, 
+           pct_deviation_from_median, is_outlier) %>%
+    mutate(
+      rank = row_number(),
+      unit_value = round(unit_value, 2),
+      pct_deviation = paste0(round(pct_deviation_from_median, 1), "%"),
+      is_usa = exporter %in% c("United States", "USA", "US")
+    )
+  
+  return(hs6_data)
 }
 
-# Main workflow for single country analysis
-# Assuming your U.S.-only data is in 'us_china_exports'
+# Main analysis workflow
+# Run the outlier detection on full dataset
+outlier_results <- detect_outlier_countries(china_imports)
 
-# Method 1: Detect outliers across all products
-outlier_results <- detect_outlier_products_single_country(us_china_exports)
-
-# Method 2: Detect outliers within product categories
-category_outliers <- detect_outliers_by_category(us_china_exports)
-
-# Generate reports
-single_country_report <- create_single_country_report(outlier_results)
+# Generate U.S.-focused reports
+us_reports <- create_us_outlier_report(outlier_results)
 
 # Export reports
-write.csv(single_country_report$outlier_products, 
+write.csv(us_reports$us_outliers, 
           "us_outlier_products.csv", 
           row.names = FALSE)
 
-# Visualize
-print(plot_price_distribution(us_china_exports, log_scale = TRUE))
+write.csv(us_reports$us_all_products, 
+          "us_all_products_comparison.csv", 
+          row.names = FALSE)
+
+write.csv(us_reports$country_comparison, 
+          "country_outlier_rates.csv", 
+          row.names = FALSE)
 
 # Print summary
-cat("=== U.S. EXPORT OUTLIER ANALYSIS ===\n")
-print(single_country_report$summary_stats)
-cat("\nDistribution of outlier scores:\n")
-print(single_country_report$outlier_distribution)
+cat("=== U.S. EXPORT PRICE ANALYSIS ===\n")
+print(us_reports$us_summary)
 
-# Top 10 most unusual products
-cat("\n=== TOP 10 MOST UNUSUAL PRODUCTS ===\n")
-print(head(single_country_report$outlier_products, 10))
+cat("\n=== TOP 10 U.S. OUTLIER PRODUCTS ===\n")
+print(head(us_reports$us_outliers, 10))
 
-# Analyze by category if needed
-category_summary <- category_outliers %>%
-  group_by(hs2) %>%
-  summarise(
-    n_products = n(),
-    n_outliers = sum(is_outlier_within_category),
-    median_price = median(unit_value),
-    cv = sd(unit_value) / mean(unit_value)
-  ) %>%
-  arrange(desc(n_outliers))
+cat("\n=== COUNTRY COMPARISON (Outlier Rates) ===\n")
+us_rank <- us_reports$country_comparison %>% 
+  filter(is_us) %>% 
+  pull(rank_by_outlier_rate)
+cat("U.S. ranks #", us_rank, " out of ", nrow(us_reports$country_comparison), 
+    " major exporters by outlier rate\n\n")
+print(head(us_reports$country_comparison, 10))
 
-cat("\n=== CATEGORIES WITH MOST OUTLIERS ===\n")
-print(head(category_summary, 10))
+# Visualize top U.S. outlier products
+if (nrow(us_reports$us_outliers) > 0) {
+  top_us_outlier_hs6 <- head(us_reports$us_outliers$hs6, 5)
+  for (hs6_code in top_us_outlier_hs6) {
+    p <- plot_us_vs_others(outlier_results, hs6_code, save_plot = TRUE)
+    print(p)
+  }
+}
+
+# Create detailed comparison for biggest U.S. outliers
+if (nrow(us_reports$us_outliers) > 0) {
+  biggest_outlier_hs6 <- us_reports$us_outliers$hs6[1]
+  comparison_table <- create_hs6_comparison(outlier_results, biggest_outlier_hs6)
+  
+  cat("\n=== DETAILED COMPARISON FOR HS6", biggest_outlier_hs6, "===\n")
+  cat("Product where U.S. has largest deviation from market price\n")
+  print(comparison_table)
+}
