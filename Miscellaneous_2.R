@@ -15,42 +15,77 @@ unit_conversion_factors <- data.frame(
   stringsAsFactors = FALSE
 )
 
-# Function to convert units to tons (only handles convertible units)
+# Vectorized function to convert units to tons (pipe-friendly)
 convert_to_tons <- function(value, unit) {
   # Convert unit to uppercase for matching
   unit <- toupper(unit)
   
-  # Find conversion factor
-  factor_idx <- which(unit_conversion_factors$unit == unit)
+  # Use match() for vectorized lookup
+  factor_idx <- match(unit, unit_conversion_factors$unit)
   
-  if (length(factor_idx) == 0) {
-    return(NA)  # Unit not convertible
-  }
+  # Get conversion factors (NA for non-matching units)
+  factors <- unit_conversion_factors$factor_to_tons[factor_idx]
   
-  factor <- unit_conversion_factors$factor_to_tons[factor_idx]
-  return(value * factor)
+  # Return converted values
+  return(value * factors)
 }
 
-# Function to convert a data frame column
-convert_trade_data_to_tons <- function(df, value_col, unit_col) {
-  # Create new column with tons
-  df$tons <- mapply(convert_to_tons, df[[value_col]], df[[unit_col]])
-  
-  # Add conversion status
-  df$conversion_status <- ifelse(is.na(df$tons), "Not convertible", "Converted")
-  
+# Alternative: Create a named vector for even faster lookup
+conversion_lookup <- setNames(
+  unit_conversion_factors$factor_to_tons, 
+  unit_conversion_factors$unit
+)
+
+convert_to_tons_fast <- function(value, unit) {
+  conversion_lookup[toupper(unit)] * value
+}
+
+# Pipe-friendly function that uses standard evaluation
+add_tons_column <- function(df, value_col, unit_col, tons_col = "tons", status_col = "conversion_status") {
+  # Use standard evaluation to access columns
+  df[[tons_col]] <- convert_to_tons(df[[value_col]], df[[unit_col]])
+  df[[status_col]] <- ifelse(is.na(df[[tons_col]]), "Not convertible", "Converted")
   return(df)
 }
 
-# Example usage:
-# sample_data <- data.frame(
-#   quantity = c(1000, 500, 2, 100, 50000),
-#   unit = c("KG", "GM", "T", "CKG", "CGM")
-# )
-# 
-# result <- convert_trade_data_to_tons(sample_data, "quantity", "unit")
-# print(result)
+# Example usage with dplyr:
+library(dplyr)
 
-# Show convertible units
-print("Convertible units:")
+# Sample data
+sample_data <- data.frame(
+  quantity = c(1000, 500, 2, 100, 50000, 75),
+  unit = c("KG", "GM", "T", "CKG", "CGM", "UNKNOWN")
+)
+
+# Method 1: Using mutate() with the vectorized function (recommended)
+result1 <- sample_data %>%
+  mutate(
+    tons = convert_to_tons(quantity, unit),
+    conversion_status = ifelse(is.na(tons), "Not convertible", "Converted")
+  )
+
+# Method 2: Using the pipe-friendly wrapper function
+result2 <- sample_data %>%
+  add_tons_column("quantity", "unit")
+
+# Method 3: Using the fast lookup version
+result3 <- sample_data %>%
+  mutate(
+    tons = convert_to_tons_fast(quantity, unit),
+    conversion_status = case_when(
+      is.na(tons) ~ "Not convertible",
+      TRUE ~ "Converted"
+    )
+  )
+
+print("Method 1 result:")
+print(result1)
+
+print("\nMethod 2 result:")
+print(result2)
+
+print("\nMethod 3 result:")
+print(result3)
+
+print("\nConvertible units:")
 print(unit_conversion_factors)
