@@ -18,6 +18,9 @@ detect_outlier_countries <- function(data, method = "consensus", threshold_iqr =
       mean_uv = mean(unit_value, na.rm = TRUE),
       sd_uv = sd(unit_value, na.rm = TRUE),
       
+      # Calculate percentile for each observation
+      percentile = round(percent_rank(unit_value) * 100, 1),
+      
       # IQR method
       q1 = quantile(unit_value, 0.25, na.rm = TRUE),
       q3 = quantile(unit_value, 0.75, na.rm = TRUE),
@@ -72,6 +75,10 @@ create_us_outlier_report <- function(outlier_data) {
   # Check if description column exists
   has_description <- "description" %in% names(outlier_data)
   
+  # Check for original unit and quantity columns
+  has_original_units <- all(c("UNIT1", "QTY1") %in% names(outlier_data))
+  has_second_units <- all(c("UNIT2", "QTY2") %in% names(outlier_data))
+  
   # First, calculate total value and quantity by HS6
   hs6_totals <- outlier_data %>%
     group_by(hs6) %>%
@@ -91,15 +98,49 @@ create_us_outlier_report <- function(outlier_data) {
     ) %>%
     arrange(desc(abs(pct_deviation_from_median))) %>%
     {if(has_description) {
-      select(., hs6, description, unit_value, median_uv, 
-             pct_deviation_from_median, z_score, modified_z_score,
-             value, quantity, us_value_share, us_quantity_share,
-             n_exporters, outlier_count)
+      if(has_original_units && has_second_units) {
+        select(., hs6, description, unit_value, median_uv, 
+               pct_deviation_from_median, percentile, z_score, modified_z_score,
+               is_outlier_iqr, is_outlier_zscore, is_outlier_mad,
+               value, quantity, UNIT1, QTY1, UNIT2, QTY2,
+               us_value_share, us_quantity_share,
+               n_exporters, outlier_count)
+      } else if(has_original_units) {
+        select(., hs6, description, unit_value, median_uv, 
+               pct_deviation_from_median, percentile, z_score, modified_z_score,
+               is_outlier_iqr, is_outlier_zscore, is_outlier_mad,
+               value, quantity, UNIT1, QTY1,
+               us_value_share, us_quantity_share,
+               n_exporters, outlier_count)
+      } else {
+        select(., hs6, description, unit_value, median_uv, 
+               pct_deviation_from_median, percentile, z_score, modified_z_score,
+               is_outlier_iqr, is_outlier_zscore, is_outlier_mad,
+               value, quantity, us_value_share, us_quantity_share,
+               n_exporters, outlier_count)
+      }
     } else {
-      select(., hs6, unit_value, median_uv, 
-             pct_deviation_from_median, z_score, modified_z_score,
-             value, quantity, us_value_share, us_quantity_share,
-             n_exporters, outlier_count)
+      if(has_original_units && has_second_units) {
+        select(., hs6, unit_value, median_uv, 
+               pct_deviation_from_median, percentile, z_score, modified_z_score,
+               is_outlier_iqr, is_outlier_zscore, is_outlier_mad,
+               value, quantity, UNIT1, QTY1, UNIT2, QTY2,
+               us_value_share, us_quantity_share,
+               n_exporters, outlier_count)
+      } else if(has_original_units) {
+        select(., hs6, unit_value, median_uv, 
+               pct_deviation_from_median, percentile, z_score, modified_z_score,
+               is_outlier_iqr, is_outlier_zscore, is_outlier_mad,
+               value, quantity, UNIT1, QTY1,
+               us_value_share, us_quantity_share,
+               n_exporters, outlier_count)
+      } else {
+        select(., hs6, unit_value, median_uv, 
+               pct_deviation_from_median, percentile, z_score, modified_z_score,
+               is_outlier_iqr, is_outlier_zscore, is_outlier_mad,
+               value, quantity, us_value_share, us_quantity_share,
+               n_exporters, outlier_count)
+      }
     }} %>%
     mutate(
       outlier_direction = ifelse(pct_deviation_from_median > 0, 
@@ -293,13 +334,15 @@ print(us_reports$us_summary)
 cat("\n=== TOP 10 U.S. OUTLIER PRODUCTS ===\n")
 if("description" %in% names(us_reports$us_outliers)) {
   print(us_reports$us_outliers %>% 
-          select(hs6, description, pct_deviation_from_median, outlier_direction, 
-                 price_ratio, us_value_share, us_quantity_share) %>%
+          select(hs6, description, pct_deviation_from_median, percentile,
+                 outlier_direction, price_ratio, us_value_share, us_quantity_share,
+                 is_outlier_iqr, is_outlier_zscore, is_outlier_mad) %>%
           head(10))
 } else {
   print(us_reports$us_outliers %>% 
-          select(hs6, pct_deviation_from_median, outlier_direction, 
-                 price_ratio, us_value_share, us_quantity_share) %>%
+          select(hs6, pct_deviation_from_median, percentile,
+                 outlier_direction, price_ratio, us_value_share, us_quantity_share,
+                 is_outlier_iqr, is_outlier_zscore, is_outlier_mad) %>%
           head(10))
 }
 
