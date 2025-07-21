@@ -72,18 +72,34 @@ create_us_outlier_report <- function(outlier_data) {
   # Check if description column exists
   has_description <- "description" %in% names(outlier_data)
   
-  # Report 1: U.S. outlier products
+  # First, calculate total value and quantity by HS6
+  hs6_totals <- outlier_data %>%
+    group_by(hs6) %>%
+    summarise(
+      total_value_hs6 = sum(value, na.rm = TRUE),
+      total_quantity_hs6 = sum(quantity, na.rm = TRUE),
+      .groups = 'drop'
+    )
+  
+  # Report 1: U.S. outlier products with trade shares
   us_outliers <- outlier_data %>%
     filter(is_us_outlier) %>%
+    left_join(hs6_totals, by = "hs6") %>%
+    mutate(
+      us_value_share = round((value / total_value_hs6) * 100, 2),
+      us_quantity_share = round((quantity / total_quantity_hs6) * 100, 2)
+    ) %>%
     arrange(desc(abs(pct_deviation_from_median))) %>%
     {if(has_description) {
       select(., hs6, description, unit_value, median_uv, 
              pct_deviation_from_median, z_score, modified_z_score,
-             value, quantity, n_exporters, outlier_count)
+             value, quantity, us_value_share, us_quantity_share,
+             n_exporters, outlier_count)
     } else {
       select(., hs6, unit_value, median_uv, 
              pct_deviation_from_median, z_score, modified_z_score,
-             value, quantity, n_exporters, outlier_count)
+             value, quantity, us_value_share, us_quantity_share,
+             n_exporters, outlier_count)
     }} %>%
     mutate(
       outlier_direction = ifelse(pct_deviation_from_median > 0, 
@@ -126,15 +142,20 @@ create_us_outlier_report <- function(outlier_data) {
       rank_by_outlier_rate = row_number()
     )
   
-  # Report 4: HS6 codes where U.S. is most unusual
+  # Report 4: HS6 codes where U.S. is most unusual (also with trade shares)
   us_deviation_by_hs6 <- outlier_data %>%
     filter(is_us) %>%
+    left_join(hs6_totals, by = "hs6") %>%
+    mutate(
+      us_value_share = round((value / total_value_hs6) * 100, 2),
+      us_quantity_share = round((quantity / total_quantity_hs6) * 100, 2)
+    ) %>%
     {if(has_description) {
       select(., hs6, description, unit_value, median_uv, pct_deviation_from_median, 
-             n_exporters, is_outlier, value)
+             n_exporters, is_outlier, value, us_value_share, us_quantity_share)
     } else {
       select(., hs6, unit_value, median_uv, pct_deviation_from_median, 
-             n_exporters, is_outlier, value)
+             n_exporters, is_outlier, value, us_value_share, us_quantity_share)
     }} %>%
     arrange(desc(abs(pct_deviation_from_median)))
   
@@ -272,10 +293,14 @@ print(us_reports$us_summary)
 cat("\n=== TOP 10 U.S. OUTLIER PRODUCTS ===\n")
 if("description" %in% names(us_reports$us_outliers)) {
   print(us_reports$us_outliers %>% 
-          select(hs6, description, pct_deviation_from_median, outlier_direction, price_ratio) %>%
+          select(hs6, description, pct_deviation_from_median, outlier_direction, 
+                 price_ratio, us_value_share, us_quantity_share) %>%
           head(10))
 } else {
-  print(head(us_reports$us_outliers, 10))
+  print(us_reports$us_outliers %>% 
+          select(hs6, pct_deviation_from_median, outlier_direction, 
+                 price_ratio, us_value_share, us_quantity_share) %>%
+          head(10))
 }
 
 cat("\n=== COUNTRY COMPARISON (Outlier Rates) ===\n")
