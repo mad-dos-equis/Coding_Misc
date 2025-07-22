@@ -15,10 +15,45 @@
 library(dplyr)      # data manipulation
 library(tidyr)      # data reshaping (crossing function)
 library(readr)      # CSV reading
-library(truncnorm)  # for truncated-normal parameter draws
-# library(MASS)    # uncomment if you want correlated mvrnorm draws
+# Removed truncnorm dependency - using base R instead
 
 set.seed(123)  # for reproducible Monte Carlo results
+
+# ── Helper Functions for Truncated Normal (Base R) ──────────────────────────
+# Function to generate truncated normal random variables using rejection sampling
+rtruncnorm_base <- function(n, a = -Inf, b = Inf, mean = 0, sd = 1) {
+  # Convert bounds to standard normal scale
+  a_std <- (a - mean) / sd
+  b_std <- (b - mean) / sd
+  
+  # Generate samples using rejection sampling
+  samples <- numeric(n)
+  for(i in 1:n) {
+    repeat {
+      # Draw from standard normal
+      z <- rnorm(1)
+      # Accept if within bounds
+      if(z >= a_std && z <= b_std) {
+        samples[i] <- mean + sd * z
+        break
+      }
+    }
+  }
+  return(samples)
+}
+
+# Alternative: Use inverse CDF method (more efficient for extreme truncations)
+rtruncnorm_invcdf <- function(n, a = -Inf, b = Inf, mean = 0, sd = 1) {
+  # Convert bounds to probabilities
+  p_a <- pnorm((a - mean) / sd)
+  p_b <- pnorm((b - mean) / sd)
+  
+  # Generate uniform random variables in [p_a, p_b]
+  u <- runif(n, min = p_a, max = p_b)
+  
+  # Convert back to truncated normal using inverse CDF
+  return(mean + sd * qnorm(u))
+}
 
 # ── 1. Load & prep panel ──────────────────────────
 # Load bilateral trade data and focus on Britain as importer
@@ -58,8 +93,10 @@ sims_base <- tibble(sim = 1:n_sims) %>%
     # Draw from truncated normal distributions to respect theoretical constraints
     # sigma > 1+epsilon ensures CES price index is well-defined
     # omega > epsilon ensures positive values (exact constraint depends on model)
-    sigma = rtruncnorm(n_sims, a = 1 + 1e-6, b = Inf, mean = sigma_hat, sd = sigma_se),
-    omega = rtruncnorm(n_sims, a = 1e-6,     b = Inf, mean = omega_hat, sd = omega_se),
+    
+    # Using inverse CDF method (most efficient for truncated normal)
+    sigma = rtruncnorm_invcdf(n_sims, a = 1 + 1e-6, b = Inf, mean = sigma_hat, sd = sigma_se),
+    omega = rtruncnorm_invcdf(n_sims, a = 1e-6,     b = Inf, mean = omega_hat, sd = omega_se),
     
     # Alternative: correlated parameter draws (more realistic but requires covariance matrix)
     # draws <- mvrnorm(n_sims, mu = c(sigma_hat, omega_hat), Sigma = cov_matrix)
