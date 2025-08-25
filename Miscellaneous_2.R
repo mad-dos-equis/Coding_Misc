@@ -339,10 +339,15 @@ calculate_elasticity_adjusted_complexity <- function(trade_data,
   
   adjusted_complexity <- base_results$product_complexity %>%
     mutate(
+      # Handle missing elasticities
+      avg_export_elasticity = replace_na(avg_export_elasticity, 1),
+      avg_import_elasticity = replace_na(avg_import_elasticity, -1),
       # Export adjustment: divide by elasticity (higher elasticity = lower complexity)
       pci_export_adjusted = pci_export / sqrt(abs(avg_export_elasticity)),
       # Import adjustment: multiply by absolute elasticity (higher = more essential)
-      pci_import_adjusted = pci_import * sqrt(abs(avg_import_elasticity)),
+      pci_import_adjusted = pci_import * sqrt(abs(avg_import_elasticity))
+    ) %>%
+    mutate(
       # Renormalize
       pci_export_adjusted = scale(pci_export_adjusted)[,1],
       pci_import_adjusted = scale(pci_import_adjusted)[,1],
