@@ -1,6 +1,6 @@
 # ============================================================================
 # BILATERAL PRODUCT COMPLEXITY INDEX (HIDALGO-HAUSMANN)
-# Lean R Implementation with Import/Export Statistics
+# Lean R Implementation for Pre-filtered Data
 # ============================================================================
 
 library(tidyverse)
@@ -79,27 +79,31 @@ method_of_reflections <- function(trade_matrix, iterations = 20, threshold = 1) 
 }
 
 # ============================================================================
-# MAIN WORKFLOW
+# MAIN FUNCTION
 # ============================================================================
 
 calculate_bilateral_complexity <- function(trade_data, 
-                                         subset_countries,
-                                         year_val,
+                                         year_val = NULL,
                                          iterations = 20,
                                          rca_threshold = 1) {
   
-  # Filter for subset and year
-  subset_data <- trade_data %>%
-    filter(year == year_val) %>%
-    filter(exporter %in% subset_countries | importer %in% subset_countries)
+  # Filter by year if specified
+  if(!is.null(year_val)) {
+    data_to_use <- trade_data %>%
+      filter(year == year_val)
+  } else {
+    data_to_use <- trade_data
+  }
   
-  # Create EXPORT matrix (what each country exports)
-  export_matrix <- subset_data %>%
-    filter(exporter %in% subset_countries) %>%
+  # Get all unique countries
+  all_exporters <- unique(data_to_use$exporter)
+  all_importers <- unique(data_to_use$importer)
+  
+  # Create EXPORT matrix
+  export_matrix <- data_to_use %>%
     group_by(exporter, commodity) %>%
     summarise(
       total_exports = sum(value),
-      avg_export_elasticity = weighted.mean(export_elasticity, value, na.rm = TRUE),
       .groups = 'drop'
     ) %>%
     pivot_wider(
@@ -111,13 +115,11 @@ calculate_bilateral_complexity <- function(trade_data,
     column_to_rownames("exporter") %>%
     as.matrix()
   
-  # Create IMPORT matrix (what each country imports)
-  import_matrix <- subset_data %>%
-    filter(importer %in% subset_countries) %>%
+  # Create IMPORT matrix
+  import_matrix <- data_to_use %>%
     group_by(importer, commodity) %>%
     summarise(
       total_imports = sum(value),
-      avg_import_elasticity = weighted.mean(import_elasticity, value, na.rm = TRUE),
       .groups = 'drop'
     ) %>%
     pivot_wider(
@@ -137,7 +139,7 @@ calculate_bilateral_complexity <- function(trade_data,
   # Calculate complexity for EXPORTS
   export_complexity <- method_of_reflections(export_matrix, iterations, rca_threshold)
   
-  # Calculate complexity for IMPORTS (import complexity)
+  # Calculate complexity for IMPORTS
   import_complexity <- method_of_reflections(import_matrix, iterations, rca_threshold)
   
   # Compile product-level results
@@ -155,25 +157,23 @@ calculate_bilateral_complexity <- function(trade_data,
   )
   
   # Add trade statistics
-  trade_stats <- subset_data %>%
+  trade_stats <- data_to_use %>%
     filter(commodity %in% common_products) %>%
     group_by(commodity) %>%
     summarise(
       # Export statistics
-      total_exports = sum(value[exporter %in% subset_countries]),
-      n_exporters = n_distinct(exporter[exporter %in% subset_countries & value > 0]),
-      avg_export_value = mean(value[exporter %in% subset_countries & value > 0]),
+      total_exports = sum(value[exporter %in% all_exporters]),
+      n_exporters = n_distinct(exporter[value > 0]),
+      avg_export_value = mean(value[value > 0]),
       # Import statistics
-      total_imports = sum(value[importer %in% subset_countries]),
-      n_importers = n_distinct(importer[importer %in% subset_countries & value > 0]),
-      avg_import_value = mean(value[importer %in% subset_countries & value > 0]),
+      total_imports = sum(value[importer %in% all_importers]),
+      n_importers = n_distinct(importer[value > 0]),
+      avg_import_value = mean(value[value > 0]),
       # Trade balance
       trade_balance = total_exports - total_imports,
-      # Elasticities
-      avg_export_elasticity = weighted.mean(export_elasticity[exporter %in% subset_countries], 
-                                           value[exporter %in% subset_countries], na.rm = TRUE),
-      avg_import_elasticity = weighted.mean(import_elasticity[importer %in% subset_countries], 
-                                           value[importer %in% subset_countries], na.rm = TRUE),
+      # Elasticities (if you want to keep them for analysis)
+      avg_export_elasticity = weighted.mean(export_elasticity, value, na.rm = TRUE),
+      avg_import_elasticity = weighted.mean(import_elasticity, value, na.rm = TRUE),
       .groups = 'drop'
     ) %>%
     rename(product = commodity)
@@ -182,7 +182,6 @@ calculate_bilateral_complexity <- function(trade_data,
     left_join(trade_stats, by = "product")
   
   # Compile country-level results
-  # Get export countries
   export_countries <- data.frame(
     country = rownames(export_matrix),
     eci_export = export_complexity$ECI,
@@ -192,7 +191,6 @@ calculate_bilateral_complexity <- function(trade_data,
     stringsAsFactors = FALSE
   )
   
-  # Get import countries  
   import_countries <- data.frame(
     country = rownames(import_matrix),
     eci_import = import_complexity$ECI,
@@ -226,43 +224,10 @@ calculate_bilateral_complexity <- function(trade_data,
 }
 
 # ============================================================================
-# COMPARISON ACROSS SUBSETS
-# ============================================================================
-
-compare_subset_complexity <- function(trade_data, 
-                                     subset_list,
-                                     year_val,
-                                     iterations = 20) {
-  
-  all_results <- list()
-  
-  for(subset_name in names(subset_list)) {
-    countries <- subset_list[[subset_name]]
-    
-    result <- calculate_bilateral_complexity(
-      trade_data = trade_data,
-      subset_countries = countries,
-      year_val = year_val,
-      iterations = iterations
-    )
-    
-    all_results[[subset_name]] <- result$product_complexity %>%
-      select(product, pci_export, pci_import, pci_combined) %>%
-      rename_with(~paste0(., "_", subset_name), -product)
-  }
-  
-  # Merge all results
-  comparison <- reduce(all_results, left_join, by = "product")
-  
-  return(comparison)
-}
-
-# ============================================================================
 # TEMPORAL ANALYSIS
 # ============================================================================
 
 calculate_temporal_complexity <- function(trade_data, 
-                                        subset_countries,
                                         years = NULL,
                                         iterations = 20) {
   
@@ -275,7 +240,6 @@ calculate_temporal_complexity <- function(trade_data,
   for(year in years) {
     result <- calculate_bilateral_complexity(
       trade_data = trade_data,
-      subset_countries = subset_countries,
       year_val = year,
       iterations = iterations
     )
@@ -317,170 +281,49 @@ calculate_temporal_complexity <- function(trade_data,
 }
 
 # ============================================================================
-# ELASTICITY-ADJUSTED COMPLEXITY
-# ============================================================================
-
-calculate_elasticity_adjusted_complexity <- function(trade_data,
-                                                    subset_countries,
-                                                    year_val,
-                                                    iterations = 20) {
-  
-  # Get base complexity
-  base_results <- calculate_bilateral_complexity(
-    trade_data = trade_data,
-    subset_countries = subset_countries,
-    year_val = year_val,
-    iterations = iterations
-  )
-  
-  # Adjust PCI by elasticities
-  # Logic: Higher export elasticity = more substitutable = less complex
-  #        Higher import elasticity (absolute) = more essential = more complex
-  
-  adjusted_complexity <- base_results$product_complexity %>%
-    mutate(
-      # Handle missing elasticities
-      avg_export_elasticity = replace_na(avg_export_elasticity, 1),
-      avg_import_elasticity = replace_na(avg_import_elasticity, -1),
-      # Export adjustment: divide by elasticity (higher elasticity = lower complexity)
-      pci_export_adjusted = pci_export / sqrt(abs(avg_export_elasticity)),
-      # Import adjustment: multiply by absolute elasticity (higher = more essential)
-      pci_import_adjusted = pci_import * sqrt(abs(avg_import_elasticity))
-    ) %>%
-    mutate(
-      # Renormalize
-      pci_export_adjusted = scale(pci_export_adjusted)[,1],
-      pci_import_adjusted = scale(pci_import_adjusted)[,1],
-      # Combined adjusted
-      pci_combined_adjusted = (pci_export_adjusted + pci_import_adjusted) / 2
-    )
-  
-  return(adjusted_complexity)
-}
-
-# ============================================================================
 # EXAMPLE USAGE
 # ============================================================================
 
-# Generate sample data for testing
-generate_sample_data <- function(n_countries = 15, n_products = 50, n_years = 3) {
-  set.seed(123)
-  
-  countries <- paste0("Country_", LETTERS[1:n_countries])
-  products <- paste0("HS_", sprintf("%04d", 1:n_products))
-  years <- 2021:2023
-  
-  # Create sparse trade matrix
-  data <- expand.grid(
-    importer = countries,
-    exporter = countries,
-    commodity = sample(products, 30),
-    year = years,
-    stringsAsFactors = FALSE
-  ) %>%
-    filter(importer != exporter) %>%
-    mutate(
-      value = ifelse(runif(n()) > 0.3, 
-                    abs(rnorm(n(), mean = 1000000, sd = 500000)), 
-                    0),
-      quantity = ifelse(value > 0, 
-                       abs(rnorm(n(), mean = 10000, sd = 5000)), 
-                       0),
-      import_share = runif(n(), 0, 0.1),
-      export_share = runif(n(), 0, 0.1),
-      import_elasticity = runif(n(), -2, -0.5),
-      export_elasticity = runif(n(), 0.5, 2)
-    )
-  
-  return(data)
-}
+# Example with your pre-filtered data
+# Assuming your data is already filtered to the countries/regions you want
 
-# Run example
-print("Generating sample data...")
-trade_data <- generate_sample_data()
+# Calculate complexity for a specific year
+# results <- calculate_bilateral_complexity(
+#   trade_data = your_filtered_data,
+#   year_val = 2023,
+#   iterations = 20
+# )
 
-# Define subsets
-subsets <- list(
-  "Region_A" = paste0("Country_", LETTERS[1:8]),
-  "Region_B" = paste0("Country_", LETTERS[9:15])
-)
+# Or calculate for all years in your data
+# results <- calculate_bilateral_complexity(
+#   trade_data = your_filtered_data,
+#   year_val = NULL,  # Uses all years
+#   iterations = 20
+# )
 
-# Calculate complexity for Region A
-print("\nCalculating bilateral complexity for Region A...")
-results <- calculate_bilateral_complexity(
-  trade_data = trade_data,
-  subset_countries = subsets$Region_A,
-  year_val = 2023,
-  iterations = 20
-)
+# Access the results
+# results$product_complexity  # Product-level complexity scores
+# results$country_complexity  # Country-level complexity scores
 
-# Display top complex products
-print("\nTop 10 Most Complex Products (Export-based):")
-results$product_complexity %>%
-  arrange(desc(pci_export)) %>%
-  select(product, pci_export, pci_import, pci_combined, 
-         total_exports, total_imports, n_exporters, n_importers) %>%
-  head(10) %>%
-  print()
+# Temporal analysis across multiple years
+# temporal <- calculate_temporal_complexity(
+#   trade_data = your_filtered_data,
+#   years = 2019:2023  # Or NULL for all years
+# )
 
-print("\nTop 10 Most Complex Products (Import-based):")
-results$product_complexity %>%
-  arrange(desc(pci_import)) %>%
-  select(product, pci_export, pci_import, pci_combined, 
-         total_exports, total_imports, n_exporters, n_importers) %>%
-  head(10) %>%
-  print()
+# Top complex products (export perspective)
+# results$product_complexity %>%
+#   arrange(desc(pci_export)) %>%
+#   select(product, pci_export, pci_import, pci_combined, 
+#          total_exports, total_imports, n_exporters, n_importers) %>%
+#   head(20)
 
-# Country complexity
-print("\nCountry Complexity Rankings:")
-results$country_complexity %>%
-  arrange(desc(eci_combined)) %>%
-  select(country, eci_export, eci_import, eci_combined, 
-         n_products_exported, n_products_imported, trade_balance) %>%
-  print()
+# Country rankings
+# results$country_complexity %>%
+#   arrange(desc(eci_combined)) %>%
+#   select(country, eci_export, eci_import, eci_combined, 
+#          n_products_exported, n_products_imported, trade_balance)
 
-# Compare regions
-print("\nComparing complexity across regions...")
-comparison <- compare_subset_complexity(
-  trade_data = trade_data,
-  subset_list = subsets,
-  year_val = 2023
-)
-
-# Products with largest complexity differences
-comparison %>%
-  mutate(diff = abs(pci_combined_Region_A - pci_combined_Region_B)) %>%
-  arrange(desc(diff)) %>%
-  head(10) %>%
-  print()
-
-# Temporal analysis
-print("\nCalculating temporal complexity evolution...")
-temporal <- calculate_temporal_complexity(
-  trade_data = trade_data,
-  subset_countries = subsets$Region_A,
-  years = 2021:2023
-)
-
-print("\nComplexity trends over time:")
-print(temporal$summary_stats)
-
-# Elasticity adjustment
-print("\nCalculating elasticity-adjusted complexity...")
-adjusted <- calculate_elasticity_adjusted_complexity(
-  trade_data = trade_data,
-  subset_countries = subsets$Region_A,
-  year_val = 2023
-)
-
-print("\nComparison: Base vs Elasticity-Adjusted Complexity (top products):")
-adjusted %>%
-  arrange(desc(pci_combined_adjusted)) %>%
-  select(product, pci_export, pci_export_adjusted, 
-         pci_import, pci_import_adjusted, 
-         pci_combined, pci_combined_adjusted,
-         avg_export_elasticity, avg_import_elasticity) %>%
-  head(10) %>%
-  print()
-
-print("\n=== Analysis Complete ===")
+print("Bilateral Complexity Analysis Functions Loaded")
+print("Main function: calculate_bilateral_complexity()")
+print("Your data should have columns: importer, exporter, commodity, year, value, quantity, import_share, export_share, import_elasticity, export_elasticity")
