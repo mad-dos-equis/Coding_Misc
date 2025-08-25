@@ -475,9 +475,11 @@ adjusted <- calculate_elasticity_adjusted_complexity(
 
 print("\nComparison: Base vs Elasticity-Adjusted Complexity (top products):")
 adjusted %>%
-  select(product, pci_export, pci_export_adjusted, 
-         pci_import, pci_import_adjusted, avg_export_elasticity, avg_import_elasticity) %>%
   arrange(desc(pci_combined_adjusted)) %>%
+  select(product, pci_export, pci_export_adjusted, 
+         pci_import, pci_import_adjusted, 
+         pci_combined, pci_combined_adjusted,
+         avg_export_elasticity, avg_import_elasticity) %>%
   head(10) %>%
   print()
 
