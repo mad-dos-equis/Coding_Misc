@@ -1,4 +1,31 @@
-# Full Iterative Bilateral Complexity Index
+# Simplified, more stable version with hard stops
+calculate_bilateral_complexity_stable <- function(trade_data, max_iterations = 20, tolerance = 1e-4, verbose = TRUE) {
+  
+  if(verbose) cat("Starting STABLE bilateral complexity calculation...\n")
+  
+  # Clean and prepare data
+  trade_clean <- trade_data %>%
+    filter(!is.na(import_share), !is.na(export_share),
+           !is.na(import_elasticity), !is.na(export_elasticity),
+           is.finite(import_share), is.finite(export_share),
+           is.finite(import_elasticity), is.finite(export_elasticity)) %>%
+    mutate(
+      # Ensure shares are between 0 and 1
+      import_share = pmax(0, pmin(1, import_share)),
+      export_share = pmax(0, pmin(1, export_share)),
+      # Simple elasticity factor
+      elasticity_factor = pmax(0.1, pmin(2, 1 / (1 + abs(import_elasticity + export_elasticity)))),
+      # Combined weight
+      weight = sqrt(import_share * export_share) * elasticity_factor
+    )
+  
+  if(verbose) cat("Cleaned data:", nrow(trade_clean), "flows\n")
+  
+  # Initialize
+  countries <- unique(c(trade_clean$exporter, trade_clean$importer))
+  commodities <- unique(trade_clean$commodity)
+  
+  if(verbose) cat("Countries:", length(countries), "| Commodities:", length(commodities), "\n# Full Iterative Bilateral Complexity Index
 library(dplyr)
 library(tidyr)
 library(ggplot2)
