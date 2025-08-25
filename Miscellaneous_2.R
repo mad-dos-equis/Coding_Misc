@@ -131,10 +131,26 @@ calculate_bilateral_complexity_full <- function(trade_data, max_iterations = 50,
     commodity_complexity <- setNames(commodity_updates$new_complexity, commodity_updates$commodity)
     country_complexity <- setNames(country_updates$total_complexity, country_updates$country)
     
-    # ====== NORMALIZATION ======
-    # Standardize to prevent explosion/implosion and maintain interpretability
-    commodity_complexity <- scale(commodity_complexity)[,1]
-    country_complexity <- scale(country_complexity)[,1]
+    # ====== ROBUST NORMALIZATION ======
+    # Handle infinite or NA values
+    commodity_complexity[is.infinite(commodity_complexity) | is.na(commodity_complexity)] <- 0.01
+    country_complexity[is.infinite(country_complexity) | is.na(country_complexity)] <- 0.01
+    
+    # Clip extreme values to prevent explosion
+    commodity_complexity <- pmax(pmin(commodity_complexity, 100), -100)
+    country_complexity <- pmax(pmin(country_complexity, 100), -100)
+    
+    # Standardize with robust scaling
+    if(sd(commodity_complexity, na.rm = TRUE) > 0) {
+      commodity_complexity <- scale(commodity_complexity)[,1]
+    }
+    if(sd(country_complexity, na.rm = TRUE) > 0) {
+      country_complexity <- scale(country_complexity)[,1]
+    }
+    
+    # Additional clipping after standardization
+    commodity_complexity <- pmax(pmin(commodity_complexity, 5), -5)
+    country_complexity <- pmax(pmin(country_complexity, 5), -5)
     
     # ====== CONVERGENCE CHECK ======
     country_change <- sqrt(mean((country_complexity - prev_country)^2, na.rm = TRUE))
