@@ -140,6 +140,10 @@ calculate_bilateral_complexity_full <- function(trade_data, max_iterations = 50,
     country_change <- sqrt(mean((country_complexity - prev_country)^2, na.rm = TRUE))
     commodity_change <- sqrt(mean((commodity_complexity - prev_commodity)^2, na.rm = TRUE))
     
+    # Handle potential NA values in convergence check
+    if(is.na(country_change)) country_change <- Inf
+    if(is.na(commodity_change)) commodity_change <- Inf
+    
     # Store convergence metrics
     convergence_history <- bind_rows(
       convergence_history,
@@ -156,10 +160,16 @@ calculate_bilateral_complexity_full <- function(trade_data, max_iterations = 50,
                   iter, country_change, commodity_change))
     }
     
-    # Check for convergence
-    if(country_change < tolerance && commodity_change < tolerance) {
+    # Check for convergence with NA protection
+    if(!is.na(country_change) && !is.na(commodity_change) && 
+       country_change < tolerance && commodity_change < tolerance) {
       if(verbose) cat(sprintf("\nConverged after %d iterations!\n", iter))
       break
+    }
+    
+    # Debug output if we hit NA values
+    if(is.infinite(country_change) || is.infinite(commodity_change)) {
+      if(verbose) cat(sprintf("Warning: NA values detected at iteration %d\n", iter))
     }
   }
   
@@ -271,14 +281,70 @@ analyze_complexity_results <- function(trade_data, results) {
   ))
 }
 
-# Example usage:
-# results <- calculate_bilateral_complexity_full(your_trade_data, verbose = TRUE)
-# 
-# # Plot convergence
-# plot_convergence(results)
-# 
-# # Analyze results
-# analysis <- analyze_complexity_results(your_trade_data, results)
-# 
-# # View top bilateral relationships
-# head(analysis$summary_stats$top_relationships, 10)
+# Diagnostic function to check your data before running the main algorithm
+diagnose_data <- function(trade_data) {
+  cat("=== DATA DIAGNOSTICS ===\n")
+  cat("Data dimensions:", nrow(trade_data), "rows,", ncol(trade_data), "columns\n")
+  
+  required_cols <- c("importer", "exporter", "commodity", "import_share", "export_share", 
+                     "import_elasticity", "export_elasticity")
+  
+  # Check column names
+  cat("\nColumn check:\n")
+  for(col in required_cols) {
+    if(col %in% names(trade_data)) {
+      cat("✓", col, "- found\n")
+    } else {
+      cat("✗", col, "- MISSING\n")
+    }
+  }
+  
+  # Check for NAs
+  cat("\nNA counts:\n")
+  na_counts <- trade_data %>% 
+    summarise_all(~sum(is.na(.))) %>%
+    pivot_longer(everything(), names_to = "column", values_to = "na_count") %>%
+    filter(na_count > 0)
+  
+  if(nrow(na_counts) > 0) {
+    print(na_counts)
+  } else {
+    cat("No NAs found in any column\n")
+  }
+  
+  # Check data ranges
+  if(all(required_cols %in% names(trade_data))) {
+    cat("\nData ranges:\n")
+    numeric_cols <- c("import_share", "export_share", "import_elasticity", "export_elasticity")
+    ranges <- trade_data[numeric_cols] %>%
+      summarise_all(list(min = ~min(., na.rm = TRUE), 
+                        max = ~max(., na.rm = TRUE),
+                        mean = ~mean(., na.rm = TRUE))) %>%
+      pivot_longer(everything(), names_to = "stat", values_to = "value") %>%
+      separate(stat, into = c("column", "statistic"), sep = "_(?=[^_]+$)") %>%
+      pivot_wider(names_from = statistic, values_from = value)
+    print(ranges)
+    
+    # Check for infinite values
+    cat("\nInfinite values:\n")
+    inf_counts <- trade_data[numeric_cols] %>%
+      summarise_all(~sum(is.infinite(.))) %>%
+      pivot_longer(everything(), names_to = "column", values_to = "inf_count") %>%
+      filter(inf_count > 0)
+    
+    if(nrow(inf_counts) > 0) {
+      print(inf_counts)
+    } else {
+      cat("No infinite values found\n")
+    }
+  }
+  
+  # Check unique counts
+  cat("\nUnique counts:\n")
+  cat("Countries (exporters):", length(unique(trade_data$exporter)), "\n")
+  cat("Countries (importers):", length(unique(trade_data$importer)), "\n")
+  cat("All countries:", length(unique(c(trade_data$exporter, trade_data$importer))), "\n")
+  cat("Commodities:", length(unique(trade_data$commodity)), "\n")
+  
+  return(invisible(trade_data))
+}
