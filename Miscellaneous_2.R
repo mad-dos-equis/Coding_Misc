@@ -18,15 +18,28 @@ test_data_setup <- function() {
   missing_cols <- setdiff(c(CAR_LOCATION_COL, CAR_ID_COL, MEASUREMENT_COLS), colnames(car_data))
   if(length(missing_cols) > 0) {
     cat("ERROR: Missing columns in car_data:", paste(missing_cols, collapse = ", "), "\n")
+    cat("Available columns:", paste(colnames(car_data), collapse = ", "), "\n")
     return(FALSE)
   }
   
   if(!SHAPEFILE_LOCATION_COL %in% colnames(shapefile_data)) {
     cat("ERROR: Missing column in shapefile_data:", SHAPEFILE_LOCATION_COL, "\n")
+    cat("Available columns:", paste(colnames(shapefile_data), collapse = ", "), "\n")
     return(FALSE)
   }
   
   cat("✓ All required columns exist\n")
+  
+  # Check for column name conflicts between datasets
+  car_cols <- colnames(car_data)
+  shape_cols <- colnames(shapefile_data)
+  conflicts <- intersect(car_cols, shape_cols)
+  conflicts <- conflicts[!conflicts %in% c(CAR_LOCATION_COL, SHAPEFILE_LOCATION_COL)]  # Exclude join columns
+  
+  if(length(conflicts) > 0) {
+    cat("WARNING: Column name conflicts found:", paste(conflicts, collapse = ", "), "\n")
+    cat("These columns exist in both datasets and may cause join issues\n")
+  }
   
   # Test data joining
   test_car <- unique(car_data[[CAR_ID_COL]])[1]
@@ -39,17 +52,24 @@ test_data_setup <- function() {
   cat("Car data locations (first 10):", paste(head(car_locs, 10), collapse = ", "), "\n")
   cat("Shapefile locations (first 10):", paste(head(shape_locs, 10), collapse = ", "), "\n")
   
-  # Check for matches
+  # Check for exact matches
   matches <- intersect(car_locs, shape_locs)
-  cat("Matching locations:", length(matches), "out of", length(car_locs), "car locations\n")
+  cat("Exact matching locations:", length(matches), "out of", length(car_locs), "car locations\n")
   
   if(length(matches) == 0) {
     cat("ERROR: No matching locations found between datasets!\n")
     cat("This is likely the cause of the 'no data available' message.\n")
-    cat("Check for:\n")
-    cat("  - Different spelling or casing\n")
-    cat("  - Extra spaces or special characters\n")
-    cat("  - Different location naming conventions\n")
+    
+    # Try to find similar names
+    cat("Trying fuzzy matching to find similar names...\n")
+    for(car_loc in head(car_locs, 5)) {
+      distances <- sapply(shape_locs, function(s) {
+        # Simple character distance check
+        sum(strsplit(tolower(car_loc), "")[[1]] %in% strsplit(tolower(s), "")[[1]])
+      })
+      best_match <- shape_locs[which.max(distances)]
+      cat("  '", car_loc, "' might match '", best_match, "'\n")
+    }
     return(FALSE)
   }
   
@@ -57,26 +77,35 @@ test_data_setup <- function() {
   cat("Testing data merge...\n")
   test_merged <- prepare_map_data(shapefile_data, car_data, test_car)
   
-  # Check results
-  valid_measurements <- sapply(MEASUREMENT_COLS, function(col) {
+  # Check that measurement columns made it through
+  cat("Checking measurement columns in merged data...\n")
+  for(col in MEASUREMENT_COLS) {
     if(col %in% colnames(test_merged)) {
-      sum(!is.na(test_merged[[col]]))
+      valid_count <- sum(!is.na(test_merged[[col]]))
+      cat("  ✓", col, ":", valid_count, "valid values\n")
     } else {
-      0
+      cat("  ✗", col, ": MISSING from merged data\n")
     }
-  })
-  
-  cat("Valid measurements after merge:\n")
-  for(i in seq_along(valid_measurements)) {
-    cat("  ", names(valid_measurements)[i], ":", valid_measurements[i], "\n")
   }
   
-  if(all(valid_measurements == 0)) {
+  # Final check
+  measurement_columns_present <- all(MEASUREMENT_COLS %in% colnames(test_merged))
+  any_valid_data <- any(sapply(MEASUREMENT_COLS, function(col) {
+    if(col %in% colnames(test_merged)) sum(!is.na(test_merged[[col]])) > 0 else FALSE
+  }))
+  
+  if(!measurement_columns_present) {
+    cat("ERROR: Some measurement columns missing from merged data\n")
+    return(FALSE)
+  }
+  
+  if(!any_valid_data) {
     cat("ERROR: No valid measurement data after merge\n")
     return(FALSE)
   }
   
   cat("✓ Data setup appears to be working!\n")
+  cat("Ready to run the Shiny app\n")
   return(TRUE)
 }# Helper functions for debugging
 debug_shapefile <- function(shapefile_data) {
@@ -174,10 +203,10 @@ CAR_LOCATION_COL <- "location_id"     # Column with location identifiers
 CAR_ID_COL <- "car_id"               # Column with car identifiers  
 
 # Measurement columns (all numeric columns you want to visualize)
-# List all the measurement columns in your dataset that you want to be selectable
-MEASUREMENT_COLS <- c("value", "price", "mileage", "age", "maintenance_cost")  # Update with your actual columns
+# *** REPLACE THESE WITH YOUR ACTUAL COLUMN NAMES ***
+MEASUREMENT_COLS <- c("value", "price", "mileage", "age", "maintenance_cost")
 
-# You can also specify display names for better UI (optional)
+# Display names for better UI (optional) - format: actual_column_name = "Display Name"
 MEASUREMENT_DISPLAY_NAMES <- c(
   "value" = "Car Value ($)",
   "price" = "Purchase Price ($)", 
@@ -186,7 +215,7 @@ MEASUREMENT_DISPLAY_NAMES <- c(
   "maintenance_cost" = "Maintenance Cost ($)"
 )
 
-# Default measurement to show on startup
+# Default measurement to show on startup - must match one of MEASUREMENT_COLS
 DEFAULT_MEASUREMENT <- "value"
 
 # Column names in your shapefile dataset
@@ -230,11 +259,18 @@ prepare_map_data <- function(shapefile_data, car_data, selected_car) {
     filter(.data[[CAR_ID_COL]] == selected_car)
   
   cat("Filtered car data rows:", nrow(filtered_data), "\n")
+  cat("Columns in filtered data:", paste(colnames(filtered_data), collapse = ", "), "\n")
   
   if(nrow(filtered_data) == 0) {
     cat("ERROR: No data found for car:", selected_car, "\n")
     cat("Available cars:", paste(head(unique(car_data[[CAR_ID_COL]]), 10), collapse = ", "), "\n")
-    return(shapefile_data %>% mutate(across(all_of(MEASUREMENT_COLS), ~ NA_real_)))
+    
+    # Return shapefile with empty measurement columns
+    result <- shapefile_data
+    for(col in MEASUREMENT_COLS) {
+      result[[col]] <- NA_real_
+    }
+    return(result)
   }
   
   # Show sample of locations from both datasets
@@ -244,20 +280,49 @@ prepare_map_data <- function(shapefile_data, car_data, selected_car) {
   cat("Sample car locations:", paste(head(car_locations, 5), collapse = ", "), "\n")
   cat("Sample shapefile locations:", paste(head(shape_locations, 5), collapse = ", "), "\n")
   
+  # Check for exact matches
+  matching_locations <- intersect(car_locations, shape_locations)
+  cat("Matching locations found:", length(matching_locations), "\n")
+  
+  if(length(matching_locations) > 0) {
+    cat("Example matches:", paste(head(matching_locations, 3), collapse = ", "), "\n")
+  } else {
+    cat("WARNING: No exact location matches found!\n")
+    cat("Trying case-insensitive matching...\n")
+    
+    # Try case-insensitive matching
+    car_locs_lower <- tolower(trimws(car_locations))
+    shape_locs_lower <- tolower(trimws(shape_locations))
+    case_matches <- intersect(car_locs_lower, shape_locs_lower)
+    cat("Case-insensitive matches:", length(case_matches), "\n")
+  }
+  
   # Merge with shapefile using parameterized column names
   join_vars <- setNames(CAR_LOCATION_COL, SHAPEFILE_LOCATION_COL)
   cat("Join variables:", paste(names(join_vars), "=", join_vars), "\n")
   
+  # Ensure we're selecting all needed columns from filtered_data
+  columns_to_join <- c(CAR_LOCATION_COL, CAR_ID_COL, MEASUREMENT_COLS)
+  existing_columns <- intersect(columns_to_join, colnames(filtered_data))
+  cat("Columns being joined:", paste(existing_columns, collapse = ", "), "\n")
+  
+  # Select only the columns we need from filtered_data to avoid conflicts
+  filtered_data_clean <- filtered_data %>%
+    select(all_of(existing_columns))
+  
   merged_data <- shapefile_data %>%
-    left_join(filtered_data, by = join_vars)
+    left_join(filtered_data_clean, by = join_vars)
   
   cat("Merged data rows:", nrow(merged_data), "\n")
+  cat("Columns in merged data:", paste(colnames(merged_data), collapse = ", "), "\n")
   
   # Check how many locations got data
   for(col in MEASUREMENT_COLS) {
     if(col %in% colnames(merged_data)) {
       non_na_count <- sum(!is.na(merged_data[[col]]))
       cat("Non-NA values in", col, ":", non_na_count, "\n")
+    } else {
+      cat("WARNING: Column", col, "not found in merged data\n")
     }
   }
   
@@ -276,21 +341,20 @@ ui <- fluidPage(
                   choices = MEASUREMENT_DISPLAY_NAMES,
                   selected = DEFAULT_MEASUREMENT),
       
-      # Car selection dropdown with server-side selectize for performance
-      if(length(unique(car_data[[CAR_ID_COL]])) > MAX_CARS_FOR_DROPDOWN) {
-        selectizeInput("selected_car",
-                      "Select Car:",
-                      choices = NULL,  # Will be populated server-side
-                      options = list(
-                        placeholder = "Type to search cars...",
-                        maxOptions = 50  # Show max 50 options at a time
-                      ))
-      } else {
-        selectInput("selected_car",
-                   "Select Car:",
-                   choices = unique(car_data[[CAR_ID_COL]]),
-                   selected = unique(car_data[[CAR_ID_COL]])[1])
-      },
+      # Car selection dropdown - always use server-side selectize for performance
+      selectizeInput("selected_car",
+                    "Select Car:",
+                    choices = NULL,  # Populated server-side for better performance
+                    options = list(
+                      placeholder = "Type to search cars...",
+                      maxOptions = 100,  # Show more options at once
+                      searchField = c('value', 'text'),
+                      render = I('{
+                        option: function(item, escape) {
+                          return "<div>" + escape(item.value) + "</div>";
+                        }
+                      }')
+                    )),
       
       # Conditional value range filter
       conditionalPanel(
@@ -342,13 +406,11 @@ ui <- fluidPage(
 # Define server logic
 server <- function(input, output, session) {
   
-  # Server-side selectize for large datasets
-  if(length(unique(car_data[[CAR_ID_COL]])) > MAX_CARS_FOR_DROPDOWN) {
-    updateSelectizeInput(session, "selected_car", 
-                        choices = unique(car_data[[CAR_ID_COL]]), 
-                        selected = unique(car_data[[CAR_ID_COL]])[1],
-                        server = TRUE)
-  }
+  # Always use server-side selectize for better performance
+  updateSelectizeInput(session, "selected_car", 
+                      choices = unique(car_data[[CAR_ID_COL]]), 
+                      selected = unique(car_data[[CAR_ID_COL]])[1],
+                      server = TRUE)
   
   # Determine if slider should be shown based on data size
   output$show_slider <- reactive({
@@ -362,16 +424,22 @@ server <- function(input, output, session) {
     
     if(nrow(car_data) <= MAX_LOCATIONS_FOR_SLIDER) {
       current_col <- input$selected_measurement
-      min_val <- min(car_data[[current_col]], na.rm = TRUE)
-      max_val <- max(car_data[[current_col]], na.rm = TRUE)
-      step_val <- max(1, round((max_val - min_val) / 1000))
       
-      updateSliderInput(session, "value_range",
-                       label = paste(MEASUREMENT_DISPLAY_NAMES[current_col], "Range:"),
-                       min = min_val,
-                       max = max_val,
-                       value = c(min_val, max_val),
-                       step = step_val)
+      # Get min/max from the entire dataset for this measurement
+      all_values <- car_data[[current_col]][!is.na(car_data[[current_col]])]
+      
+      if(length(all_values) > 0) {
+        min_val <- min(all_values)
+        max_val <- max(all_values)
+        step_val <- max(1, round((max_val - min_val) / 1000))
+        
+        updateSliderInput(session, "value_range",
+                         label = paste(MEASUREMENT_DISPLAY_NAMES[current_col], "Range:"),
+                         min = min_val,
+                         max = max_val,
+                         value = c(min_val, max_val),
+                         step = step_val)
+      }
     }
   })
   
@@ -379,13 +447,7 @@ server <- function(input, output, session) {
   map_data <- reactive({
     req(input$selected_car, input$selected_measurement)
     
-    cat("\n=== MAP_DATA REACTIVE DEBUG ===\n")
-    cat("Selected car:", input$selected_car, "\n")
-    cat("Selected measurement:", input$selected_measurement, "\n")
-    
     data <- prepare_map_data(shapefile_data, car_data, input$selected_car)
-    
-    cat("Data after prepare_map_data:", nrow(data), "rows\n")
     
     # Apply value range filter only if slider exists and is available
     if(nrow(car_data) <= MAX_LOCATIONS_FOR_SLIDER && !is.null(input$value_range)) {
@@ -394,23 +456,10 @@ server <- function(input, output, session) {
       if(current_col %in% colnames(data)) {
         before_filter <- nrow(data)
         data <- data %>%
-          filter(.data[[current_col]] >= input$value_range[1] & 
-                 .data[[current_col]] <= input$value_range[2])
-        cat("After range filter:", nrow(data), "rows (was", before_filter, ")\n")
-      } else {
-        cat("WARNING: Column", current_col, "not found in merged data\n")
-        cat("Available columns:", paste(colnames(data), collapse = ", "), "\n")
+          filter(is.na(.data[[current_col]]) | 
+                 (.data[[current_col]] >= input$value_range[1] & 
+                  .data[[current_col]] <= input$value_range[2]))
       }
-    } else {
-      cat("Range filter skipped (large dataset or no slider input)\n")
-    }
-    
-    # Final check
-    if(input$selected_measurement %in% colnames(data)) {
-      valid_rows <- sum(!is.na(data[[input$selected_measurement]]))
-      cat("Final data: ", nrow(data), "total rows,", valid_rows, "with valid", input$selected_measurement, "values\n")
-    } else {
-      cat("ERROR: Selected measurement column not in final data\n")
     }
     
     return(data)
@@ -423,102 +472,83 @@ server <- function(input, output, session) {
     current_col <- input$selected_measurement
     display_name <- MEASUREMENT_DISPLAY_NAMES[current_col]
     
-    cat("\n=== PLOTLY RENDER DEBUG ===\n")
-    cat("Render data rows:", nrow(data), "\n")
-    cat("Current column:", current_col, "\n")
-    cat("Display name:", display_name, "\n")
-    
-    # Check if column exists
     if(!current_col %in% colnames(data)) {
-      cat("ERROR: Column", current_col, "not in data. Available:", paste(colnames(data), collapse = ", "), "\n")
-      return(plotly_empty() %>% layout(title = list(text = paste("Column", current_col, "not found"), font = list(size = 16))))
+      return(plotly_empty() %>% 
+        layout(title = list(text = paste("Column", current_col, "not found"), font = list(size = 16))))
     }
     
     # Check for valid data
     valid_data_count <- sum(!is.na(data[[current_col]]))
-    cat("Valid data count:", valid_data_count, "\n")
     
     if (nrow(data) > 0 && valid_data_count > 0) {
-      # Transform to WGS84 if needed for better plotly compatibility
+      # Get the range of values for proper color scaling
+      value_range <- range(data[[current_col]], na.rm = TRUE)
+      
+      # Transform to WGS84 if needed
       if(!is.na(st_crs(data)$input) && st_crs(data)$input != "EPSG:4326") {
         tryCatch({
           data <- st_transform(data, 4326)
-          cat("Transformed to WGS84\n")
         }, error = function(e) {
           cat("CRS transformation failed:", e$message, "\n")
         })
       }
       
-      # Calculate bounds for initial view
-      tryCatch({
-        bbox <- st_bbox(data)
-        cat("Bounds:", paste(names(bbox), bbox, sep="=", collapse=", "), "\n")
-        
-        # Create the base ggplot using parameterized column names
-        p <- ggplot(data) +
-          geom_sf(aes(fill = .data[[current_col]], 
-                     text = paste0("Location: ", .data[[SHAPEFILE_LOCATION_COL]],
-                                 "<br>Car: ", input$selected_car,
-                                 "<br>", display_name, ": ", 
-                                 if(grepl("\\$", display_name)) {
-                                   paste0("$", format(round(.data[[current_col]], 0), big.mark = ",", scientific = FALSE))
-                                 } else {
-                                   format(round(.data[[current_col]], 2), big.mark = ",", scientific = FALSE)
-                                 })),
-                 color = if(input$show_borders) "white" else NA, 
-                 size = if(input$show_borders) 0.3 else 0) +
-          scale_fill_viridis_c(name = display_name, 
-                             na.value = "grey90",
-                             option = input$color_scheme,
-                             labels = function(x) {
+      # Create the base ggplot - fix the color mapping issue
+      p <- ggplot(data) +
+        geom_sf(aes(fill = !!sym(current_col),  # Use !! and sym() for proper column reference
+                   text = paste0("Location: ", !!sym(SHAPEFILE_LOCATION_COL),
+                               "<br>Car: ", input$selected_car,
+                               "<br>", display_name, ": ", 
                                if(grepl("\\$", display_name)) {
-                                 paste0("$", format(x, big.mark = ",", scientific = FALSE))
+                                 paste0("$", format(round(!!sym(current_col), 0), big.mark = ",", scientific = FALSE))
                                } else {
-                                 format(x, big.mark = ",", scientific = FALSE)
-                               }
-                             }) +
-          theme_void() +
-          theme(
-            legend.position = "right",
-            legend.title = element_text(size = 10),
-            plot.title = element_text(size = 14, hjust = 0.5, margin = margin(b = 20)),
-            axis.text = element_blank(),
-            axis.ticks = element_blank(),
-            panel.grid = element_blank()
-          ) +
-          labs(title = paste(display_name, "for", input$selected_car)) +
-          coord_sf(expand = FALSE, crs = st_crs(4326))  # Explicitly set CRS
-        
-        cat("ggplot object created\n")
-        
-        # Convert to plotly with custom configuration
-        plotly_obj <- ggplotly(p, tooltip = "text") %>%
-          config(
-            displayModeBar = TRUE,
-            modeBarButtonsToRemove = c("pan2d", "select2d", "lasso2d", "autoScale2d", 
-                                     "hoverClosestCartesian", "hoverCompareCartesian"),
-            displaylogo = FALSE
-          ) %>%
-          layout(
-            hoverlabel = list(
-              bgcolor = "white",
-              bordercolor = "black",
-              font = list(family = "Arial", size = 12)
-            ),
-            margin = list(l = 0, r = 50, t = 50, b = 0)
-          )
-        
-        cat("Plotly object created successfully\n")
-        return(plotly_obj)
-        
-      }, error = function(e) {
-        cat("Error creating plot:", e$message, "\n")
-        return(plotly_empty() %>% layout(title = list(text = paste("Plot error:", e$message), font = list(size = 16))))
-      })
+                                 format(round(!!sym(current_col), 2), big.mark = ",", scientific = FALSE)
+                               })),
+               color = if(input$show_borders) "white" else NA, 
+               size = if(input$show_borders) 0.3 else 0) +
+        scale_fill_viridis_c(name = display_name, 
+                           na.value = "grey90",
+                           option = input$color_scheme,
+                           limits = value_range,  # Ensure proper color scaling
+                           labels = function(x) {
+                             if(grepl("\\$", display_name)) {
+                               paste0("$", format(x, big.mark = ",", scientific = FALSE))
+                             } else {
+                               format(x, big.mark = ",", scientific = FALSE)
+                             }
+                           }) +
+        theme_void() +
+        theme(
+          legend.position = "right",
+          legend.title = element_text(size = 10),
+          plot.title = element_text(size = 14, hjust = 0.5, margin = margin(b = 20)),
+          axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          panel.grid = element_blank()
+        ) +
+        labs(title = paste(display_name, "for", input$selected_car)) +
+        coord_sf(expand = FALSE, crs = st_crs(4326))
+      
+      # Convert to plotly
+      plotly_obj <- ggplotly(p, tooltip = "text") %>%
+        config(
+          displayModeBar = TRUE,
+          modeBarButtonsToRemove = c("pan2d", "select2d", "lasso2d", "autoScale2d", 
+                                   "hoverClosestCartesian", "hoverCompareCartesian"),
+          displaylogo = FALSE
+        ) %>%
+        layout(
+          hoverlabel = list(
+            bgcolor = "white",
+            bordercolor = "black",
+            font = list(family = "Arial", size = 12)
+          ),
+          margin = list(l = 0, r = 50, t = 50, b = 0)
+        )
+      
+      return(plotly_obj)
       
     } else {
-      # Handle case with no data
-      cat("No valid data available\n")
       return(plotly_empty() %>%
         layout(
           title = list(
