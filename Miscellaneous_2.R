@@ -1,4 +1,79 @@
-# Load required libraries
+# Helper functions for debugging
+debug_shapefile <- function(shapefile_data) {
+  cat("=== SHAPEFILE DIAGNOSTICS ===\n")
+  cat("Class:", class(shapefile_data), "\n")
+  cat("Dimensions:", nrow(shapefile_data), "rows,", ncol(shapefile_data), "columns\n")
+  cat("CRS:", st_crs(shapefile_data)$input, "\n")
+  cat("Geometry type:", unique(st_geometry_type(shapefile_data)), "\n")
+  
+  # Check bounds
+  bbox <- st_bbox(shapefile_data)
+  cat("Bounding box:\n")
+  print(bbox)
+  
+  # Check for invalid geometries
+  valid_geoms <- st_is_valid(shapefile_data)
+  if(!all(valid_geoms)) {
+    cat("WARNING: Invalid geometries found in", sum(!valid_geoms), "features\n")
+  }
+  
+  # Show first few rows
+  cat("\nFirst few rows of data:\n")
+  print(head(as.data.frame(shapefile_data)))
+  
+  cat("\nColumn names:\n")
+  print(colnames(shapefile_data))
+}
+
+debug_car_data <- function(car_data) {
+  cat("\n=== CAR DATA DIAGNOSTICS ===\n")
+  cat("Class:", class(car_data), "\n")
+  cat("Dimensions:", nrow(car_data), "rows,", ncol(car_data), "columns\n")
+  cat("Column names:\n")
+  print(colnames(car_data))
+  
+  cat("\nFirst few rows:\n")
+  print(head(car_data))
+  
+  # Check measurement columns
+  cat("\nMeasurement columns summary:\n")
+  for(col in intersect(MEASUREMENT_COLS, colnames(car_data))) {
+    values <- car_data[[col]]
+    cat(col, ": min =", min(values, na.rm = TRUE), 
+        ", max =", max(values, na.rm = TRUE),
+        ", NA =", sum(is.na(values)), "\n")
+  }
+}
+
+# Quick test function to create a simple static plot
+test_static_plot <- function(shapefile_data, car_data, test_car = NULL, test_measurement = DEFAULT_MEASUREMENT) {
+  if(is.null(test_car)) {
+    test_car <- unique(car_data[[CAR_ID_COL]])[1]
+  }
+  
+  cat("Testing with car:", test_car, "and measurement:", test_measurement, "\n")
+  
+  # Prepare data
+  test_data <- prepare_map_data(shapefile_data, car_data, test_car)
+  
+  cat("Merged data dimensions:", nrow(test_data), "x", ncol(test_data), "\n")
+  cat("Non-NA values:", sum(!is.na(test_data[[test_measurement]])), "\n")
+  
+  if(nrow(test_data) > 0 && any(!is.na(test_data[[test_measurement]]))) {
+    # Create simple ggplot
+    p <- ggplot(test_data) +
+      geom_sf(aes(fill = .data[[test_measurement]]), color = "white", size = 0.2) +
+      scale_fill_viridis_c() +
+      theme_void() +
+      labs(title = paste("Test plot:", test_measurement, "for", test_car))
+    
+    print(p)
+    return(test_data)
+  } else {
+    cat("ERROR: No valid data for plotting\n")
+    return(test_data)
+  }
+}# Load required libraries
 library(shiny)
 library(plotly)
 library(sf)
@@ -214,7 +289,24 @@ server <- function(input, output, session) {
     current_col <- input$selected_measurement
     display_name <- MEASUREMENT_DISPLAY_NAMES[current_col]
     
+    # Debug information
+    cat("Debug info:\n")
+    cat("  Data rows:", nrow(data), "\n")
+    cat("  Non-NA values:", sum(!is.na(data[[current_col]])), "\n")
+    cat("  Geometry type:", class(st_geometry(data))[1], "\n")
+    cat("  CRS:", st_crs(data)$input, "\n")
+    
     if (nrow(data) > 0 && any(!is.na(data[[current_col]]))) {
+      # Transform to WGS84 if needed for better plotly compatibility
+      if(st_crs(data)$input != "EPSG:4326" && !is.na(st_crs(data)$input)) {
+        data <- st_transform(data, 4326)
+        cat("  Transformed to WGS84\n")
+      }
+      
+      # Calculate bounds for initial view
+      bbox <- st_bbox(data)
+      cat("  Bounds: ", bbox, "\n")
+      
       # Create the base ggplot using parameterized column names
       p <- ggplot(data) +
         geom_sf(aes(fill = .data[[current_col]], 
@@ -242,12 +334,16 @@ server <- function(input, output, session) {
         theme(
           legend.position = "right",
           legend.title = element_text(size = 10),
-          plot.title = element_text(size = 14, hjust = 0.5, margin = margin(b = 20))
+          plot.title = element_text(size = 14, hjust = 0.5, margin = margin(b = 20)),
+          axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          panel.grid = element_blank()
         ) +
-        labs(title = paste(display_name, "for", input$selected_car))
+        labs(title = paste(display_name, "for", input$selected_car)) +
+        coord_sf(expand = FALSE)  # Remove extra whitespace
       
       # Convert to plotly with custom configuration
-      ggplotly(p, tooltip = "text") %>%
+      plotly_obj <- ggplotly(p, tooltip = "text") %>%
         config(
           displayModeBar = TRUE,
           modeBarButtonsToRemove = c("pan2d", "select2d", "lasso2d", "autoScale2d", 
@@ -259,10 +355,29 @@ server <- function(input, output, session) {
             bgcolor = "white",
             bordercolor = "black",
             font = list(family = "Arial", size = 12)
-          )
+          ),
+          # Set initial view based on data bounds
+          xaxis = list(
+            range = c(bbox["xmin"], bbox["xmax"]),
+            showgrid = FALSE,
+            zeroline = FALSE,
+            showticklabels = FALSE
+          ),
+          yaxis = list(
+            range = c(bbox["ymin"], bbox["ymax"]),
+            showgrid = FALSE,
+            zeroline = FALSE,
+            showticklabels = FALSE
+          ),
+          margin = list(l = 0, r = 50, t = 50, b = 0)
         )
+      
+      cat("  Plotly object created successfully\n")
+      return(plotly_obj)
+      
     } else {
       # Handle case with no data
+      cat("  No data available - showing empty plot\n")
       plotly_empty() %>%
         layout(
           title = list(
