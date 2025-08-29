@@ -11,11 +11,11 @@ trade_data <- as.data.table(trade_data)
 
 # Get year bounds
 years <- range(trade_data$year)
-year1 <- years[1]
-year5 <- years[2]
+year_min <- years[1]
+year_max <- years[2]
 
-# Filter for year 1 and year 5 only
-data_filtered <- trade_data[year %in% c(year1, year5)]
+# Filter for year_min and year_max only
+data_filtered <- trade_data[year %in% c(year_min, year_max)]
 
 # Calculate total imports and shares
 data_filtered[, total_value := sum(value, na.rm = TRUE), 
@@ -65,8 +65,8 @@ for(chunk_num in 1:n_chunks) {
     comm_data <- chunk_data[commodity == comm]
     
     # Pre-calculate shares for this commodity
-    shares_y1 <- comm_data[year == year1, .(importer, exporter, share)]
-    shares_y5 <- comm_data[year == year5, .(importer, exporter, share)]
+    shares_yr_min <- comm_data[year == year_min, .(importer, exporter, share)]
+    shares_yr_max <- comm_data[year == year_max, .(importer, exporter, share)]
     
     # Process each third country for this commodity
     tc_results <- data.table(
@@ -76,48 +76,48 @@ for(chunk_num in 1:n_chunks) {
     
     # CRITERION 1: Calculate share changes vectorially
     # China's share of USA imports
-    china_usa_y1 <- shares_y1[importer == "USA" & exporter == "China", share]
-    china_usa_y1 <- ifelse(length(china_usa_y1) == 0, 0, china_usa_y1)
+    china_usa_yr_min <- shares_yr_min[importer == "USA" & exporter == "China", share]
+    china_usa_yr_min <- ifelse(length(china_usa_yr_min) == 0, 0, china_usa_yr_min)
     
-    china_usa_y5 <- shares_y5[importer == "USA" & exporter == "China", share]
-    china_usa_y5 <- ifelse(length(china_usa_y5) == 0, 0, china_usa_y5)
+    china_usa_yr_max <- shares_yr_max[importer == "USA" & exporter == "China", share]
+    china_usa_yr_max <- ifelse(length(china_usa_yr_max) == 0, 0, china_usa_yr_max)
     
     tc_results[, `:=`(
-      china_usa_y1 = china_usa_y1,
-      china_usa_y5 = china_usa_y5
+      china_usa_yr_min = china_usa_yr_min,
+      china_usa_yr_max = china_usa_yr_max
     )]
     
     # Third countries' shares of USA imports
-    tc_usa_shares_y1 <- shares_y1[importer == "USA" & exporter %in% third_countries]
-    tc_usa_shares_y5 <- shares_y5[importer == "USA" & exporter %in% third_countries]
+    tc_usa_shares_yr_min <- shares_yr_min[importer == "USA" & exporter %in% third_countries]
+    tc_usa_shares_yr_max <- shares_yr_max[importer == "USA" & exporter %in% third_countries]
     
     tc_results <- merge(tc_results, 
-                        tc_usa_shares_y1[, .(third_country = exporter, tc_usa_y1 = share)],
+                        tc_usa_shares_yr_min[, .(third_country = exporter, tc_usa_yr_min = share)],
                         by = "third_country", all.x = TRUE)
     tc_results <- merge(tc_results,
-                        tc_usa_shares_y5[, .(third_country = exporter, tc_usa_y5 = share)],
+                        tc_usa_shares_yr_max[, .(third_country = exporter, tc_usa_yr_max = share)],
                         by = "third_country", all.x = TRUE)
     
     # China's shares of third country imports
-    china_tc_shares_y1 <- shares_y1[exporter == "China" & importer %in% third_countries]
-    china_tc_shares_y5 <- shares_y5[exporter == "China" & importer %in% third_countries]
+    china_tc_shares_yr_min <- shares_yr_min[exporter == "China" & importer %in% third_countries]
+    china_tc_shares_yr_max <- shares_yr_max[exporter == "China" & importer %in% third_countries]
     
     tc_results <- merge(tc_results,
-                        china_tc_shares_y1[, .(third_country = importer, china_tc_y1 = share)],
+                        china_tc_shares_yr_min[, .(third_country = importer, china_tc_yr_min = share)],
                         by = "third_country", all.x = TRUE)
     tc_results <- merge(tc_results,
-                        china_tc_shares_y5[, .(third_country = importer, china_tc_y5 = share)],
+                        china_tc_shares_yr_max[, .(third_country = importer, china_tc_yr_max = share)],
                         by = "third_country", all.x = TRUE)
     
     # Replace NAs with 0
-    cols_to_fill <- c("tc_usa_y1", "tc_usa_y5", "china_tc_y1", "china_tc_y5")
+    cols_to_fill <- c("tc_usa_yr_min", "tc_usa_yr_max", "china_tc_yr_min", "china_tc_yr_max")
     tc_results[, (cols_to_fill) := lapply(.SD, function(x) ifelse(is.na(x), 0, x)), 
                .SDcols = cols_to_fill]
     
     # Check criterion 1
-    tc_results[, criterion1 := (china_usa_y5 < china_usa_y1) & 
-                               (china_tc_y5 > china_tc_y1) & 
-                               (tc_usa_y5 > tc_usa_y1)]
+    tc_results[, criterion1 := (china_usa_yr_max < china_usa_yr_min) & 
+                               (china_tc_yr_max > china_tc_yr_min) & 
+                               (tc_usa_yr_max > tc_usa_yr_min)]
     
     # Filter to only those passing criterion 1
     tc_results <- tc_results[criterion1 == TRUE]
@@ -135,33 +135,33 @@ for(chunk_num in 1:n_chunks) {
       row_countries <- unique(comm_data$importer[!comm_data$importer %in% c("USA", "China", tc)])
       
       # China to ROW
-      china_row_y1 <- comm_data[year == year1 & exporter == "China" & importer %in% row_countries, sum(value, na.rm = TRUE)]
-      china_row_y5 <- comm_data[year == year5 & exporter == "China" & importer %in% row_countries, sum(value, na.rm = TRUE)]
+      china_row_yr_min <- comm_data[year == year_min & exporter == "China" & importer %in% row_countries, sum(value, na.rm = TRUE)]
+      china_row_yr_max <- comm_data[year == year_max & exporter == "China" & importer %in% row_countries, sum(value, na.rm = TRUE)]
       
       # Total ROW imports
-      total_row_y1 <- comm_data[year == year1 & importer %in% row_countries, sum(value, na.rm = TRUE)]
-      total_row_y5 <- comm_data[year == year5 & importer %in% row_countries, sum(value, na.rm = TRUE)]
+      total_row_yr_min <- comm_data[year == year_min & importer %in% row_countries, sum(value, na.rm = TRUE)]
+      total_row_yr_max <- comm_data[year == year_max & importer %in% row_countries, sum(value, na.rm = TRUE)]
       
       # Third country to ROW
-      tc_row_y1 <- comm_data[year == year1 & exporter == tc & importer %in% row_countries, sum(value, na.rm = TRUE)]
-      tc_row_y5 <- comm_data[year == year5 & exporter == tc & importer %in% row_countries, sum(value, na.rm = TRUE)]
+      tc_row_yr_min <- comm_data[year == year_min & exporter == tc & importer %in% row_countries, sum(value, na.rm = TRUE)]
+      tc_row_yr_max <- comm_data[year == year_max & exporter == tc & importer %in% row_countries, sum(value, na.rm = TRUE)]
       
       # Calculate shares
-      china_share_y1 <- ifelse(total_row_y1 == 0, 0, china_row_y1 / total_row_y1)
-      china_share_y5 <- ifelse(total_row_y5 == 0, 0, china_row_y5 / total_row_y5)
-      tc_share_y1 <- ifelse(total_row_y1 == 0, 0, tc_row_y1 / total_row_y1)
-      tc_share_y5 <- ifelse(total_row_y5 == 0, 0, tc_row_y5 / total_row_y5)
+      china_share_yr_min <- ifelse(total_row_yr_min == 0, 0, china_row_yr_min / total_row_yr_min)
+      china_share_yr_max <- ifelse(total_row_yr_max == 0, 0, china_row_yr_max / total_row_yr_max)
+      tc_share_yr_min <- ifelse(total_row_yr_min == 0, 0, tc_row_yr_min / total_row_yr_min)
+      tc_share_yr_max <- ifelse(total_row_yr_max == 0, 0, tc_row_yr_max / total_row_yr_max)
       
       # IMPROVED LOGIC: Smart handling of growth rates based on baseline shares
-      if(china_share_y1 < MIN_SHARE_FOR_GROWTH | tc_share_y1 < MIN_SHARE_FOR_GROWTH) {
+      if(china_share_yr_min < MIN_SHARE_FOR_GROWTH | tc_share_yr_min < MIN_SHARE_FOR_GROWTH) {
         # Can't calculate meaningful growth rates - use alternative logic
         
-        if(china_share_y1 < MIN_SHARE_FOR_GROWTH & tc_share_y1 < MIN_SHARE_FOR_GROWTH) {
+        if(china_share_yr_min < MIN_SHARE_FOR_GROWTH & tc_share_yr_min < MIN_SHARE_FOR_GROWTH) {
           # Both are new/tiny in base year
           # Check if China's entry is larger than TC's entry (suspicious if TC suddenly bigger)
-          tc_results[i, criterion2 := china_share_y5 > tc_share_y5]
+          tc_results[i, criterion2 := china_share_yr_max > tc_share_yr_max]
           
-        } else if(china_share_y1 < MIN_SHARE_FOR_GROWTH) {
+        } else if(china_share_yr_min < MIN_SHARE_FOR_GROWTH) {
           # China is new entrant, TC is established
           # Less likely to be transshipment (China entering new market)
           tc_results[i, criterion2 := FALSE]
@@ -170,15 +170,15 @@ for(chunk_num in 1:n_chunks) {
           # TC is new entrant, China is established
           # This could be transshipment (TC suddenly entering where China was)
           # Compare absolute changes instead of growth rates
-          china_change <- china_share_y5 - china_share_y1
-          tc_change <- tc_share_y5 - tc_share_y1
+          china_change <- china_share_yr_max - china_share_yr_min
+          tc_change <- tc_share_yr_max - tc_share_yr_min
           tc_results[i, criterion2 := china_change > tc_change]
         }
         
       } else {
         # Both have sufficient baseline - use normal growth rates
-        china_growth <- (china_share_y5 - china_share_y1) / china_share_y1
-        tc_growth <- (tc_share_y5 - tc_share_y1) / tc_share_y1
+        china_growth <- (china_share_yr_max - china_share_yr_min) / china_share_yr_min
+        tc_growth <- (tc_share_yr_max - tc_share_yr_min) / tc_share_yr_min
         tc_results[i, criterion2 := china_growth > tc_growth]
       }
     }
@@ -189,15 +189,15 @@ for(chunk_num in 1:n_chunks) {
     if(nrow(tc_results) == 0) next
     
     # CRITERION 3: Volume check
-    # Get trade values for year 5
-    values_y5 <- comm_data[year == year5, .(importer, exporter, value)]
+    # Get trade values for year_max
+    values_yr_max <- comm_data[year == year_max, .(importer, exporter, value)]
     
     # China to third countries
-    china_to_tc <- values_y5[exporter == "China" & importer %in% tc_results$third_country,
+    china_to_tc <- values_yr_max[exporter == "China" & importer %in% tc_results$third_country,
                              .(third_country = importer, china_to_tc = value)]
     
     # Third countries to USA
-    tc_to_usa <- values_y5[importer == "USA" & exporter %in% tc_results$third_country,
+    tc_to_usa <- values_yr_max[importer == "USA" & exporter %in% tc_results$third_country,
                           .(third_country = exporter, tc_to_usa = value)]
     
     # Merge volume data
