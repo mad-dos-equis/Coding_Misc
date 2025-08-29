@@ -124,10 +124,8 @@ for(chunk_num in 1:n_chunks) {
     
     if(nrow(tc_results) == 0) next
     
-    # CRITERION 2: ROW analysis - IMPROVED VERSION (handles new entrants intelligently)
-    # Define minimum share threshold for growth calculation
-    MIN_SHARE_FOR_GROWTH <- 0.005  # 0.5% minimum share
-    
+        # CRITERION 2: ROW analysis (aggregate)
+    # For each third country, calculate ROW metrics
     for(i in 1:nrow(tc_results)) {
       tc <- tc_results$third_country[i]
       
@@ -135,52 +133,31 @@ for(chunk_num in 1:n_chunks) {
       row_countries <- unique(comm_data$importer[!comm_data$importer %in% c("USA", "China", tc)])
       
       # China to ROW
-      china_row_yr_min <- comm_data[year == year_min & exporter == "China" & importer %in% row_countries, sum(value, na.rm = TRUE)]
-      china_row_yr_max <- comm_data[year == year_max & exporter == "China" & importer %in% row_countries, sum(value, na.rm = TRUE)]
+      china_row_y1 <- comm_data[year == year1 & exporter == "China" & importer %in% row_countries, sum(value, na.rm = TRUE)]
+      china_row_y5 <- comm_data[year == year5 & exporter == "China" & importer %in% row_countries, sum(value, na.rm = TRUE)]
       
       # Total ROW imports
-      total_row_yr_min <- comm_data[year == year_min & importer %in% row_countries, sum(value, na.rm = TRUE)]
-      total_row_yr_max <- comm_data[year == year_max & importer %in% row_countries, sum(value, na.rm = TRUE)]
+      total_row_y1 <- comm_data[year == year1 & importer %in% row_countries, sum(value, na.rm = TRUE)]
+      total_row_y5 <- comm_data[year == year5 & importer %in% row_countries, sum(value, na.rm = TRUE)]
       
       # Third country to ROW
-      tc_row_yr_min <- comm_data[year == year_min & exporter == tc & importer %in% row_countries, sum(value, na.rm = TRUE)]
-      tc_row_yr_max <- comm_data[year == year_max & exporter == tc & importer %in% row_countries, sum(value, na.rm = TRUE)]
+      tc_row_y1 <- comm_data[year == year1 & exporter == tc & importer %in% row_countries, sum(value, na.rm = TRUE)]
+      tc_row_y5 <- comm_data[year == year5 & exporter == tc & importer %in% row_countries, sum(value, na.rm = TRUE)]
       
-      # Calculate shares
-      china_share_yr_min <- ifelse(total_row_yr_min == 0, 0, china_row_yr_min / total_row_yr_min)
-      china_share_yr_max <- ifelse(total_row_yr_max == 0, 0, china_row_yr_max / total_row_yr_max)
-      tc_share_yr_min <- ifelse(total_row_yr_min == 0, 0, tc_row_yr_min / total_row_yr_min)
-      tc_share_yr_max <- ifelse(total_row_yr_max == 0, 0, tc_row_yr_max / total_row_yr_max)
+      # Calculate shares and growth
+      china_share_y1 <- ifelse(total_row_y1 == 0, 0, china_row_y1 / total_row_y1)
+      china_share_y5 <- ifelse(total_row_y5 == 0, 0, china_row_y5 / total_row_y5)
+      tc_share_y1 <- ifelse(total_row_y1 == 0, 0, tc_row_y1 / total_row_y1)
+      tc_share_y5 <- ifelse(total_row_y5 == 0, 0, tc_row_y5 / total_row_y5)
       
-      # IMPROVED LOGIC: Smart handling of growth rates based on baseline shares
-      if(china_share_yr_min < MIN_SHARE_FOR_GROWTH | tc_share_yr_min < MIN_SHARE_FOR_GROWTH) {
-        # Can't calculate meaningful growth rates - use alternative logic
-        
-        if(china_share_yr_min < MIN_SHARE_FOR_GROWTH & tc_share_yr_min < MIN_SHARE_FOR_GROWTH) {
-          # Both are new/tiny in base year
-          # Check if China's entry is larger than TC's entry (suspicious if TC suddenly bigger)
-          tc_results[i, criterion2 := china_share_yr_max > tc_share_yr_max]
-          
-        } else if(china_share_yr_min < MIN_SHARE_FOR_GROWTH) {
-          # China is new entrant, TC is established
-          # Less likely to be transshipment (China entering new market)
-          tc_results[i, criterion2 := FALSE]
-          
-        } else {
-          # TC is new entrant, China is established
-          # This could be transshipment (TC suddenly entering where China was)
-          # Compare absolute changes instead of growth rates
-          china_change <- china_share_yr_max - china_share_yr_min
-          tc_change <- tc_share_yr_max - tc_share_yr_min
-          tc_results[i, criterion2 := china_change > tc_change]
-        }
-        
-      } else {
-        # Both have sufficient baseline - use normal growth rates
-        china_growth <- (china_share_yr_max - china_share_yr_min) / china_share_yr_min
-        tc_growth <- (tc_share_yr_max - tc_share_yr_min) / tc_share_yr_min
-        tc_results[i, criterion2 := china_growth > tc_growth]
-      }
+      china_growth <- ifelse(china_share_y1 == 0, 
+                            ifelse(china_share_y5 > 0, 999, 0),
+                            (china_share_y5 - china_share_y1) / china_share_y1)
+      tc_growth <- ifelse(tc_share_y1 == 0,
+                         ifelse(tc_share_y5 > 0, 999, 0),
+                         (tc_share_y5 - tc_share_y1) / tc_share_y1)
+      
+      tc_results[i, criterion2 := china_growth > tc_growth]
     }
     
     # Filter to only those passing criterion 2
