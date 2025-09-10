@@ -238,8 +238,8 @@ create_consensus_analysis <- function(data,
     
     method_correlations = cor(
       results %>% 
-        select(starts_with("score_")) %>%
-        select(-consensus_score),
+        select(score_percentile, score_ratio, score_outlier, 
+               score_residual, score_cluster),
       use = "complete.obs"
     ),
     
@@ -272,8 +272,8 @@ create_consensus_analysis <- function(data,
   
   # Plot 2: Method comparison
   method_scores <- results %>%
-    select(product_id, starts_with("score_")) %>%
-    select(-consensus_score) %>%
+    select(product_id, score_percentile, score_ratio, score_outlier, 
+           score_residual, score_cluster) %>%
     pivot_longer(
       cols = starts_with("score_"),
       names_to = "method",
