@@ -18,8 +18,10 @@ create_consensus_analysis <- function(data,
       product_id = !!id_col
     )
   
-  # Initialize results dataframe
-  results <- analysis_data
+  # Initialize results dataframe - remove any existing score columns to avoid conflicts
+  results <- analysis_data %>%
+    select(-any_of(c("consensus_score", "score_percentile", "score_ratio", 
+                     "score_outlier", "score_residual", "score_cluster")))
   
   # ==============================================================
   # METHOD 1: Percentile-Based Score
