@@ -103,46 +103,29 @@ p5 <- ggplot(data, aes(x = group, y = values, fill = group)) +
 
 print(p5)
 
-# Method 7: Box plot with jittered points
-p6 <- ggplot(data, aes(x = group, y = values, fill = group)) +
-  geom_boxplot(alpha = 0.5, outlier.shape = NA) +  # Hide outliers from boxplot
-  geom_jitter(width = 0.2, alpha = 0.3, size = 0.8) +  # Add all points
-  labs(title = "Box Plot with Individual Data Points",
-       subtitle = "Shows distribution shape along with percentiles",
-       x = "Group", y = "Values") +
-  theme_minimal()
-
-print(p6)
-
 # Print summary statistics to understand the percentiles
-cat("\nSummary Statistics by Group:\n")
-summary_stats <- data %>%
-  group_by(group) %>%
-  summarise(
-    Min = min(values),
-    Q1 = quantile(values, 0.25),
-    Median = median(values),
-    Q3 = quantile(values, 0.75),
-    Max = max(values),
-    IQR = IQR(values),
-    .groups = 'drop'
-  )
+cat("\nSummary Statistics:\n")
+summary_stats <- data.frame(
+  Min = min(values),
+  Q1 = quantile(values, 0.25),
+  Median = median(values),
+  Q3 = quantile(values, 0.75),
+  Max = max(values),
+  IQR = IQR(values)
+)
 
 print(summary_stats)
 
 # Calculate specific percentiles
-cat("\nDetailed Percentiles by Group:\n")
-detailed_percentiles <- data %>%
-  group_by(group) %>%
-  summarise(
-    P5 = quantile(values, 0.05),
-    P10 = quantile(values, 0.10),
-    P25 = quantile(values, 0.25),
-    P50 = quantile(values, 0.50),
-    P75 = quantile(values, 0.75),
-    P90 = quantile(values, 0.90),
-    P95 = quantile(values, 0.95),
-    .groups = 'drop'
-  )
+cat("\nDetailed Percentiles:\n")
+detailed_percentiles <- data.frame(
+  P5 = quantile(values, 0.05),
+  P10 = quantile(values, 0.10),
+  P25 = quantile(values, 0.25),
+  P50 = quantile(values, 0.50),
+  P75 = quantile(values, 0.75),
+  P90 = quantile(values, 0.90),
+  P95 = quantile(values, 0.95)
+)
 
 print(detailed_percentiles)
