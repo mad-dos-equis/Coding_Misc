@@ -1,131 +1,160 @@
-# Box Plots for Percentile Visualization in R
+# Distribution Plots for Percentile Visualization in R
 
 # Load required libraries
 library(ggplot2)
-library(dplyr)
 
 # Generate sample data
 set.seed(123)
-data <- data.frame(
-  group = rep(c("A", "B", "C"), each = 100),
-  values = c(rnorm(100, mean = 50, sd = 10),
-             rnorm(100, mean = 60, sd = 15),
-             rnorm(100, mean = 55, sd = 8))
-)
+values <- rnorm(200, mean = 50, sd = 10)
 
-# Method 1: Basic box plot with base R
-boxplot(values ~ group, data = data,
-        main = "Basic Box Plot Showing Percentiles",
-        xlab = "Group", ylab = "Values",
-        col = c("lightblue", "lightgreen", "lightcoral"))
+# Create data frame for ggplot
+df <- data.frame(values = values)
 
-# Add custom percentile labels
-text(x = 1:3, y = par("usr")[4], 
-     labels = c("25th, 50th, 75th percentiles shown"), 
-     pos = 1, cex = 0.8)
-
-# Method 2: Enhanced ggplot2 version
-p1 <- ggplot(data, aes(x = group, y = values, fill = group)) +
-  geom_boxplot(alpha = 0.7) +
-  labs(title = "Box Plot with ggplot2",
-       subtitle = "Box boundaries show 25th, 50th, and 75th percentiles",
-       x = "Group", y = "Values") +
-  theme_minimal() +
-  scale_fill_brewer(palette = "Set2")
+# Method 1: Histogram with percentile lines
+p1 <- ggplot(df, aes(x = values)) +
+  geom_histogram(bins = 30, fill = "lightblue", alpha = 0.7, color = "black") +
+  geom_vline(aes(xintercept = quantile(values, 0.25)), 
+             color = "red", linetype = "dashed", size = 1) +
+  geom_vline(aes(xintercept = quantile(values, 0.50)), 
+             color = "red", linetype = "solid", size = 1.2) +
+  geom_vline(aes(xintercept = quantile(values, 0.75)), 
+             color = "red", linetype = "dashed", size = 1) +
+  labs(title = "Histogram with Percentile Lines",
+       subtitle = "Dashed lines: 25th & 75th percentiles, Solid line: 50th percentile (median)",
+       x = "Values", y = "Frequency") +
+  theme_minimal()
 
 print(p1)
 
-# Method 3: Customized box plot with specific percentiles
-p2 <- ggplot(data, aes(x = group, y = values)) +
-  stat_boxplot(geom = "errorbar", width = 0.2) +  # Add whisker caps
-  geom_boxplot(aes(fill = group), 
-               alpha = 0.7,
-               outlier.color = "red",
-               outlier.size = 2) +
-  stat_summary(fun = mean, geom = "point", 
-               shape = 23, size = 3, fill = "white") +  # Add mean
-  labs(title = "Detailed Box Plot with Mean and Outliers",
-       subtitle = "Whiskers extend to 1.5*IQR, outliers shown in red",
-       x = "Group", y = "Values") +
-  theme_classic() +
-  scale_fill_manual(values = c("A" = "#FF9999", "B" = "#66B2FF", "C" = "#99FF99"))
+# Method 2: Density plot with percentiles
+p2 <- ggplot(df, aes(x = values)) +
+  geom_density(fill = "lightgreen", alpha = 0.7, color = "darkgreen") +
+  geom_vline(aes(xintercept = quantile(values, 0.10)), 
+             color = "blue", linetype = "dotted") +
+  geom_vline(aes(xintercept = quantile(values, 0.25)), 
+             color = "blue", linetype = "dashed") +
+  geom_vline(aes(xintercept = quantile(values, 0.50)), 
+             color = "blue", linetype = "solid", size = 1.2) +
+  geom_vline(aes(xintercept = quantile(values, 0.75)), 
+             color = "blue", linetype = "dashed") +
+  geom_vline(aes(xintercept = quantile(values, 0.90)), 
+             color = "blue", linetype = "dotted") +
+  labs(title = "Density Plot with Percentiles",
+       subtitle = "10th, 25th, 50th, 75th, and 90th percentiles shown",
+       x = "Values", y = "Density") +
+  theme_minimal()
 
 print(p2)
 
-# Method 4: Box plot with custom percentiles
-# Function to calculate custom percentiles
-custom_percentiles <- function(x) {
-  data.frame(
-    ymin = quantile(x, 0.05),   # 5th percentile
-    lower = quantile(x, 0.25),  # 25th percentile
-    middle = quantile(x, 0.50), # 50th percentile (median)
-    upper = quantile(x, 0.75),  # 75th percentile
-    ymax = quantile(x, 0.95)    # 95th percentile
-  )
-}
+# Method 3: Histogram with base R
+hist(values, 
+     breaks = 30, 
+     col = "lightcoral", 
+     border = "black",
+     main = "Histogram with Percentile Lines (Base R)",
+     xlab = "Values", 
+     ylab = "Frequency")
 
-p3 <- ggplot(data, aes(x = group, y = values, fill = group)) +
-  stat_summary(fun.data = custom_percentiles, 
-               geom = "boxplot", alpha = 0.7) +
-  labs(title = "Custom Percentile Box Plot",
-       subtitle = "5th, 25th, 50th, 75th, and 95th percentiles",
-       x = "Group", y = "Values") +
+# Add percentile lines
+abline(v = quantile(values, 0.25), col = "red", lty = 2, lwd = 2)
+abline(v = quantile(values, 0.50), col = "red", lty = 1, lwd = 3)
+abline(v = quantile(values, 0.75), col = "red", lty = 2, lwd = 2)
+
+# Add legend
+legend("topright", 
+       legend = c("25th percentile", "50th percentile", "75th percentile"),
+       col = "red", lty = c(2, 1, 2), lwd = c(2, 3, 2))
+
+# Method 4: Empirical Cumulative Distribution Function (ECDF)
+p3 <- ggplot(df, aes(x = values)) +
+  stat_ecdf(geom = "step", color = "purple", size = 1.2) +
+  geom_hline(yintercept = c(0.25, 0.50, 0.75), 
+             color = "red", linetype = "dashed", alpha = 0.7) +
+  geom_vline(aes(xintercept = quantile(values, 0.25)), 
+             color = "red", linetype = "dashed", alpha = 0.7) +
+  geom_vline(aes(xintercept = quantile(values, 0.50)), 
+             color = "red", linetype = "dashed", alpha = 0.7) +
+  geom_vline(aes(xintercept = quantile(values, 0.75)), 
+             color = "red", linetype = "dashed", alpha = 0.7) +
+  labs(title = "Empirical Cumulative Distribution Function",
+       subtitle = "Y-axis shows percentiles directly (0.25 = 25th percentile)",
+       x = "Values", y = "Cumulative Probability") +
   theme_minimal() +
-  scale_fill_viridis_d()
+  scale_y_continuous(labels = scales::percent_format())
 
 print(p3)
 
-# Method 5: Multiple box plots with faceting
-# Create data with more groups
-extended_data <- data.frame(
-  category = rep(c("Type1", "Type2"), each = 300),
-  group = rep(rep(c("A", "B", "C"), each = 100), 2),
-  values = c(data$values, data$values + rnorm(300, 0, 5))
-)
-
-p4 <- ggplot(extended_data, aes(x = group, y = values, fill = group)) +
-  geom_boxplot(alpha = 0.7) +
-  facet_wrap(~ category) +
-  labs(title = "Faceted Box Plots for Comparison",
-       x = "Group", y = "Values") +
-  theme_bw() +
-  scale_fill_brewer(palette = "Pastel1")
+# Method 5: Violin plot (single distribution)
+p4 <- ggplot(df, aes(x = "", y = values)) +
+  geom_violin(fill = "lightyellow", alpha = 0.7) +
+  geom_boxplot(width = 0.1, fill = "white", alpha = 0.8) +
+  stat_summary(fun = mean, geom = "point", 
+               shape = 23, size = 3, fill = "red") +
+  labs(title = "Violin Plot with Box Plot Overlay",
+       subtitle = "Shows full distribution shape plus percentiles",
+       x = "", y = "Values") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
 
 print(p4)
 
-# Method 6: Horizontal box plot
-p5 <- ggplot(data, aes(x = group, y = values, fill = group)) +
-  geom_boxplot(alpha = 0.7) +
-  coord_flip() +  # Flip coordinates for horizontal boxes
-  labs(title = "Horizontal Box Plot",
-       x = "Group", y = "Values") +
+# Method 6: Q-Q Plot (comparing to normal distribution)
+p5 <- ggplot(df, aes(sample = values)) +
+  stat_qq() +
+  stat_qq_line(color = "red") +
+  labs(title = "Q-Q Plot vs Normal Distribution",
+       subtitle = "Points on red line indicate normal distribution",
+       x = "Theoretical Quantiles", y = "Sample Quantiles") +
   theme_minimal()
 
 print(p5)
 
-# Print summary statistics to understand the percentiles
+# Method 7: Density plot with filled percentile regions
+# Calculate percentiles
+p25 <- quantile(values, 0.25)
+p75 <- quantile(values, 0.75)
+
+p6 <- ggplot(df, aes(x = values)) +
+  geom_density(alpha = 0.3) +
+  geom_density(data = subset(df, values >= p25 & values <= p75),
+               fill = "red", alpha = 0.5) +
+  geom_vline(aes(xintercept = quantile(values, 0.50)), 
+             color = "darkred", linetype = "solid", size = 1.2) +
+  labs(title = "Density Plot with IQR Highlighted",
+       subtitle = "Red area shows interquartile range (25th to 75th percentile)",
+       x = "Values", y = "Density") +
+  theme_minimal()
+
+print(p6)
+
+# Method 8: Strip chart (dot plot)
+stripchart(values, 
+           method = "stack", 
+           pch = 19, 
+           col = "blue",
+           main = "Strip Chart Showing All Data Points",
+           xlab = "Values")
+
+# Add percentile lines
+abline(v = quantile(values, c(0.25, 0.50, 0.75)), 
+       col = "red", lty = 2, lwd = 2)
+
+# Print summary statistics
 cat("\nSummary Statistics:\n")
 summary_stats <- data.frame(
   Min = min(values),
   Q1 = quantile(values, 0.25),
   Median = median(values),
+  Mean = mean(values),
   Q3 = quantile(values, 0.75),
   Max = max(values),
-  IQR = IQR(values)
+  SD = sd(values)
 )
 
 print(summary_stats)
 
-# Calculate specific percentiles
-cat("\nDetailed Percentiles:\n")
-detailed_percentiles <- data.frame(
-  P5 = quantile(values, 0.05),
-  P10 = quantile(values, 0.10),
-  P25 = quantile(values, 0.25),
-  P50 = quantile(values, 0.50),
-  P75 = quantile(values, 0.75),
-  P90 = quantile(values, 0.90),
-  P95 = quantile(values, 0.95)
-)
-
-print(detailed_percentiles)
+# Calculate various percentiles
+cat("\nPercentiles:\n")
+percentiles <- quantile(values, probs = seq(0.1, 0.9, 0.1))
+print(percentiles)
