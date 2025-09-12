@@ -26,11 +26,17 @@ decile_table <- data.frame(
 print("Decile Table:")
 print(decile_table)
 
-# Method 4: Custom percentiles (you can specify any percentiles you want)
+# Method 4: Custom percentiles with min, median, mean, and max
 custom_probs <- c(0.01, 0.05, 0.25, 0.50, 0.75, 0.95, 0.99)
 custom_table <- data.frame(
-  Percentile = paste0(custom_probs * 100, "th"),
-  Value = quantile(values, probs = custom_probs)
+  Percentile = c("Min", paste0(custom_probs[1:2] * 100, "th"), 
+                 paste0(custom_probs[3] * 100, "th"), 
+                 "Median", "Mean",
+                 paste0(custom_probs[5:7] * 100, "th"), "Max"),
+  Value = c(min(values), quantile(values, probs = custom_probs[1:2]),
+            quantile(values, probs = custom_probs[3]),
+            median(values), mean(values),
+            quantile(values, probs = custom_probs[5:7]), max(values))
 )
 
 print("Custom Percentile Table:")
