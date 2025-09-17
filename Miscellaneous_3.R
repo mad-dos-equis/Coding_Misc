@@ -1,3 +1,7 @@
+# Calculate actual min and max from your data
+min_value <- min(world_data$measure_value, na.rm = TRUE)
+max_value <- max(world_data$measure_value, na.rm = TRUE)
+
 # Create the map with customized styling
 map_diverging <- ggplot() +
   geom_sf(data = world_data,
@@ -10,9 +14,9 @@ map_diverging <- ggplot() +
     mid = "#FFFFBF",              # Light yellow for values near zero
     high = "#1A9850",             # Green for positive values
     midpoint = 0,                 # Center the scale at zero
-    limits = c(-max_abs_value, max_abs_value),  # Symmetric limits
-    breaks = c(-max_abs_value, 0, max_abs_value),  # Only show min, 0, and max
-    labels = dollar_format(accuracy = 1),  # Dollar signs with commas
+    limits = c(min_value, max_value),  # Use actual min/max from data
+    breaks = c(min_value, 0, max_value),  # Show actual min, 0, and max
+    labels = percent_format(accuracy = 0.1),  # Percentage with 1 decimal place
     name = "Measure Value",       # Simplified for horizontal layout
     guide = guide_colorbar(
       barwidth = 20,              # Wider for horizontal
