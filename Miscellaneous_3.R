@@ -11,8 +11,8 @@ map_diverging <- ggplot() +
     high = "#1A9850",             # Green for positive values
     midpoint = 0,                 # Center the scale at zero
     limits = c(-max_abs_value, max_abs_value),  # Symmetric limits
-    breaks = c(-max_abs_value, seq(-ceiling(max_abs_value/2), ceiling(max_abs_value/2), length.out = 5), max_abs_value),  # Include min/max
-    labels = number_format(accuracy = 0.1),
+    breaks = c(-max_abs_value, 0, max_abs_value),  # Only show min, 0, and max
+    labels = dollar_format(accuracy = 1),  # Dollar signs with commas
     name = "Measure Value",       # Simplified for horizontal layout
     guide = guide_colorbar(
       barwidth = 20,              # Wider for horizontal
@@ -24,7 +24,8 @@ map_diverging <- ggplot() +
       ticks.colour = "black",
       ticks.linewidth = 0.5,
       frame.colour = "black",
-      frame.linewidth = 0.5
+      frame.linewidth = 0.5,
+      nbin = 300                  # Increase for smoother gradient
     )
   ) +
   
@@ -62,3 +63,12 @@ map_diverging <- ggplot() +
 
 # Display the map
 print(map_diverging)
+
+# For sharper/higher quality output when saving:
+# ggsave("map_diverging.png", 
+#        plot = map_diverging, 
+#        width = 12, 
+#        height = 8, 
+#        dpi = 300,           # Increase DPI for sharper image (try 600 for very high quality)
+#        device = "png",      # Can also use "pdf" for vector graphics
+#        bg = "white")
