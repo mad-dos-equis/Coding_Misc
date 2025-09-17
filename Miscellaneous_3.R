@@ -9,27 +9,29 @@ map_diverging <- ggplot() +
           color = "gray30",        # Change outline color
           linewidth = 0.3) +       # Change outline thickness
   
-  scale_fill_gradient2(
-    low = "#D73027",              # Red for negative values
-    mid = "#FFFFBF",              # Light yellow for values near zero
-    high = "#1A9850",             # Green for positive values
-    midpoint = 0,                 # Center the scale at zero
-    limits = c(min_value, max_value),  # Use actual min/max from data
-    breaks = c(min_value, 0, max_value),  # Show actual min, 0, and max
+  # Asymmetric color scale for skewed distributions
+  scale_fill_gradientn(
+    colors = c("#D73027", "#FFFFBF", "#1A9850"),
+    values = scales::rescale(quantile(world_data$measure_value, c(0, 0.5, 1), na.rm = TRUE)),
+    limits = c(min_value, max_value),
+    breaks = c(min_value, 0, max_value),  # Show min, 0, and max
     labels = percent_format(accuracy = 0.1),  # Percentage with 1 decimal place
-    name = "Measure Value",       # Simplified for horizontal layout
+    name = "Measure Value",
     guide = guide_colorbar(
-      barwidth = 20,              # Wider for horizontal
-      barheight = 0.8,            # Thinner for horizontal
+      barwidth = 30,              # Wider bar (increase this for even wider)
+      barheight = 0.8,            # Keep height thin
       title.position = "top",     # Title above the bar
       title.hjust = 0.5,          # Center the title
       label.position = "bottom",  # Labels below the bar
-      direction = "horizontal",    # Make it horizontal
+      direction = "horizontal",    # Horizontal orientation
       ticks.colour = "black",
       ticks.linewidth = 0.5,
       frame.colour = "black",
       frame.linewidth = 0.5,
-      nbin = 300                  # Increase for smoother gradient
+      nbin = 300,                 # Smooth gradient
+      raster = TRUE,              # Better rendering
+      draw.ulim = TRUE,           # Draw upper limit tick
+      draw.llim = TRUE            # Draw lower limit tick
     )
   ) +
   
