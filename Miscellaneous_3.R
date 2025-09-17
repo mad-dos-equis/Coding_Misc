@@ -1,4 +1,7 @@
-# Calculate actual min and max from your data
+# Asymmetric color scale for skewed distributions
+  scale_fill_gradientn(
+    colors = c("#D73027", "#FFFFBF", "#1A9850"),
+    values = scales::rescale(quantile(world_data$measure_value, c(# Calculate actual min and max from your data
 min_value <- min(world_data$measure_value, na.rm = TRUE)
 max_value <- max(world_data$measure_value, na.rm = TRUE)
 
@@ -14,7 +17,7 @@ map_diverging <- ggplot() +
     colors = c("#D73027", "#FFFFBF", "#1A9850"),
     values = scales::rescale(quantile(world_data$measure_value, c(0, 0.5, 1), na.rm = TRUE)),
     limits = c(min_value, max_value),
-    breaks = c(min_value, 0, max_value),  # Show min, 0, and max
+    breaks = c(min_value, 0, max_value),  # These will appear at their actual positions
     labels = percent_format(accuracy = 0.1),  # Percentage with 1 decimal place
     name = "Measure Value",
     guide = guide_colorbar(
