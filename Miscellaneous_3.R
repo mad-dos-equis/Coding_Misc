@@ -1,117 +1,142 @@
-# ---- Packages ----
 library(dplyr)
 library(ggplot2)
 library(scales)
 library(stringr)
 library(purrr)
 
-# ------------------------------------------------------------------------------
-# INPUT: a data frame named df with columns: item, year, month, value
-# - month can be 1..12 OR text ("Jan", "January", etc.)
-# Example scaffold (delete when using your real df):
-# df <- tibble::tibble(
-#   item  = rep(c("Widget A", "Gizmo/Beta (Rev.2)"), each = 36),
-#   year  = rep(rep(2023:2025, each = 12), 2),
-#   month = rep(1:12, 6),
-#   value = runif(72, 1e4, 2e6)
-# )
-# ------------------------------------------------------------------------------
+# ---- CONFIG: set your real column names if you know them ----
+item_col  <- "item"         # e.g., "product_name"
+year_col  <- "year"
+month_col <- "month"
+value_col <- "value"
+desc_col  <- "description"  # <- NEW (set to NULL if you have no description)
 
-# ---- Output directory for saved plots ----
+# ---- Output folder ----
 out_dir <- "outputs/item_charts"
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
-# ---- Helper: normalize month to Jan–Dec factor ----
+# ---- Helpers ----
 to_month_factor <- function(m) {
-  # If numeric 1:12, convert; if text, try to map "Jan"/"January" (case-insensitive) to month.abb
-  if (is.numeric(m)) {
-    return(factor(month.abb[m], levels = month.abb))
-  }
+  if (is.numeric(m)) return(factor(month.abb[m], levels = month.abb))
   m_chr <- as.character(m)
-  # Try to coerce full names to abbreviations first using base date parsing
-  # Fallback: title-case and match to month.abb directly
   try_full <- suppressWarnings(match(tolower(m_chr), tolower(month.name)))
   abb_from_full <- ifelse(!is.na(try_full), month.abb[try_full], NA_character_)
-  # Where that failed, try direct match to abbreviations
-  try_abb <- match(str_to_title(m_chr), month.abb)
+  try_abb <- match(stringr::str_to_title(m_chr), month.abb)
   resolved <- ifelse(!is.na(abb_from_full), abb_from_full, month.abb[try_abb])
   factor(resolved, levels = month.abb)
 }
 
-# ---- Helper: robust filename sanitizer (fixes mismatched-paren regex issue) ----
-sanitize_filename <- function(x) {
-  # Optional: transliterate Unicode to ASCII if stringi is available
+sanitize_filename <- function(x, fallback = "item") {
   if (requireNamespace("stringi", quietly = TRUE)) {
     x <- stringi::stri_trans_general(x, "Any-Latin; NFD; [:Nonspacing Mark:] Remove; NFC")
   }
-  x |>
-    tolower() |>
-    str_replace_all("[^a-z0-9]+", "-") |>   # collapse non-alnum to hyphens
-    str_replace_all("^[-]+|[-]+$", "")      # trim leading/trailing hyphens (no grouping parens)
+  x <- x %>%
+    tolower() %>%
+    str_replace_all("[^a-z0-9]+", "-") %>%
+    str_replace_all("^[-]+|[-]+$", "")
+  if (is.na(x) || !nzchar(x)) fallback else x
 }
 
-# ---- Plot function for a single item ----
-plot_item <- function(df_item) {
-  item_name <- unique(df_item$item)[1]
-  yr_min <- suppressWarnings(min(df_item$year, na.rm = TRUE))
-  yr_max <- suppressWarnings(max(df_item$year, na.rm = TRUE))
-  subtitle_txt <- if (is.finite(yr_min) && is.finite(yr_max) && yr_min != yr_max) {
+# ---- Main plot function ----
+# set use_cumulative = TRUE to plot the cumulative series
+plot_item <- function(df_item, use_cumulative = TRUE) {
+  item_name <- unique(df_item[[item_col]])[1]
+
+  # Pull a single, non-missing description if available
+  desc <- if (!is.null(desc_col) && desc_col %in% names(df_item)) {
+    d <- unique(na.omit(df_item[[desc_col]]))
+    if (length(d)) as.character(d[1]) else NA_character_
+  } else NA_character_
+
+  # Year range for subtitle
+  yr_min <- suppressWarnings(min(df_item[[year_col]], na.rm = TRUE))
+  yr_max <- suppressWarnings(max(df_item[[year_col]], na.rm = TRUE))
+  yr_span <- if (is.finite(yr_min) && is.finite(yr_max) && yr_min != yr_max) {
     paste0(yr_min, "–", yr_max, " Comparison")
+  } else as.character(yr_min)
+
+  # Build subtitle: "Description — 2023–2025 Comparison"
+  # (truncate very long descriptions)
+  desc_show <- if (!is.na(desc)) str_trunc(desc, 120) else NULL
+  subtitle_txt <- if (!is.null(desc_show)) {
+    paste0(desc_show, " — ", yr_span)
   } else {
-    as.character(yr_min)
+    yr_span
   }
 
   df_plot <- df_item %>%
     mutate(
-      month_fac = to_month_factor(month),
-      year = factor(year)
+      month_fac = to_month_factor(.data[[month_col]]),
+      month_num = as.integer(month_fac),
+      year_fac  = factor(.data[[year_col]])
     ) %>%
-    arrange(year, month_fac)
+    arrange(year_fac, month_num) %>%
+    group_by(.data[[item_col]], year_fac) %>%
+    # ---- NEW: cumulative value within each item-year ----
+    mutate(value_cum = cumsum(.data[[value_col]])) %>%
+    ungroup()
 
-  ggplot(df_plot, aes(x = month_fac, y = value, color = year, group = year)) +
+  y_mapping <- if (use_cumulative) "value_cum" else value_col
+
+  ggplot(df_plot, aes(x = month_fac, y = .data[[y_mapping]], color = year_fac, group = year_fac)) +
     geom_line(linewidth = 1.1) +
     geom_point(size = 2) +
     scale_y_continuous(labels = dollar_format(prefix = "$", big.mark = ",")) +
     labs(
       title = paste0("Monthly Values by Year — ", item_name),
       subtitle = subtitle_txt,
-      x = NULL,
-      y = NULL,
-      color = "Year"
+      x = NULL, y = NULL, color = "Year"
     ) +
     theme_minimal(base_size = 12) +
     theme(
-      panel.grid.minor = element_blank(),                    # only major gridlines
+      panel.grid.minor = element_blank(),
       axis.text.x = element_text(size = 13),
       axis.text.y = element_text(size = 13),
       legend.title = element_text(size = 13),
       legend.text  = element_text(size = 12),
-      plot.title   = element_text(size = 18, face = "bold", hjust = 0,
-                                  margin = margin(l = -10)),
-      plot.subtitle = element_text(size = 14, hjust = 0,
-                                   margin = margin(l = -10)),
+      plot.title   = element_text(size = 18, face = "bold", hjust = 0, margin = margin(l = -10)),
+      plot.subtitle = element_text(size = 14, hjust = 0, margin = margin(l = -10)),
       plot.title.position = "plot",
       plot.margin = margin(t = 10, r = 12, b = 10, l = 0)
     )
 }
 
-# ---- Generate & save one chart per item (robust to errors inside map/walk) ----
-df %>%
-  group_split(item, .keep = TRUE) %>%
-  walk(function(dfi) {
-    item_name <- unique(dfi$item)[1]
-    safe_name <- sanitize_filename(item_name)
-    file_path <- file.path(out_dir, paste0("monthly-values-", safe_name, ".png"))
+# ---- Clean data, compute cumulative, and save one plot per item ----
+df_clean <- df %>%
+  # basic type hygiene
+  mutate(
+    across(all_of(year_col), as.integer),
+    across(all_of(value_col), as.numeric)
+  ) %>%
+  # drop rows missing essentials
+  filter(
+    !is.na(.data[[item_col]]),
+    !is.na(.data[[year_col]]),
+    !is.na(.data[[month_col]]),
+    !is.na(.data[[value_col]])
+  )
 
-    # Build plot and save; report any failures with the item name
-    tryCatch(
-      {
-        p <- plot_item(dfi)
-        ggsave(filename = file_path, plot = p, width = 8.5, height = 5, dpi = 300)
-        message("Saved: ", file_path)
-      },
-      error = function(e) {
-        message("Failed on item: ", item_name, " | Error: ", conditionMessage(e))
-      }
-    )
-  })
+# Split and save
+df_clean %>%
+  group_split(.data[[item_col]], .keep = TRUE) %>%
+  walk2(
+    .y = seq_along(.),
+    .x = .,
+    .f = function(dfi, i) {
+      raw_name <- unique(dfi[[item_col]])[1]
+      label_name <- if (is.na(raw_name) || !nzchar(as.character(raw_name))) paste0("Item ", sprintf("%03d", i)) else as.character(raw_name)
+      safe_name  <- sanitize_filename(label_name, fallback = paste0("item-", sprintf("%03d", i)))
+      file_path  <- file.path(out_dir, paste0("monthly-values-", safe_name, ".png"))
+
+      tryCatch(
+        {
+          p <- plot_item(dfi, use_cumulative = TRUE)  # toggle FALSE to plot raw monthly values
+          ggsave(filename = file_path, plot = p, width = 8.5, height = 5, dpi = 300)
+          message("Saved: ", file_path)
+        },
+        error = function(e) {
+          message("Failed on item index ", i, " (label: ", label_name, "): ", conditionMessage(e))
+        }
+      )
+    }
+  )
