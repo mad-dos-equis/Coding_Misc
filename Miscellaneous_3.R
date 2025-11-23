@@ -1,156 +1,261 @@
-# ---- Packages ----
-library(dplyr)
-library(ggplot2)
-library(scales)
-library(stringr)
-library(purrr)
+################################################################################
+# DATA-DRIVEN TARIFFED CATEGORY DETECTION (APPROACH 1: CLUSTERING)
+#
+# - Uses coverage = dutiable_value / customs_value
+# - Uses tariff_dutiable = calculated_duties / dutiable_value
+# - Uses k-means on (coverage, tariff_dutiable) to find a "tariffed" cluster
+# - Derives c_star and r_star from the lower edge (10th percentile) of that cluster
+################################################################################
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIG: set to your actual column names (strings)
-item_col  <- "item"          # e.g., "product_name"
-year_col  <- "year"
-month_col <- "month"         # 1–12 or "Jan"/"February"/etc.
-value_col <- "value"
-desc_col  <- "description"   # set to NULL if no description column
+#===============================================================================
+# SECTION 0: SETUP
+#===============================================================================
 
-# Output folder
-out_dir <- "outputs/item_charts"
-dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
-# ─────────────────────────────────────────────────────────────────────────────
+# Load required packages
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+})
 
-# =============================================================================
-# 1) Build a cleaned/aggregated data frame with value_cum OUTSIDE the function
-#    - Aggregates multiple rows within the same item–year–month (sum of value)
-#    - Computes cumulative within each item–year across months
-# =============================================================================
-df_cum <- df %>%
-  # basic type hygiene
-  mutate(
-    !!year_col  := as.integer(.data[[year_col]]),
-    !!value_col := as.numeric(.data[[value_col]])
-  ) %>%
-  # drop rows missing essentials
-  filter(
-    !is.na(.data[[item_col]]),
-    !is.na(.data[[year_col]]),
-    !is.na(.data[[month_col]]),
-    !is.na(.data[[value_col]])
-  ) %>%
-  # aggregate duplicates within month (if any)
-  group_by(.data[[item_col]], .data[[year_col]], .data[[month_col]]) %>%
-  summarise(!!value_col := sum(.data[[value_col]], na.rm = TRUE), .groups = "drop") %>%
-  # cumulative within item-year; month order will be set inside plot_item()
-  arrange(.data[[item_col]], .data[[year_col]]) %>%
-  group_by(.data[[item_col]], .data[[year_col]]) %>%
-  mutate(value_cum = cumsum(.data[[value_col]])) %>%
-  ungroup()
-
-# =============================================================================
-# 2) Plot function (helpers defined & applied INSIDE the function)
-#    - recomputes month factor safely
-#    - prefers description as subtitle
-#    - returns both plot and safe filename stem
-# =============================================================================
-plot_item <- function(df_item, use_cumulative = TRUE) {
-  # ---- local helpers (scoped to this function) ----
-  to_month_factor <- function(m) {
-    if (is.numeric(m)) return(factor(month.abb[m], levels = month.abb))
-    m_chr <- as.character(m)
-    i_full <- suppressWarnings(match(tolower(m_chr), tolower(month.name)))  # "january"
-    abb_from_full <- ifelse(!is.na(i_full), month.abb[i_full], NA_character_)
-    i_abb  <- match(stringr::str_to_title(m_chr), month.abb)                # "Jan"
-    resolved <- ifelse(!is.na(abb_from_full), abb_from_full, month.abb[i_abb])
-    factor(resolved, levels = month.abb)
-  }
-  sanitize_filename <- function(x, fallback = "item") {
-    if (requireNamespace("stringi", quietly = TRUE)) {
-      x <- stringi::stri_trans_general(x, "Any-Latin; NFD; [:Nonspacing Mark:] Remove; NFC")
+# Weighted quantile helper (avoids extra dependencies)
+wtd_quantile <- function(x, weights = NULL, probs = 0.5, na.rm = TRUE) {
+  if (na.rm) {
+    keep <- !is.na(x) & !is.na(weights)
+    if (!is.null(weights)) {
+      x <- x[keep]
+      weights <- weights[keep]
+    } else {
+      x <- x[!is.na(x)]
     }
-    x <- x |>
-      tolower() |>
-      str_replace_all("[^a-z0-9]+", "-") |>
-      str_replace_all("^[-]+|[-]+$", "")
-    if (is.na(x) || !nzchar(x)) fallback else x
   }
-
-  # ---- item name and safe filename ----
-  item_name <- unique(df_item[[item_col]])[1] |> as.character()
-  label     <- if (is.na(item_name) || !nzchar(item_name)) "Item" else item_name
-  safe_stem <- sanitize_filename(label, fallback = "item")
-
-  # ---- subtitle: prefer description if provided; else year span ----
-  desc <- if (!is.null(desc_col) && desc_col %in% names(df_item)) {
-    d <- unique(na.omit(df_item[[desc_col]]))
-    if (length(d)) as.character(d[1]) else NA_character_
-  } else NA_character_
-
-  yr_min <- suppressWarnings(min(df_item[[year_col]], na.rm = TRUE))
-  yr_max <- suppressWarnings(max(df_item[[year_col]], na.rm = TRUE))
-  yr_span <- if (is.finite(yr_min) && is.finite(yr_max) && yr_min != yr_max) {
-    paste0(yr_min, "–", yr_max, " Comparison")
-  } else as.character(yr_min)
-
-  subtitle_txt <- if (!is.na(desc) && nzchar(desc)) str_trunc(desc, 120) else yr_span
-
-  # ---- prep data for plotting (apply helper here) ----
-  df_plot <- df_item %>%
-    mutate(
-      month_fac = to_month_factor(.data[[month_col]]),
-      year_fac  = factor(.data[[year_col]])
-    ) %>%
-    arrange(year_fac, month_fac)
-
-  # which y to plot
-  y_mapping <- if (use_cumulative) "value_cum" else value_col
-
-  # draw lines only for year groups with >=2 points to avoid warning
-  df_lines <- df_plot %>% group_by(year_fac) %>% filter(dplyr::n() >= 2) %>% ungroup()
-
-  # ---- the plot ----
-  p <- ggplot(df_plot, aes(x = month_fac, y = .data[[y_mapping]], color = year_fac, group = year_fac)) +
-    geom_line(data = df_lines, linewidth = 1.2) +
-    geom_point(size = 2) +
-    scale_y_continuous(labels = scales::label_dollar(prefix = "$", big.mark = ",")) +
-    labs(
-      title = paste0("Monthly Values by Year — ", label),
-      subtitle = subtitle_txt,
-      x = NULL, y = NULL, color = "Year"
-    ) +
-    theme_minimal(base_size = 12) +
-    theme(
-      panel.grid.minor = element_blank(),     # only major gridlines
-      axis.text.x = element_text(size = 13),
-      axis.text.y = element_text(size = 13),
-      legend.title = element_text(size = 13),
-      legend.text  = element_text(size = 12),
-      plot.title.position = "plot",           # clean left align
-      plot.title    = element_text(size = 18, face = "bold", hjust = 0,
-                                   margin = margin(l = -10)),
-      plot.subtitle = element_text(size = 14, hjust = 0,
-                                   margin = margin(l = -10)),
-      plot.margin = margin(t = 10, r = 12, b = 10, l = 0)
-    )
-
-  # return both
-  list(plot = p, safe_stem = safe_stem)
+  if (is.null(weights)) {
+    return(stats::quantile(x, probs = probs, na.rm = FALSE, type = 7))
+  }
+  # sort by x
+  o <- order(x)
+  x_sorted <- x[o]
+  w_sorted <- weights[o]
+  w_cum <- cumsum(w_sorted) / sum(w_sorted)
+  sapply(probs, function(p) {
+    idx <- which(w_cum >= p)[1]
+    x_sorted[idx]
+  })
 }
 
-# =============================================================================
-# 3) Generate & save one plot per item (using safe_stem returned by plot_item)
-# =============================================================================
-df_cum %>%
-  group_split(.data[[item_col]], .keep = TRUE) %>%
-  walk2(.x = ., .y = seq_along(.), .f = function(dfi, i) {
-    res <- tryCatch(
-      plot_item(dfi, use_cumulative = TRUE),  # set FALSE for raw monthly values
-      error = function(e) {
-        message("Failed on item index ", i, ": ", conditionMessage(e))
-        return(NULL)
-      }
-    )
-    if (is.null(res)) return(invisible())
+#===============================================================================
+# SECTION 1: SYNTHETIC HS-LEVEL DATA (EXAMPLE)
+#===============================================================================
 
-    file_path <- file.path(out_dir, paste0("monthly-values-", res$safe_stem, ".png"))
-    ggsave(filename = file_path, plot = res$plot, width = 8.5, height = 5, dpi = 300)
-    message("Saved: ", file_path)
-  })
+set.seed(123)
+
+n_codes <- 400
+
+# Create fake HS-10 codes
+hs_codes <- sprintf("%010d", sample(1e9:1.5e9, n_codes))
+
+# We'll simulate three "types" of HS codes:
+# 1) Mostly duty-free: low coverage, low rate
+# 2) Mixed: medium coverage, modest rate
+# 3) Heavily tariffed: high coverage, higher rate
+
+type <- sample(c("duty_freeish", "mixed", "heavily_tariffed"),
+               size = n_codes,
+               replace = TRUE,
+               prob = c(0.4, 0.3, 0.3))
+
+synthetic_df <- tibble(
+  hs_code = hs_codes,
+  type    = type,
+  customs_value = runif(n_codes, min = 1e5, max = 5e7) # overall import value
+) %>%
+  rowwise() %>%
+  mutate(
+    # Simulate coverage and tariff rates depending on "type"
+    true_coverage = case_when(
+      type == "duty_freeish"      ~ runif(1, 0.00, 0.35),
+      type == "mixed"             ~ runif(1, 0.20, 0.75),
+      type == "heavily_tariffed"  ~ runif(1, 0.60, 1.00)
+    ),
+    true_tariff_dutiable = case_when(
+      type == "duty_freeish"      ~ runif(1, 0.000, 0.010), # ~0–1%
+      type == "mixed"             ~ runif(1, 0.005, 0.025), # 0.5–2.5%
+      type == "heavily_tariffed"  ~ runif(1, 0.020, 0.080)  # 2–8%
+    ),
+    dutiable_value = true_coverage * customs_value,
+    calculated_duties = true_tariff_dutiable * dutiable_value
+  ) %>%
+  ungroup()
+
+# For demonstration, this synthetic_df plays the role of your August 2025 extract:
+df_aug25_raw <- synthetic_df
+
+#===============================================================================
+# SECTION 2: COMPUTE COVERAGE, TARIFF_DUTIABLE, AND ETR
+#===============================================================================
+
+df_aug25 <- df_aug25_raw %>%
+  mutate(
+    coverage = if_else(customs_value > 0,
+                       dutiable_value / customs_value,
+                       NA_real_),
+    tariff_dutiable = if_else(dutiable_value > 0,
+                              calculated_duties / dutiable_value,
+                              NA_real_),
+    ETR = if_else(customs_value > 0,
+                  calculated_duties / customs_value,
+                  NA_real_)
+  )
+
+# Sanity check (synthetic case: these should be close to true_coverage/true_tariff_dutiable)
+df_aug25 %>%
+  select(hs_code, type, coverage, tariff_dutiable, ETR) %>%
+  head()
+
+#===============================================================================
+# SECTION 3: PREP DATA FOR CLUSTERING
+#===============================================================================
+
+df_use <- df_aug25 %>%
+  filter(
+    !is.na(coverage),
+    !is.na(tariff_dutiable),
+    customs_value > 0
+  )
+
+# Optional: drop very small flows to reduce noise from tiny trade lines
+min_value_threshold <- quantile(df_use$customs_value, 0.10, na.rm = TRUE)
+df_use <- df_use %>%
+  filter(customs_value >= min_value_threshold)
+
+# Data matrix for clustering
+X <- df_use %>%
+  select(coverage, tariff_dutiable) %>%
+  as.matrix()
+
+# Scale variables
+X_scaled <- scale(X)
+
+#===============================================================================
+# SECTION 4: K-MEANS CLUSTERING TO FIND "TARIFFED" GROUP
+#===============================================================================
+
+set.seed(123)
+k <- 3  # you can experiment with 2–4, but 3 is a good starting point
+
+km <- kmeans(X_scaled, centers = k)
+
+df_use <- df_use %>%
+  mutate(cluster = km$cluster)
+
+# Summarize clusters (import-value weighted)
+cluster_summary <- df_use %>%
+  group_by(cluster) %>%
+  summarise(
+    mean_cov  = weighted.mean(coverage, customs_value),
+    mean_rate = weighted.mean(tariff_dutiable, customs_value),
+    total_value = sum(customs_value),
+    n_codes   = n(),
+    .groups   = "drop"
+  )
+
+cat("Cluster summary:\n")
+print(cluster_summary)
+
+# Choose the "tariffed" cluster: highest (mean_cov + mean_rate)
+tariffed_cluster <- cluster_summary %>%
+  arrange(desc(mean_cov + mean_rate)) %>%
+  slice(1) %>%
+  pull(cluster)
+
+cat("\nChosen 'tariffed' cluster:", tariffed_cluster, "\n\n")
+
+#===============================================================================
+# SECTION 5: DATA-DRIVEN c_star AND r_star
+#===============================================================================
+
+tariffed_df <- df_use %>%
+  filter(cluster == tariffed_cluster)
+
+# Compute value-weighted 10th percentile thresholds
+c_star <- wtd_quantile(
+  tariffed_df$coverage,
+  weights = tariffed_df$customs_value,
+  probs = 0.10
+)
+
+r_star <- wtd_quantile(
+  tariffed_df$tariff_dutiable,
+  weights = tariffed_df$customs_value,
+  probs = 0.10
+)
+
+cat("Data-driven thresholds:\n")
+cat("  c_star (coverage threshold):        ", round(c_star, 4), "\n")
+cat("  r_star (tariff_dutiable threshold): ", round(r_star, 4), "\n\n")
+
+#===============================================================================
+# SECTION 6: APPLY THE RULE TO ALL HS CODES
+#===============================================================================
+
+df_aug25_flagged <- df_aug25 %>%
+  mutate(
+    coverage = if_else(customs_value > 0,
+                       dutiable_value / customs_value,
+                       NA_real_),
+    tariff_dutiable = if_else(dutiable_value > 0,
+                              calculated_duties / dutiable_value,
+                              NA_real_),
+    tariffed_flag = coverage >= c_star & tariff_dutiable >= r_star
+  )
+
+cat("Tariffed flag summary (by count of HS codes):\n")
+print(table(df_aug25_flagged$tariffed_flag, useNA = "ifany"))
+
+cat("\nTariffed flag summary (by import value):\n")
+print(df_aug25_flagged %>%
+        group_by(tariffed_flag) %>%
+        summarise(
+          total_value = sum(customs_value, na.rm = TRUE),
+          share_of_value = total_value / sum(df_aug25_flagged$customs_value, na.rm = TRUE),
+          n_codes = n(),
+          .groups = "drop"
+        ))
+
+#===============================================================================
+# SECTION 7: OPTIONAL — BACK OUT AN ETR THRESHOLD & PLOT
+#===============================================================================
+
+# ETR threshold from the "tariffed" cluster (e.g., value-weighted 10th percentile)
+etr_star <- wtd_quantile(
+  tariffed_df$ETR,
+  weights = tariffed_df$customs_value,
+  probs = 0.10
+)
+
+cat("\nDerived ETR threshold (etr_star):", round(etr_star, 4), "\n")
+
+# Compare ETR-based flag vs coverage+rate-based flag
+df_aug25_flagged <- df_aug25_flagged %>%
+  mutate(
+    tariffed_flag_ETR = ETR >= etr_star
+  )
+
+cat("\nCross-tab: rule-based vs ETR-based flags:\n")
+print(table(rule = df_aug25_flagged$tariffed_flag,
+            ETR_flag = df_aug25_flagged$tariffed_flag_ETR,
+            useNA = "ifany"))
+
+# Optional plot of clusters in synthetic example
+ggplot(df_use, aes(x = coverage, y = tariff_dutiable,
+                   color = factor(cluster))) +
+  geom_point(alpha = 0.6) +
+  geom_vline(xintercept = c_star, linetype = "dashed") +
+  geom_hline(yintercept = r_star, linetype = "dashed") +
+  labs(
+    title = "Coverage vs Tariff on Dutiable Value (Synthetic HS Data)",
+    subtitle = paste("Dashed lines show c_star and r_star; tariffed cluster =", tariffed_cluster),
+    x = "Coverage (dutiable_value / customs_value)",
+    y = "Tariff on dutiable value (duties / dutiable_value)",
+    color = "Cluster"
+  ) +
+  theme_minimal()
