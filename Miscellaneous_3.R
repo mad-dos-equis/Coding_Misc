@@ -891,7 +891,22 @@ integrate_rauch_benchmark <- function(
   # --- Step 8: Compare classifications ---
   dt[, benchmark_match := rauch_category == rauch_benchmark]
   
-  # --- Step 9: Compute summaries ---
+ # --- Step 9: Reconcile to final classification ---
+  # Priority: Use Rauch (1999) for high-confidence benchmarks, GMM elsewhere
+  dt[, rauch_final := fcase(
+    benchmark_tier == "tier1_direct", rauch_benchmark,
+    benchmark_tier == "tier2_inherited" & rauch_unanimous == TRUE, rauch_benchmark,
+    default = rauch_category
+  )]
+  
+  # Track source of final classification
+ dt[, final_source := fcase(
+    benchmark_tier == "tier1_direct", "rauch_1999",
+    benchmark_tier == "tier2_inherited" & rauch_unanimous == TRUE, "rauch_1999",
+    default = "gmm"
+  )]
+  
+  # --- Step 10: Compute summaries ---
   coverage_summary <- dt[, .(
     n_hs6 = .N,
     n_with_benchmark = sum(!is.na(rauch_benchmark)),
@@ -902,7 +917,9 @@ integrate_rauch_benchmark <- function(
     n_tier1 = sum(benchmark_tier == "tier1_direct", na.rm = TRUE),
     n_tier2 = sum(benchmark_tier %in% c("tier2_inherited", "tier2_ambiguous"), na.rm = TRUE),
     n_tier3 = sum(benchmark_tier == "tier3_poor_concordance", na.rm = TRUE),
-    n_no_coverage = sum(benchmark_tier == "no_coverage", na.rm = TRUE)
+    n_no_coverage = sum(benchmark_tier == "no_coverage", na.rm = TRUE),
+    n_final_from_rauch = sum(final_source == "rauch_1999", na.rm = TRUE),
+    n_final_from_gmm = sum(final_source == "gmm", na.rm = TRUE)
   )]
   
   # Agreement matrix (confusion matrix) for Tier 1 only
@@ -937,6 +954,12 @@ integrate_rauch_benchmark <- function(
     cat("\nAgreement with Rauch (1999):\n")
     cat("  Overall: ", coverage_summary$pct_match_all, "%\n", sep = "")
     cat("  Tier 1 only: ", coverage_summary$pct_match_tier1, "%\n", sep = "")
+    
+    cat("\n=== Final Classification Sources ===\n")
+    cat("  From Rauch (1999): ", coverage_summary$n_final_from_rauch, 
+        " (", round(100 * coverage_summary$n_final_from_rauch / coverage_summary$n_hs6, 1), "%)\n", sep = "")
+    cat("  From GMM: ", coverage_summary$n_final_from_gmm,
+        " (", round(100 * coverage_summary$n_final_from_gmm / coverage_summary$n_hs6, 1), "%)\n", sep = "")
     
     if (!is.null(agreement_wide) && nrow(agreement_wide) > 0) {
       cat("\n=== Agreement Matrix (Tier 1) ===\n")
@@ -1157,7 +1180,18 @@ export_results <- function(results, output_dir = "output", prefix = "homogeneity
 #' 5. Export:
 #'    export_results(results, output_dir = "output")
 #'
-#' 6. Benchmark-specific queries:
+#' 6. Final classification queries:
+#'
+#'    # Use rauch_final for the reconciled classification
+#'    results$combined[, .N, by = rauch_final]
+#'
+#'    # See where final classification came from
+#'    results$combined[, .N, by = final_source]
+#'
+#'    # Homogeneous goods (final)
+#'    results$combined[rauch_final == "homogeneous"]
+#'
+#' 7. Benchmark-specific queries:
 #'
 #'    # HS6 codes where GMM disagrees with Rauch (1999) - Tier 1 only
 #'    results$combined[benchmark_tier == "tier1_direct" & benchmark_match == FALSE]
@@ -1170,7 +1204,7 @@ export_results <- function(results, output_dir = "output", prefix = "homogeneity
 #'      .(n = .N, pct_match = mean(benchmark_match)), 
 #'      by = rauch_category]
 #'
-#' 7. Disable benchmark (if concordance package unavailable):
+#' 8. Disable benchmark (if concordance package unavailable):
 #'    config$use_rauch_benchmark <- FALSE
 #'    results <- run_full_pipeline(dt, config)
 
@@ -1198,6 +1232,9 @@ export_results <- function(results, output_dir = "output", prefix = "homogeneity
 # print(results$combined[order(med_log_gap_eq)])
 # print(results$rauch$category_summary)
 #
+# # --- View final classification distribution ---
+# print(results$combined[, .N, by = .(rauch_final, final_source)])
+#
 # # --- View benchmark results ---
 # if (!is.null(results$benchmark)) {
 #   print(results$benchmark$coverage_summary)
@@ -1206,7 +1243,7 @@ export_results <- function(results, output_dir = "output", prefix = "homogeneity
 #   # Disagreements worth investigating
 #   print(results$combined[
 #     benchmark_tier == "tier1_direct" & benchmark_match == FALSE,
-#     .(hs6, rauch_category, rauch_benchmark, med_H_eq)
+#     .(hs6, rauch_category, rauch_benchmark, rauch_final, med_H_eq)
 #   ])
 # }
 #
