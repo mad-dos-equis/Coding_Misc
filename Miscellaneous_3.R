@@ -24,13 +24,11 @@ config <- list(
   
   # --- Homogeneity pipeline parameters ---
   min_exporters = 10,        # Minimum exporters required for reliable estimates
-
   min_coverage  = 0.85,      # Minimum value share in dominant UOM
   trim_tail     = 0.01,      # Trim extreme prices (0.01 = drop top/bottom 1%)
   min_Q_exporter = 0,        # Minimum quantity per exporter (0 = no filter)
   min_V_exporter = 0,        # Minimum value per exporter (0 = no filter)
   
-
   # --- Divergence testing parameters ---
   R_boot = 500,              # Bootstrap replications for CI
   R_perm = 500,              # Permutation replications for p-value
@@ -41,7 +39,12 @@ config <- list(
   n_components = 3,          # Max GMM components (2 or 3)
   min_years_classify = 3,    # Minimum years for classification
   instability_override_quantile = 0.90,  # CV threshold for stability override
-  use_2d = TRUE              # Use 2D GMM (dispersion + stability) if possible
+  use_2d = TRUE,             # Use 2D GMM (dispersion + stability) if possible
+  
+  # --- Rauch (1999) benchmark parameters ---
+  use_rauch_benchmark = TRUE,           # Compare against original Rauch classifications
+  rauch_variant = "conservative",       # "conservative" or "liberal"
+  hs_vintage = "HS6"                    # Your data's HS revision (for concordance)
 )
 
 # =============================================================================
@@ -627,6 +630,309 @@ classify_years_rauch <- function(year_level, hs6_classification) {
 }
 
 # =============================================================================
+# RAUCH (1999) BENCHMARK INTEGRATION
+# =============================================================================
+
+get_rauch_sitc4 <- function(variant = "conservative") {
+#
+# Retrieves original Rauch (1999) classifications at SITC Rev.2 4-digit level
+# Uses the concordance package if available, otherwise loads from bundled data
+#
+# Arguments:
+#   variant: "conservative" or "liberal" (Rauch provides both)
+#
+# Returns:
+#   data.table with columns: sitc4, rauch_original
+#
+  
+  # Try concordance package first
+ if (requireNamespace("concordance", quietly = TRUE)) {
+    rauch_raw <- concordance::sitc2_rauch()
+    rauch_dt <- as.data.table(rauch_raw)
+    
+    # The concordance package returns sitc.code, con, lib columns
+    setnames(rauch_dt, "sitc.code", "sitc4", skip_absent = TRUE)
+    
+    col <- if (variant == "conservative") "con" else "lib"
+    
+    if (!col %in% names(rauch_dt)) {
+      stop("Rauch variant column '", col, "' not found in concordance::sitc2_rauch()")
+    }
+    
+    rauch_dt[, rauch_original := fcase(
+      get(col) == "w", "homogeneous",
+      get(col) == "r", "reference",
+      get(col) == "n", "differentiated",
+      default = NA_character_
+    )]
+    
+    rauch_dt <- rauch_dt[!is.na(rauch_original), .(sitc4, rauch_original)]
+    rauch_dt[, sitc4 := as.character(sitc4)]
+    
+    # Pad to 4 digits if needed
+    rauch_dt[nchar(sitc4) < 4, sitc4 := sprintf("%04d", as.integer(sitc4))]
+    
+    return(rauch_dt[])
+  }
+  
+  stop("Package 'concordance' is required for Rauch benchmark. Install with: install.packages('concordance')")
+}
+
+get_sitc4_hs6_crosswalk <- function(hs_vintage = "HS6") {
+#
+# Builds a crosswalk from SITC Rev.2 4-digit to HS 6-digit
+# Uses the concordance package
+#
+# Arguments:
+#   hs_vintage: HS revision identifier (used for documentation; 
+#               concordance package handles the mapping)
+#
+# Returns:
+#   data.table with columns: sitc4, hs6
+#
+# Note: This is a many-to-many mapping. One SITC4 can map to multiple HS6 codes
+#       and vice versa.
+#
+  
+  if (!requireNamespace("concordance", quietly = TRUE)) {
+    stop("Package 'concordance' is required. Install with: install.packages('concordance')")
+  }
+  
+  # Get all SITC4 codes from Rauch
+  rauch_sitc4 <- get_rauch_sitc4()
+  sitc4_codes <- unique(rauch_sitc4$sitc4)
+  
+  # Use concordance to map SITC4 -> HS6
+  # The concordance package's concord_sitc_hs function or concord() handles this
+  
+  crosswalk_list <- lapply(sitc4_codes, function(s4) {
+    # Try to concord each SITC4 code
+    hs6_matches <- tryCatch({
+      concordance::concord(
+        sourcevar = s4,
+        origin = "SITC2", 
+        destination = "HS",
+        dest.digit = 6
+      )
+    }, error = function(e) NA_character_)
+    
+    if (length(hs6_matches) == 0 || all(is.na(hs6_matches))) {
+      return(NULL)
+    }
+    
+    data.table(sitc4 = s4, hs6 = as.character(hs6_matches))
+  })
+  
+  crosswalk <- rbindlist(crosswalk_list, use.names = TRUE)
+  
+  if (nrow(crosswalk) == 0) {
+    warning("Concordance returned no mappings. Check concordance package version and data.")
+    return(data.table(sitc4 = character(), hs6 = character()))
+  }
+  
+  # Clean HS6 codes (ensure 6 digits, remove any with letters unless valid)
+  crosswalk <- crosswalk[!is.na(hs6) & nchar(hs6) >= 4]
+  crosswalk[, hs6 := gsub("[^0-9]", "", hs6)]
+  crosswalk[nchar(hs6) == 4, hs6 := paste0(hs6, "00")]
+  crosswalk[nchar(hs6) == 5, hs6 := paste0(hs6, "0")]
+  crosswalk <- crosswalk[nchar(hs6) == 6]
+  
+  # Remove duplicates
+  crosswalk <- unique(crosswalk)
+  
+  return(crosswalk[])
+}
+
+integrate_rauch_benchmark <- function(
+    classification,
+    config,
+    crosswalk = NULL,
+    verbose = TRUE
+) {
+#
+# Integrates original Rauch (1999) classifications as benchmark/prior
+#
+# Arguments:
+#   classification: Output from classify_rauch_gmm() - the $classification table
+#   config:         Configuration list with rauch_variant and hs_vintage
+#   crosswalk:      Optional pre-computed SITC4-HS6 crosswalk (if NULL, computed fresh)
+#   verbose:        Print progress
+#
+# Returns:
+#   List with:
+#     - classification: Enhanced classification with benchmark columns
+#     - coverage_summary: Coverage statistics
+#     - agreement_matrix: Confusion matrix for Tier 1 matches
+#     - crosswalk: The SITC4-HS6 crosswalk used
+#
+  
+  dt <- copy(classification)
+  
+  if (verbose) cat("Loading Rauch (1999) original classifications...\n")
+  
+  # --- Step 1: Get Rauch classifications at SITC4 ---
+  rauch_sitc4 <- get_rauch_sitc4(variant = config$rauch_variant)
+  
+  if (verbose) {
+    cat("  Rauch SITC4 codes loaded: ", format(nrow(rauch_sitc4), big.mark = ","), "\n")
+    cat("  Variant: ", config$rauch_variant, "\n")
+    cat("  Distribution:\n")
+    print(rauch_sitc4[, .N, by = rauch_original][order(-N)])
+  }
+  
+  # --- Step 2: Build or use provided crosswalk ---
+  if (is.null(crosswalk)) {
+    if (verbose) cat("\nBuilding SITC4 -> HS6 crosswalk (this may take a moment)...\n")
+    crosswalk <- get_sitc4_hs6_crosswalk(hs_vintage = config$hs_vintage)
+  }
+  
+  if (nrow(crosswalk) == 0) {
+    warning("Empty crosswalk; cannot integrate Rauch benchmark")
+    dt[, `:=`(
+      rauch_benchmark = NA_character_,
+      rauch_unanimous = NA,
+      concordance_quality = NA_character_,
+      benchmark_tier = "no_crosswalk",
+      benchmark_match = NA
+    )]
+    return(list(
+      classification = dt,
+      coverage_summary = data.table(
+        n_hs6 = nrow(dt), pct_with_benchmark = 0,
+        pct_match = NA_real_, pct_tier1 = 0, pct_tier2 = 0, pct_no_coverage = 1
+      ),
+      agreement_matrix = NULL,
+      crosswalk = crosswalk
+    ))
+  }
+  
+  if (verbose) {
+    cat("  Crosswalk mappings: ", format(nrow(crosswalk), big.mark = ","), "\n")
+    cat("  Unique SITC4 codes: ", format(uniqueN(crosswalk$sitc4), big.mark = ","), "\n")
+    cat("  Unique HS6 codes: ", format(uniqueN(crosswalk$hs6), big.mark = ","), "\n")
+  }
+  
+  # --- Step 3: Assess concordance quality ---
+  crosswalk[, n_hs6_per_sitc4 := .N, by = sitc4]
+  crosswalk[, n_sitc4_per_hs6 := .N, by = hs6]
+  
+  crosswalk[, concordance_quality := fcase(
+    n_hs6_per_sitc4 == 1 & n_sitc4_per_hs6 == 1, "exact",
+    n_hs6_per_sitc4 <= 3 & n_sitc4_per_hs6 == 1, "good",
+    n_sitc4_per_hs6 == 1, "acceptable",
+    default = "poor"
+  )]
+  
+  # --- Step 4: Merge Rauch to crosswalk ---
+  crosswalk_rauch <- rauch_sitc4[crosswalk, on = "sitc4"]
+  
+  # --- Step 5: Aggregate to HS6 level ---
+  # For HS6 codes mapping to multiple SITC4 with different Rauch categories,
+  # take modal category and flag if not unanimous
+  hs6_rauch <- crosswalk_rauch[
+    !is.na(rauch_original),
+    .(
+      rauch_benchmark = {
+        tab <- table(rauch_original)
+        names(tab)[which.max(tab)]
+      },
+      rauch_unanimous = uniqueN(rauch_original) == 1,
+      n_sitc4_sources = uniqueN(sitc4),
+      concordance_quality = {
+        # Take best quality among sources
+        quals <- unique(concordance_quality)
+        if ("exact" %in% quals) "exact"
+        else if ("good" %in% quals) "good"
+        else if ("acceptable" %in% quals) "acceptable"
+        else "poor"
+      }
+    ),
+    by = hs6
+  ]
+  
+  if (verbose) {
+    cat("\nHS6 codes with Rauch benchmark: ", format(nrow(hs6_rauch), big.mark = ","), "\n")
+  }
+  
+  # --- Step 6: Merge with GMM classification ---
+  dt <- hs6_rauch[dt, on = "hs6"]
+  
+  # --- Step 7: Determine benchmark tier ---
+  dt[, benchmark_tier := fcase(
+    is.na(rauch_benchmark), "no_coverage",
+    concordance_quality == "exact" & rauch_unanimous == TRUE, "tier1_direct",
+    concordance_quality %in% c("good", "acceptable") & rauch_unanimous == TRUE, "tier2_inherited",
+    rauch_unanimous == FALSE, "tier2_ambiguous",
+    concordance_quality == "poor", "tier3_poor_concordance",
+    default = "tier2_inherited"
+  )]
+  
+  # --- Step 8: Compare classifications ---
+  dt[, benchmark_match := rauch_category == rauch_benchmark]
+  
+  # --- Step 9: Compute summaries ---
+  coverage_summary <- dt[, .(
+    n_hs6 = .N,
+    n_with_benchmark = sum(!is.na(rauch_benchmark)),
+    pct_with_benchmark = round(100 * mean(!is.na(rauch_benchmark)), 1),
+    pct_match_all = round(100 * mean(benchmark_match, na.rm = TRUE), 1),
+    pct_match_tier1 = round(100 * mean(benchmark_match[benchmark_tier == "tier1_direct"], na.rm = TRUE), 1),
+    pct_match_tier2 = round(100 * mean(benchmark_match[benchmark_tier %in% c("tier2_inherited", "tier2_ambiguous")], na.rm = TRUE), 1),
+    n_tier1 = sum(benchmark_tier == "tier1_direct", na.rm = TRUE),
+    n_tier2 = sum(benchmark_tier %in% c("tier2_inherited", "tier2_ambiguous"), na.rm = TRUE),
+    n_tier3 = sum(benchmark_tier == "tier3_poor_concordance", na.rm = TRUE),
+    n_no_coverage = sum(benchmark_tier == "no_coverage", na.rm = TRUE)
+  )]
+  
+  # Agreement matrix (confusion matrix) for Tier 1 only
+  agreement_matrix <- dt[
+    benchmark_tier == "tier1_direct" & !is.na(rauch_benchmark),
+    .N,
+    by = .(gmm_category = rauch_category, rauch_1999 = rauch_benchmark)
+  ]
+  
+  # Convert to wide format for easier reading
+  if (nrow(agreement_matrix) > 0) {
+    agreement_wide <- dcast(
+      agreement_matrix, 
+      gmm_category ~ rauch_1999, 
+      value.var = "N", 
+      fill = 0
+    )
+  } else {
+    agreement_wide <- NULL
+  }
+  
+  if (verbose) {
+    cat("\n=== Benchmark Coverage Summary ===\n")
+    cat("Total HS6 codes: ", coverage_summary$n_hs6, "\n")
+    cat("With Rauch benchmark: ", coverage_summary$n_with_benchmark, 
+        " (", coverage_summary$pct_with_benchmark, "%)\n", sep = "")
+    cat("\nBy tier:\n")
+    cat("  Tier 1 (direct match): ", coverage_summary$n_tier1, "\n")
+    cat("  Tier 2 (inherited): ", coverage_summary$n_tier2, "\n")
+    cat("  Tier 3 (poor concordance): ", coverage_summary$n_tier3, "\n")
+    cat("  No coverage: ", coverage_summary$n_no_coverage, "\n")
+    cat("\nAgreement with Rauch (1999):\n")
+    cat("  Overall: ", coverage_summary$pct_match_all, "%\n", sep = "")
+    cat("  Tier 1 only: ", coverage_summary$pct_match_tier1, "%\n", sep = "")
+    
+    if (!is.null(agreement_wide) && nrow(agreement_wide) > 0) {
+      cat("\n=== Agreement Matrix (Tier 1) ===\n")
+      cat("Rows = GMM classification, Columns = Rauch (1999)\n\n")
+      print(agreement_wide)
+    }
+  }
+  
+  list(
+    classification = dt[],
+    coverage_summary = coverage_summary,
+    agreement_matrix = agreement_wide,
+    crosswalk = crosswalk
+  )
+}
+
+# =============================================================================
 # MAIN PIPELINE FUNCTION
 # =============================================================================
 
@@ -635,7 +941,9 @@ run_full_pipeline <- function(dt, config, verbose = TRUE) {
 # Runs the complete pipeline:
 #   1. Homogeneity metrics
 #   2. Divergence tests
-#   3. Rauch classification
+#   3. Rauch classification (GMM-based)
+#   4. Year-level classification
+#   5. Rauch (1999) benchmark comparison (optional)
 #
 # Arguments:
 #   dt:      Validated trade data (data.table)
@@ -662,7 +970,7 @@ run_full_pipeline <- function(dt, config, verbose = TRUE) {
     cat("HS6 codes with significant divergence: ", n_flagged, "\n")
   }
   
-  if (verbose) cat("\n=== Step 3: Rauch Classification ===\n")
+  if (verbose) cat("\n=== Step 3: Rauch Classification (GMM) ===\n")
   rauch <- classify_rauch_gmm(homog$year_level, homog$hs6_level, config)
   
   if (verbose) {
@@ -674,11 +982,34 @@ run_full_pipeline <- function(dt, config, verbose = TRUE) {
   if (verbose) cat("\n=== Step 4: Year-Level Classification ===\n")
   year_rauch <- classify_years_rauch(homog$year_level, rauch)
   
-  # Combine results
-  combined <- rauch$classification[
-    div$hs6_level[, .(hs6, med_delta, flag_divergence, dominant_direction)],
-    on = "hs6"
-  ]
+  # --- Step 5: Rauch (1999) Benchmark Integration ---
+  benchmark <- NULL
+  if (isTRUE(config$use_rauch_benchmark)) {
+    if (verbose) cat("\n=== Step 5: Rauch (1999) Benchmark Comparison ===\n")
+    
+    benchmark <- tryCatch({
+      integrate_rauch_benchmark(
+        classification = rauch$classification,
+        config = config,
+        verbose = verbose
+      )
+    }, error = function(e) {
+      warning("Rauch benchmark integration failed: ", e$message)
+      if (verbose) cat("Benchmark integration skipped due to error.\n")
+      NULL
+    })
+  }
+  
+  # --- Combine results ---
+  # Start with divergence results
+  combined <- div$hs6_level[, .(hs6, med_delta, flag_divergence, dominant_direction)]
+  
+  # Merge with classification (use benchmark-enhanced if available)
+  if (!is.null(benchmark)) {
+    combined <- benchmark$classification[combined, on = "hs6"]
+  } else {
+    combined <- rauch$classification[combined, on = "hs6"]
+  }
   
   if (verbose) {
     cat("\n=== Pipeline Complete ===\n")
@@ -690,6 +1021,7 @@ run_full_pipeline <- function(dt, config, verbose = TRUE) {
     divergence = div,
     rauch = rauch,
     year_rauch = year_rauch,
+    benchmark = benchmark,
     combined = combined,
     config = config
   )
@@ -730,6 +1062,20 @@ export_results <- function(results, output_dir = "output", prefix = "homogeneity
   fwrite(results$year_rauch$year_classified,
          file.path(output_dir, paste0(prefix, "_year_rauch.csv")))
   
+  # Benchmark outputs (if available)
+  if (!is.null(results$benchmark)) {
+    fwrite(results$benchmark$coverage_summary,
+           file.path(output_dir, paste0(prefix, "_benchmark_coverage.csv")))
+    
+    if (!is.null(results$benchmark$agreement_matrix)) {
+      fwrite(results$benchmark$agreement_matrix,
+             file.path(output_dir, paste0(prefix, "_benchmark_agreement.csv")))
+    }
+    
+    fwrite(results$benchmark$crosswalk,
+           file.path(output_dir, paste0(prefix, "_sitc4_hs6_crosswalk.csv")))
+  }
+  
   cat("Results exported to:", output_dir, "\n")
   cat("Files:\n")
   cat("  - ", prefix, "_year_level.csv\n", sep = "")
@@ -738,6 +1084,12 @@ export_results <- function(results, output_dir = "output", prefix = "homogeneity
   cat("  - ", prefix, "_rauch_classification.csv\n", sep = "")
   cat("  - ", prefix, "_combined.csv\n", sep = "")
   cat("  - ", prefix, "_year_rauch.csv\n", sep = "")
+  
+  if (!is.null(results$benchmark)) {
+    cat("  - ", prefix, "_benchmark_coverage.csv\n", sep = "")
+    cat("  - ", prefix, "_benchmark_agreement.csv\n", sep = "")
+    cat("  - ", prefix, "_sitc4_hs6_crosswalk.csv\n", sep = "")
+  }
 }
 
 # =============================================================================
@@ -774,19 +1126,42 @@ export_results <- function(results, output_dir = "output", prefix = "homogeneity
 #'    results <- run_full_pipeline(dt, config)
 #'
 #' 4. Access results:
-#'    results$combined                    # Main HS6-level output
+#'    results$combined                    # Main HS6-level output (includes benchmark if enabled)
 #'    results$homogeneity$year_level      # Year-level metrics
-#'    results$rauch$classification        # Rauch categories
+#'    results$rauch$classification        # Rauch categories (GMM-based)
 #'    results$divergence$hs6_level        # Divergence test results
+#'    results$benchmark$coverage_summary  # Rauch (1999) benchmark coverage
+#'    results$benchmark$agreement_matrix  # GMM vs Rauch (1999) confusion matrix
 #'
 #' 5. Export:
 #'    export_results(results, output_dir = "output")
+#'
+#' 6. Benchmark-specific queries:
+#'
+#'    # HS6 codes where GMM disagrees with Rauch (1999) - Tier 1 only
+#'    results$combined[benchmark_tier == "tier1_direct" & benchmark_match == FALSE]
+#'
+#'    # HS6 codes with no Rauch (1999) coverage (new products)
+#'    results$combined[benchmark_tier == "no_coverage"]
+#'
+#'    # Agreement rate by GMM category
+#'    results$combined[!is.na(rauch_benchmark), 
+#'      .(n = .N, pct_match = mean(benchmark_match)), 
+#'      by = rauch_category]
+#'
+#' 7. Disable benchmark (if concordance package unavailable):
+#'    config$use_rauch_benchmark <- FALSE
+#'    results <- run_full_pipeline(dt, config)
 
 
 # =============================================================================
 # UNCOMMENT BELOW TO RUN
 # =============================================================================
 
+# # --- Prerequisites ---
+# # install.packages("concordance")  # Required for Rauch (1999) benchmark
+# # install.packages("mclust")       # Required for GMM classification
+#
 # # --- Load and validate data ---
 # dt <- load_trade_data(c(
 #   "data/trade_2022.csv",
@@ -795,12 +1170,24 @@ export_results <- function(results, output_dir = "output", prefix = "homogeneity
 # ))
 # dt <- validate_trade_data(dt)
 #
-# # --- Run pipeline ---
+# # --- Run pipeline (with benchmark) ---
 # results <- run_full_pipeline(dt, config, verbose = TRUE)
 #
 # # --- View key outputs ---
 # print(results$combined[order(med_log_gap_eq)])
 # print(results$rauch$category_summary)
+#
+# # --- View benchmark results ---
+# if (!is.null(results$benchmark)) {
+#   print(results$benchmark$coverage_summary)
+#   print(results$benchmark$agreement_matrix)
+#   
+#   # Disagreements worth investigating
+#   print(results$combined[
+#     benchmark_tier == "tier1_direct" & benchmark_match == FALSE,
+#     .(hs6, rauch_category, rauch_benchmark, med_H_eq)
+#   ])
+# }
 #
 # # --- Export ---
 # export_results(results, output_dir = "output", prefix = "trade_homogeneity")
