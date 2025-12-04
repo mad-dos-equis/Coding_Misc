@@ -636,7 +636,7 @@ classify_years_rauch <- function(year_level, hs6_classification) {
 get_rauch_sitc4 <- function(variant = "conservative") {
 #
 # Retrieves original Rauch (1999) classifications at SITC Rev.2 4-digit level
-# Uses the concordance package if available, otherwise loads from bundled data
+# Uses the concordance package
 #
 # Arguments:
 #   variant: "conservative" or "liberal" (Rauch provides both)
@@ -645,37 +645,44 @@ get_rauch_sitc4 <- function(variant = "conservative") {
 #   data.table with columns: sitc4, rauch_original
 #
   
-  # Try concordance package first
- if (requireNamespace("concordance", quietly = TRUE)) {
-    rauch_raw <- concordance::sitc2_rauch()
-    rauch_dt <- as.data.table(rauch_raw)
-    
-    # The concordance package returns sitc.code, con, lib columns
-    setnames(rauch_dt, "sitc.code", "sitc4", skip_absent = TRUE)
-    
-    col <- if (variant == "conservative") "con" else "lib"
-    
-    if (!col %in% names(rauch_dt)) {
-      stop("Rauch variant column '", col, "' not found in concordance::sitc2_rauch()")
-    }
-    
-    rauch_dt[, rauch_original := fcase(
-      get(col) == "w", "homogeneous",
-      get(col) == "r", "reference",
-      get(col) == "n", "differentiated",
-      default = NA_character_
-    )]
-    
-    rauch_dt <- rauch_dt[!is.na(rauch_original), .(sitc4, rauch_original)]
-    rauch_dt[, sitc4 := as.character(sitc4)]
-    
-    # Pad to 4 digits if needed
-    rauch_dt[nchar(sitc4) < 4, sitc4 := sprintf("%04d", as.integer(sitc4))]
-    
-    return(rauch_dt[])
+  if (!requireNamespace("concordance", quietly = TRUE)) {
+    stop("Package 'concordance' is required for Rauch benchmark. Install with: install.packages('concordance')")
   }
   
-  stop("Package 'concordance' is required for Rauch benchmark. Install with: install.packages('concordance')")
+  # sitc2_rauch is a dataset, not a function
+  rauch_raw <- concordance::sitc2_rauch
+  rauch_dt <- as.data.table(rauch_raw)
+  
+  # Standardize column names to lowercase
+  setnames(rauch_dt, names(rauch_dt), tolower(names(rauch_dt)))
+  
+  # Rename sitc2 to sitc4 (it's actually 4-digit SITC Rev.2)
+  if ("sitc2" %in% names(rauch_dt)) {
+    setnames(rauch_dt, "sitc2", "sitc4")
+  }
+  
+  # Determine which column to use for classification
+  col <- if (variant == "conservative") "con" else "lib"
+  
+  if (!col %in% names(rauch_dt)) {
+    stop("Rauch variant column '", col, "' not found. Available columns: ", 
+         paste(names(rauch_dt), collapse = ", "))
+  }
+  
+  # Map Rauch codes to categories
+  col_vals <- rauch_dt[[col]]
+  rauch_dt$rauch_original <- NA_character_
+  rauch_dt$rauch_original[col_vals == "w"] <- "homogeneous"
+  rauch_dt$rauch_original[col_vals == "r"] <- "reference"
+  rauch_dt$rauch_original[col_vals == "n"] <- "differentiated"
+  
+  rauch_dt <- rauch_dt[!is.na(rauch_original), .(sitc4, rauch_original)]
+  rauch_dt[, sitc4 := as.character(sitc4)]
+  
+  # Pad to 4 digits if needed
+  rauch_dt[nchar(sitc4) < 4, sitc4 := sprintf("%04d", as.integer(sitc4))]
+  
+  return(rauch_dt[])
 }
 
 get_sitc4_hs6_crosswalk <- function(hs_vintage = "HS6") {
@@ -702,10 +709,19 @@ get_sitc4_hs6_crosswalk <- function(hs_vintage = "HS6") {
   rauch_sitc4 <- get_rauch_sitc4()
   sitc4_codes <- unique(rauch_sitc4$sitc4)
   
-  # Use concordance to map SITC4 -> HS6
-  # The concordance package's concord_sitc_hs function or concord() handles this
+  cat("  Building crosswalk for", length(sitc4_codes), "SITC4 codes...\n")
   
-  crosswalk_list <- lapply(sitc4_codes, function(s4) {
+  # Use concordance to map SITC4 -> HS6
+  # Try different concordance approaches based on what's available
+  
+  crosswalk_list <- lapply(seq_along(sitc4_codes), function(i) {
+    s4 <- sitc4_codes[i]
+    
+    # Progress indicator every 100 codes
+    if (i %% 200 == 0) {
+      cat("    Processed", i, "of", length(sitc4_codes), "codes\n")
+    }
+    
     # Try to concord each SITC4 code
     hs6_matches <- tryCatch({
       concordance::concord(
@@ -714,7 +730,10 @@ get_sitc4_hs6_crosswalk <- function(hs_vintage = "HS6") {
         destination = "HS",
         dest.digit = 6
       )
-    }, error = function(e) NA_character_)
+    }, error = function(e) {
+      # If concord fails, return NA
+      NA_character_
+    })
     
     if (length(hs6_matches) == 0 || all(is.na(hs6_matches))) {
       return(NULL)
@@ -723,7 +742,7 @@ get_sitc4_hs6_crosswalk <- function(hs_vintage = "HS6") {
     data.table(sitc4 = s4, hs6 = as.character(hs6_matches))
   })
   
-  crosswalk <- rbindlist(crosswalk_list, use.names = TRUE)
+  crosswalk <- rbindlist(crosswalk_list, use.names = TRUE, fill = TRUE)
   
   if (nrow(crosswalk) == 0) {
     warning("Concordance returned no mappings. Check concordance package version and data.")
@@ -739,6 +758,8 @@ get_sitc4_hs6_crosswalk <- function(hs_vintage = "HS6") {
   
   # Remove duplicates
   crosswalk <- unique(crosswalk)
+  
+  cat("  Crosswalk complete:", nrow(crosswalk), "mappings\n")
   
   return(crosswalk[])
 }
