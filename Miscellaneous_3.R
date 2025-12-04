@@ -71,53 +71,138 @@ config <- list(
 # DATA LOADING FUNCTION (CUSTOMIZE THIS)
 # =============================================================================
 
-load_trade_data <- function(path = NULL) {
+load_trade_data <- function(paths = NULL, id_col = NULL) {
 #
-# Customize this function to load your data
-# Return a data.table with the required columns
+# Load and combine trade data from one or more files
 #
-# Options:
-#   - Read from CSV/parquet/RDS
-#   - Query from database
-#   - Load from existing R object
+# Arguments:
+#   paths:   Character vector of file paths (CSV, RDS, Parquet, or Stata)
+#            Can also be a single path or a directory path
+#   id_col:  Optional name for source identifier column (e.g., "source_file")
+#            If provided, adds a column indicating which file each row came from
+#
+# Returns:
+#   Combined data.table with all observations
+#
+# Examples:
+#   # Single file
+#   dt <- load_trade_data("data/trade_2023.csv")
+#
+#   # Multiple files explicitly
+#   dt <- load_trade_data(c("data/trade_2022.csv", 
+#                           "data/trade_2023.csv", 
+#                           "data/trade_2024.csv"))
+#
+#   # All CSVs in a directory
+#   dt <- load_trade_data("data/annual/")
+#
+#   # With source tracking
+#   dt <- load_trade_data(c("comtrade.csv", "census.csv"), id_col = "source")
 #
   
-  if (is.null(path)) {
-    stop("Please provide a data path or modify load_trade_data() to load your data")
+  if (is.null(paths)) {
+    stop("Please provide file path(s) or modify load_trade_data() to load your data")
   }
   
-  # --- Option 1: CSV ---
-  if (grepl("\\.csv$", path, ignore.case = TRUE)) {
-    dt <- fread(path, colClasses = c(hs6 = "character"))
-  }
-  
-  # --- Option 2: RDS ---
-  else if (grepl("\\.rds$", path, ignore.case = TRUE)) {
-    dt <- as.data.table(readRDS(path))
-  }
-  
-  # --- Option 3: Parquet (requires arrow) ---
-  else if (grepl("\\.parquet$", path, ignore.case = TRUE)) {
-    if (!requireNamespace("arrow", quietly = TRUE)) {
-      stop("Package 'arrow' required to read parquet files")
+  # If a directory is provided, find all supported files
+ if (length(paths) == 1 && dir.exists(paths)) {
+    dir_path <- paths
+    paths <- list.files(
+      dir_path, 
+      pattern = "\\.(csv|rds|parquet|dta)$", 
+      full.names = TRUE, 
+      ignore.case = TRUE
+    )
+    if (length(paths) == 0) {
+      stop("No supported files found in directory: ", dir_path)
     }
-    dt <- as.data.table(arrow::read_parquet(path))
+    cat("Found", length(paths), "files in", dir_path, "\n")
   }
   
-  # --- Option 4: Stata .dta (requires haven) ---
-  else if (grepl("\\.dta$", path, ignore.case = TRUE)) {
-    if (!requireNamespace("haven", quietly = TRUE)) {
-      stop("Package 'haven' required to read Stata files")
+  # Function to load a single file
+  load_single <- function(path) {
+    
+    if (!file.exists(path)) {
+      stop("File not found: ", path)
     }
-    dt <- as.data.table(haven::read_dta(path))
+    
+    ext <- tolower(tools::file_ext(path))
+    
+    dt <- switch(ext,
+      "csv" = fread(path, colClasses = c(hs6 = "character")),
+      "rds" = as.data.table(readRDS(path)),
+      "parquet" = {
+        if (!requireNamespace("arrow", quietly = TRUE)) {
+          stop("Package 'arrow' required to read parquet files")
+        }
+        as.data.table(arrow::read_parquet(path))
+      },
+      "dta" = {
+        if (!requireNamespace("haven", quietly = TRUE)) {
+          stop("Package 'haven' required to read Stata files")
+        }
+        as.data.table(haven::read_dta(path))
+      },
+      stop("Unsupported file format: ", ext, " (file: ", path, ")")
+    )
+    
+    # Ensure hs6 is character
+    if ("hs6" %in% names(dt)) {
+      dt[, hs6 := as.character(hs6)]
+    }
+    
+    return(dt)
   }
   
-  else {
-    stop("Unsupported file format. Supported: .csv, .rds, .parquet, .dta")
+  # Load all files
+  cat("Loading", length(paths), "file(s)...\n")
+  
+  dt_list <- lapply(seq_along(paths), function(i) {
+    path <- paths[i]
+    cat("  [", i, "/", length(paths), "] ", basename(path), sep = "")
+    
+    dt <- load_single(path)
+    
+    cat(" -", format(nrow(dt), big.mark = ","), "rows\n")
+    
+    # Add source identifier if requested
+    if (!is.null(id_col)) {
+      dt[, (id_col) := basename(path)]
+    }
+    
+    return(dt)
+  })
+  
+  # Combine all datasets
+  if (length(dt_list) == 1) {
+    dt <- dt_list[[1]]
+  } else {
+    # Check for column consistency
+    all_cols <- lapply(dt_list, names)
+    common_cols <- Reduce(intersect, all_cols)
+    all_unique_cols <- unique(unlist(all_cols))
+    
+    if (length(common_cols) < length(all_unique_cols)) {
+      missing_info <- sapply(seq_along(dt_list), function(i) {
+        missing <- setdiff(all_unique_cols, names(dt_list[[i]]))
+        if (length(missing) > 0) {
+          paste0(basename(paths[i]), ": missing ", paste(missing, collapse = ", "))
+        } else {
+          NULL
+        }
+      })
+      missing_info <- missing_info[!sapply(missing_info, is.null)]
+      
+      if (length(missing_info) > 0) {
+        warning("Column mismatch across files (using rbindlist with fill=TRUE):\n  ",
+                paste(missing_info, collapse = "\n  "))
+      }
+    }
+    
+    dt <- rbindlist(dt_list, use.names = TRUE, fill = TRUE)
   }
   
-  # Ensure hs6 is character
-  dt[, hs6 := as.character(hs6)]
+  cat("\nTotal rows loaded:", format(nrow(dt), big.mark = ","), "\n")
   
   return(dt)
 }
@@ -661,8 +746,26 @@ export_results <- function(results, output_dir = "output", prefix = "homogeneity
 
 #' To run the pipeline:
 #'
-#' 1. Load your data:
-#'    dt <- load_trade_data("path/to/your/data.csv")
+#' 1. Load your data (multiple options):
+#'
+#'    # Single file
+#'    dt <- load_trade_data("data/trade_all_years.csv")
+#'
+#'    # Multiple files by year
+#'    dt <- load_trade_data(c(
+#'      "data/trade_2022.csv",
+#'      "data/trade_2023.csv", 
+#'      "data/trade_2024.csv"
+#'    ))
+#'
+#'    # All files in a directory
+#'    dt <- load_trade_data("data/annual/")
+#'
+#'    # With source tracking (adds column identifying origin file)
+#'    dt <- load_trade_data(
+#'      c("data/comtrade_2023.csv", "data/census_2023.csv"),
+#'      id_col = "data_source"
+#'    )
 #'
 #' 2. Validate:
 #'    dt <- validate_trade_data(dt)
@@ -685,7 +788,11 @@ export_results <- function(results, output_dir = "output", prefix = "homogeneity
 # =============================================================================
 
 # # --- Load and validate data ---
-# dt <- load_trade_data("path/to/your/trade_data.csv")
+# dt <- load_trade_data(c(
+#   "data/trade_2022.csv",
+#   "data/trade_2023.csv",
+#   "data/trade_2024.csv"
+# ))
 # dt <- validate_trade_data(dt)
 #
 # # --- Run pipeline ---
