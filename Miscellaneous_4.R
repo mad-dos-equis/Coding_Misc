@@ -167,8 +167,6 @@ calculate_price_indices <- function(
       V0_m = sum(V0, na.rm = TRUE)
     ),
     by = .(PTN_ISO, YEAR, MONTH)
-  ][
-    , PF_m := sqrt(PL_m * PP_m)
   ]
   
   
@@ -187,16 +185,17 @@ calculate_price_indices <- function(
   dt_idx <- dt_idx_monthly[
     , .(
       PL = sum(PL_m * V0_m, na.rm = TRUE) / sum(V0_m, na.rm = TRUE),
-      PP = sum(PP_m * V0_m, na.rm = TRUE) / sum(V0_m, na.rm = TRUE),
-      PF = sum(PF_m * V0_m, na.rm = TRUE) / sum(V0_m, na.rm = TRUE)
+      PP = sum(PP_m * V0_m, na.rm = TRUE) / sum(V0_m, na.rm = TRUE)
     ),
     by = .(PTN_ISO, YEAR)
   ][
     , `:=`(
+      PF = sqrt(PL * PP),
       Laspeyres_YoY_Pct = PL - 1,
-      Paasche_YoY_Pct = PP - 1,
-      Fisher_YoY_Pct = PF - 1
+      Paasche_YoY_Pct = PP - 1
     )
+  ][
+    , Fisher_YoY_Pct := PF - 1
   ]
   
   # Rename with month label
