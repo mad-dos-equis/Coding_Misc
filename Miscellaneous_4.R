@@ -4,6 +4,7 @@ calculate_price_indices <- function(
     hs_filter_col = NULL,
     months = 4:9,
     countries = NULL,
+    countries_exclude = NULL,
     country_group = NULL,
     country_group_label = NULL,
     commodity_col = "COMMODITY",
@@ -30,9 +31,9 @@ calculate_price_indices <- function(
     stop("Missing required columns: ", paste(missing_cols, collapse = ", "))
   }
   
-  # Validate country_group params are both provided or both NULL
-  if (xor(is.null(country_group), is.null(country_group_label))) {
-    stop("Both 'country_group' and 'country_group_label' must be provided together")
+  # Validate: country_group requires country_group_label
+  if (!is.null(country_group) && is.null(country_group_label)) {
+    stop("'country_group_label' must be provided when using 'country_group'")
   }
   
   # Standardize column names internally
@@ -43,15 +44,18 @@ calculate_price_indices <- function(
     new = c("COMMODITY", "PTN_ISO", "YEAR", "MONTH", "VALUE", "UNIT_VALUE1")
   )
   
+  
   # Step 1: Apply filters
+  
   
   dt <- dt[MONTH %in% months]
   
-# Country filtering
+  # Exclude countries first (applies before any grouping)
   if (!is.null(countries_exclude)) {
     dt <- dt[!PTN_ISO %in% countries_exclude]
   }
   
+  # Country filtering/grouping logic
   if (!is.null(country_group)) {
     # Group specific countries, drop others
     dt[
@@ -70,6 +74,7 @@ calculate_price_indices <- function(
     dt <- dt[PTN_ISO %in% countries]
   }
   
+  # HS filter join
   if (!is.null(hs_filter_dt) && !is.null(hs_filter_col)) {
     if (!is.data.table(hs_filter_dt)) hs_filter_dt <- as.data.table(hs_filter_dt)
     
@@ -93,7 +98,9 @@ calculate_price_indices <- function(
     ]
   }
   
+  
   # Step 2: Compute implied quantity
+  
   
   dt[
     , q_m := fifelse(
@@ -103,7 +110,9 @@ calculate_price_indices <- function(
     )
   ]
   
+  
   # Step 3: Monthly unit values at commodity level
+  
   
   dt_monthly <- dt[
     , .(V = sum(VALUE, na.rm = TRUE),
@@ -115,7 +124,9 @@ calculate_price_indices <- function(
     is.finite(P) & P > 0 & is.finite(Q) & Q >= 0
   ]
   
+  
   # Step 4: Compute lags for YoY comparison
+  
   
   setorder(dt_monthly, PTN_ISO, COMMODITY, MONTH, YEAR)
   dt_monthly[
@@ -130,7 +141,9 @@ calculate_price_indices <- function(
   
   dt_pairs <- dt_monthly[!is.na(P0) & !is.na(Q0) & year0 == YEAR - 1]
   
+  
   # Step 5: Monthly indices at country-month level
+  
   
   dt_idx_monthly <- dt_pairs[
     , .(
@@ -143,7 +156,9 @@ calculate_price_indices <- function(
     , PF_m := sqrt(PL_m * PP_m)
   ]
   
+  
   # Step 6: Aggregate to multi-month level, weighted by base-period value
+  
   
   # Use custom label if provided, otherwise auto-generate
   if (is.null(month_label)) {
@@ -180,7 +195,9 @@ calculate_price_indices <- function(
     )
   )
   
+  
   # Step 7: Optionally pivot wider
+  
   
   if (pivot_wide) {
     value_vars <- setdiff(names(dt_idx), c("PTN_ISO", "YEAR"))
@@ -194,40 +211,3 @@ calculate_price_indices <- function(
   
   return(dt_idx[])
 }
-
-
-# East Asia group (replicates your original)
-df2_east_asia <- calculate_price_indices(
-  dt = df1,
-  hs_filter_dt = list,
-  hs_filter_col = "feature1",
-  months = 4:9,
-  country_group = c("TWN", "SGP", "MNG", "JPN", "PRK", "KOR"),
-  country_group_label = "East_Asia"
-)
-
-# USMCA group
-df2_usmca <- calculate_price_indices(
-  dt = df1,
-  hs_filter_dt = list,
-  hs_filter_col = "feature1",
-  months = 1:9,
-  country_group = c("CAN", "MEX"),
-  country_group_label = "USMCA",
-  month_label = "YTD_Sep"
-)
-
-# EU group
-df2_eu <- calculate_price_indices(
-  dt = df1,
-  months = 4:9,
-  country_group = c("DEU", "FRA", "ITA", "NLD", "ESP", "BEL", "AUT", "IRL", "POL"),
-  country_group_label = "EU"
-)
-
-# Simple country filter (no grouping) still works
-df2_china <- calculate_price_indices(
-  dt = df1,
-  months = 4:9,
-  countries = "CHN"
-)
