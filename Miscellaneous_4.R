@@ -2,6 +2,7 @@ calculate_price_indices <- function(
     dt,
     hs_filter_dt = NULL,
     hs_filter_col = NULL,
+    hs_filter_join_col = NULL,
     months = 4:9,
     countries = NULL,
     countries_exclude = NULL,
@@ -78,19 +79,34 @@ calculate_price_indices <- function(
     if (!is.data.table(hs_filter_dt)) hs_filter_dt <- as.data.table(hs_filter_dt)
     hs_filter_dt <- copy(hs_filter_dt)  # Avoid modifying original
     
-    # Create HS key for joining
-    hs_col_name <- paste0("HS", hs_digits)
-    dt[, (hs_col_name) := substr(COMMODITY, 1, hs_digits)]
-    
-    # Ensure filter table has matching column name
-    if (!hs_col_name %in% names(hs_filter_dt)) {
-      setnames(hs_filter_dt, 1, hs_col_name)
+    # Determine join column in filter table
+    if (is.null(hs_filter_join_col)) {
+      # Default: look for HS{hs_digits} column, else assume first column
+      hs_col_name <- paste0("HS", hs_digits)
+      if (hs_col_name %in% names(hs_filter_dt)) {
+        hs_filter_join_col <- hs_col_name
+      } else {
+        hs_filter_join_col <- names(hs_filter_dt)[1]
+      }
     }
     
-    # Join and filter (hs_filter_dt[dt, ...] keeps all dt rows with matches)
+    # Determine join column in dt (truncate or use full COMMODITY)
+    if (hs_filter_join_col == "COMMODITY") {
+      # Join on full COMMODITY (no truncation)
+      dt_join_col <- "COMMODITY"
+    } else {
+      # Truncate COMMODITY to hs_digits
+      dt_join_col <- paste0("HS", hs_digits)
+      dt[, (dt_join_col) := substr(COMMODITY, 1, hs_digits)]
+    }
+    
+    # Build join specification
+    join_on <- setNames(dt_join_col, hs_filter_join_col)
+    
+    # Join and filter
     dt <- hs_filter_dt[
       dt,
-      on = hs_col_name,
+      on = join_on,
       nomatch = NULL
     ][
       get(hs_filter_col) == 1
