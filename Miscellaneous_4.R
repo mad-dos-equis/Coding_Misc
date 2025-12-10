@@ -53,6 +53,7 @@ calculate_price_indices <- function(
   }
   
   if (!is.null(country_group)) {
+    # Group specific countries, drop others
     dt[
       , PTN_ISO := fifelse(
         PTN_ISO %in% country_group,
@@ -61,7 +62,11 @@ calculate_price_indices <- function(
       )
     ]
     dt <- dt[!is.na(PTN_ISO)]
+  } else if (!is.null(country_group_label)) {
+    # Group ALL remaining countries under the label
+    dt[, PTN_ISO := country_group_label]
   } else if (!is.null(countries)) {
+    # Simple subset, no grouping
     dt <- dt[PTN_ISO %in% countries]
   }
   
