@@ -47,7 +47,11 @@ calculate_price_indices <- function(
   
   dt <- dt[MONTH %in% months]
   
-  # Country filtering: either group or subset (group takes precedence)
+# Country filtering
+  if (!is.null(countries_exclude)) {
+    dt <- dt[!PTN_ISO %in% countries_exclude]
+  }
+  
   if (!is.null(country_group)) {
     dt[
       , PTN_ISO := fifelse(
