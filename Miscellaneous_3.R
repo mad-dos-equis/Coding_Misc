@@ -1,1251 +1,501 @@
-############################################################
-# Dominant-UOM Price Homogeneity & Rauch Classification
-# Production Version (v5)
+################################################################################
+# TRANSSHIPMENT ANALYSIS - MULTIPLE ORIGIN COUNTRIES
+# 
+# Identifies potential trade rerouting from multiple origin countries through 
+# third countries to a destination (USA)
 #
-# Pipeline:
-#   1. Compute price dispersion metrics by HS6-year
-#   2. Test for divergence between equal-weight and value-weight measures
-#   3. Classify goods as homogeneous/reference/differentiated
+# Methodology based on Freund et al. (2025):
+# https://china.ucsd.edu/_files/02072025-brief-identify-tariff-evasion-web.pdf
 #
-# Author: [Your Name]
-# Last Updated: [Date]
-############################################################
+# Detection Criteria (Freund's ii, iii, iv):
+# ii.  Three-way pattern: Origin→Dest decreased, Origin→TC increased, TC→Dest increased
+# iii. Origin share growth in rest-of-world > TC share growth in rest-of-world
+# iv.  TC imports from origin ≥ 75% of TC exports to destination
+#
+# Transshipment Value: Excess growth above market expectations (deviation from Freund)
+#
+# Author: Updated for multi-origin analysis
+# Date: December 2025
+################################################################################
 
-suppressPackageStartupMessages({
-  library(data.table)
-  library(mclust)
-})
+# Load required libraries
+library(data.table)
+library(dplyr)
 
-# =============================================================================
-# USER CONFIGURATION
-# =============================================================================
+# Clear environment
+rm(list = ls())
+gc()
 
-config <- list(
-  
-  # --- Homogeneity pipeline parameters ---
-  min_exporters = 10,        # Minimum exporters required for reliable estimates
-  min_coverage  = 0.85,      # Minimum value share in dominant UOM
-  trim_tail     = 0.01,      # Trim extreme prices (0.01 = drop top/bottom 1%)
-  min_Q_exporter = 0,        # Minimum quantity per exporter (0 = no filter)
-  min_V_exporter = 0,        # Minimum value per exporter (0 = no filter)
-  
-  # --- Divergence testing parameters ---
-  R_boot = 500,              # Bootstrap replications for CI
-  R_perm = 500,              # Permutation replications for p-value
-  fdr_level = 0.10,          # False discovery rate for flagging
-  min_years_for_hs6 = 3,     # Minimum years for HS6-level inference
-  
-  # --- Rauch classification parameters ---
-  n_components = 3,          # Max GMM components (2 or 3)
-  min_years_classify = 3,    # Minimum years for classification
-  instability_override_quantile = 0.90,  # CV threshold for stability override
-  use_2d = TRUE,             # Use 2D GMM (dispersion + stability) if possible
-  
-  # --- Rauch (1999) benchmark parameters ---
-  use_rauch_benchmark = TRUE,           # Compare against original Rauch classifications
-  rauch_variant = "conservative",       # "conservative" or "liberal"
-  hs_vintage = "HS6"                    # Your data's HS revision (for concordance)
-)
+################################################################################
+# CONFIGURATION PARAMETERS
+################################################################################
 
-# =============================================================================
-# DATA INPUT SPECIFICATION
-# =============================================================================
+# Define origin countries to analyze
+origin_countries <- c("China", "Vietnam", "Mexico")
 
-#' Required columns in your input data:
-#' 
-#' | Column   | Type      | Description                                    |
-#' |----------|-----------|------------------------------------------------|
-#' | year     | integer   | Year of observation                            |
-#' | exporter | character | Exporter country code (e.g., "USA", "CHN")     |
-#' | importer | character | Importer country code                          |
-#' | hs6      | character | 6-digit HS code (as string to preserve zeros)  |
-#' | value    | numeric   | Trade value (e.g., USD)                        |
-#' | quantity | numeric   | Trade quantity                                 |
-#' | uom      | character | Unit of measure (e.g., "kg", "item", "litre")  |
-#'
-#' Example:
-#'   year exporter importer    hs6      value  quantity   uom
-#'   2022      CHN      USA 847130 1250000.00    5000.0    kg
-#'   2022      DEU      USA 847130  890000.00    3200.0    kg
-#'   2022      JPN      USA 300490  450000.00     120.5  item
+# Define destination country
+destination_country <- "USA"
 
+# Allow origin countries to serve as third countries for each other?
+# FALSE = more conservative (recommended), excludes origin countries from third country analysis
+# TRUE = allows origin countries to be potential transshipment hubs for each other
+allow_origin_crossover <- FALSE
 
-# =============================================================================
-# DATA LOADING FUNCTION (CUSTOMIZE THIS)
-# =============================================================================
+# Years to compare
+start_year <- 2018  # Baseline/starting year
+end_year <- 2023    # Comparison/ending year
 
-load_trade_data <- function(paths = NULL, id_col = NULL) {
-#
-# Load and combine trade data from one or more files
-#
-# Arguments:
-#   paths:   Character vector of file paths (CSV, RDS, Parquet, or Stata)
-#            Can also be a single path or a directory path
-#   id_col:  Optional name for source identifier column (e.g., "source_file")
-#            If provided, adds a column indicating which file each row came from
-#
-# Returns:
-#   Combined data.table with all observations
-#
-# Examples:
-#   # Single file
-#   dt <- load_trade_data("data/trade_2023.csv")
-#
-#   # Multiple files explicitly
-#   dt <- load_trade_data(c("data/trade_2022.csv", 
-#                           "data/trade_2023.csv", 
-#                           "data/trade_2024.csv"))
-#
-#   # All CSVs in a directory
-#   dt <- load_trade_data("data/annual/")
-#
-#   # With source tracking
-#   dt <- load_trade_data(c("comtrade.csv", "census.csv"), id_col = "source")
-#
+# Chunk size for processing (adjust based on available memory)
+chunk_size <- 50
+
+# Output file path
+output_file <- "transshipment_results_multi_origin.rds"
+
+################################################################################
+# LOAD AND PREPARE DATA
+################################################################################
+
+cat("Loading data...\n")
+
+# Load your trade data
+# Replace this with your actual data loading code
+# trade_data <- fread("your_trade_data.csv")
+# 
+# Required columns:
+# - importer: importing country
+# - exporter: exporting country
+# - commodity: commodity code/identifier
+# - year: year of observation
+# - value: trade value
+
+# For this example, assuming trade_data is already loaded
+# Ensure it's a data.table
+trade_data <- as.data.table(trade_data)
+
+cat(sprintf("Loaded %s rows of trade data\n", format(nrow(trade_data), big.mark = ",")))
+
+# Keep only the two years we're comparing
+trade_data <- trade_data[year %in% c(start_year, end_year)]
+
+cat(sprintf("Filtered to years %d and %d: %s rows\n", 
+            start_year, end_year, format(nrow(trade_data), big.mark = ",")))
+
+################################################################################
+# IDENTIFY THIRD COUNTRIES
+################################################################################
+
+cat("\nIdentifying third countries...\n")
+
+# Get all unique exporters in the data
+all_exporters <- unique(trade_data$exporter)
+
+# Define third countries based on toggle parameter
+if (allow_origin_crossover) {
+  # Third countries = all countries except destination
+  third_countries <- setdiff(all_exporters, destination_country)
+  cat(sprintf("Origin crossover ALLOWED: %d third countries identified\n", 
+              length(third_countries)))
+} else {
+  # Third countries = all countries except destination and origin countries
+  third_countries <- setdiff(all_exporters, c(destination_country, origin_countries))
+  cat(sprintf("Origin crossover EXCLUDED: %d third countries identified\n", 
+              length(third_countries)))
+}
+
+################################################################################
+# CALCULATE IMPORT SHARES
+################################################################################
+
+cat("\nCalculating import shares...\n")
+
+# Calculate total imports by importer-commodity-year
+total_imports <- trade_data[, .(total_value = sum(value, na.rm = TRUE)), 
+                            by = .(importer, commodity, year)]
+
+# Merge and calculate shares
+trade_data <- merge(trade_data, total_imports, 
+                    by = c("importer", "commodity", "year"),
+                    all.x = TRUE)
+
+trade_data[, share := value / total_value]
+trade_data[is.na(share), share := 0]
+
+################################################################################
+# PREPARE DATA SUBSETS
+################################################################################
+
+cat("Preparing data subsets by year...\n")
+
+# Calculate total imports by commodity-importer-year (for excess growth calculations)
+# This represents "world" imports to each country for each commodity
+total_imports_by_country <- trade_data[, .(
+  total_imports = sum(value, na.rm = TRUE)
+), by = .(commodity, importer, year)]
+
+setkey(total_imports_by_country, commodity, importer, year)
+
+# Calculate rest-of-world (ROW) total imports by commodity-year
+# ROW = all importers except the destination country (for Freund criterion iii)
+row_total_imports <- trade_data[importer != destination_country, .(
+  row_total_imports = sum(value, na.rm = TRUE)
+), by = .(commodity, year)]
+
+setkey(row_total_imports, commodity, year)
+
+# Create separate datasets for each year
+shares_start <- trade_data[year == start_year, 
+                           .(importer, exporter, commodity, value, share)]
+setkey(shares_start, importer, exporter, commodity)
+
+shares_end <- trade_data[year == end_year, 
+                         .(importer, exporter, commodity, value, share)]
+setkey(shares_end, importer, exporter, commodity)
+
+# Get unique commodities
+all_commodities <- unique(trade_data$commodity)
+n_commodities <- length(all_commodities)
+
+cat(sprintf("Total commodities to process: %s\n", format(n_commodities, big.mark = ",")))
+
+################################################################################
+# MAIN TRANSSHIPMENT ANALYSIS - BY ORIGIN COUNTRY
+################################################################################
+
+cat("\n=== BEGINNING TRANSSHIPMENT ANALYSIS ===\n\n")
+
+# Initialize list to store results for each origin country
+all_results <- list()
+
+# Process each origin country separately
+for (origin_idx in seq_along(origin_countries)) {
   
-  if (is.null(paths)) {
-    stop("Please provide file path(s) or modify load_trade_data() to load your data")
-  }
+  origin_country <- origin_countries[origin_idx]
   
-  # If a directory is provided, find all supported files
- if (length(paths) == 1 && dir.exists(paths)) {
-    dir_path <- paths
-    paths <- list.files(
-      dir_path, 
-      pattern = "\\.(csv|rds|parquet|dta)$", 
-      full.names = TRUE, 
-      ignore.case = TRUE
-    )
-    if (length(paths) == 0) {
-      stop("No supported files found in directory: ", dir_path)
-    }
-    cat("Found", length(paths), "files in", dir_path, "\n")
-  }
+  cat(sprintf("\n--- ANALYZING ORIGIN COUNTRY %d/%d: %s ---\n", 
+              origin_idx, length(origin_countries), origin_country))
   
-  # Function to load a single file
-  load_single <- function(path) {
-    
-    if (!file.exists(path)) {
-      stop("File not found: ", path)
-    }
-    
-    ext <- tolower(tools::file_ext(path))
-    
-    dt <- switch(ext,
-      "csv" = fread(path, colClasses = c(hs6 = "character")),
-      "rds" = as.data.table(readRDS(path)),
-      "parquet" = {
-        if (!requireNamespace("arrow", quietly = TRUE)) {
-          stop("Package 'arrow' required to read parquet files")
-        }
-        as.data.table(arrow::read_parquet(path))
-      },
-      "dta" = {
-        if (!requireNamespace("haven", quietly = TRUE)) {
-          stop("Package 'haven' required to read Stata files")
-        }
-        as.data.table(haven::read_dta(path))
-      },
-      stop("Unsupported file format: ", ext, " (file: ", path, ")")
-    )
-    
-    # Ensure hs6 is character
-    if ("hs6" %in% names(dt)) {
-      dt[, hs6 := as.character(hs6)]
-    }
-    
-    return(dt)
-  }
+  # Initialize results list for this origin
+  origin_results <- list()
   
-  # Load all files
-  cat("Loading", length(paths), "file(s)...\n")
+  # Create chunks of commodities
+  n_chunks <- ceiling(n_commodities / chunk_size)
   
-  dt_list <- lapply(seq_along(paths), function(i) {
-    path <- paths[i]
-    cat("  [", i, "/", length(paths), "] ", basename(path), sep = "")
+  # Process commodities in chunks
+  for (chunk_idx in 1:n_chunks) {
     
-    dt <- load_single(path)
+    # Get commodity indices for this chunk
+    start_idx <- (chunk_idx - 1) * chunk_size + 1
+    end_idx <- min(chunk_idx * chunk_size, n_commodities)
+    chunk_commodities <- all_commodities[start_idx:end_idx]
     
-    cat(" -", format(nrow(dt), big.mark = ","), "rows\n")
+    cat(sprintf("  [%s] Processing chunk %d/%d (commodities %d-%d)...\n",
+                origin_country, chunk_idx, n_chunks, start_idx, end_idx))
     
-    # Add source identifier if requested
-    if (!is.null(id_col)) {
-      dt[, (id_col) := basename(path)]
-    }
+    # Filter data for this chunk
+    comm_data_start <- shares_start[commodity %in% chunk_commodities]
+    comm_data_end <- shares_end[commodity %in% chunk_commodities]
     
-    return(dt)
-  })
-  
-  # Combine all datasets
-  if (length(dt_list) == 1) {
-    dt <- dt_list[[1]]
-  } else {
-    # Check for column consistency
-    all_cols <- lapply(dt_list, names)
-    common_cols <- Reduce(intersect, all_cols)
-    all_unique_cols <- unique(unlist(all_cols))
-    
-    if (length(common_cols) < length(all_unique_cols)) {
-      missing_info <- sapply(seq_along(dt_list), function(i) {
-        missing <- setdiff(all_unique_cols, names(dt_list[[i]]))
-        if (length(missing) > 0) {
-          paste0(basename(paths[i]), ": missing ", paste(missing, collapse = ", "))
+    # Process each commodity in the chunk
+    for (comm in chunk_commodities) {
+      
+      # Get data for this commodity
+      comm_start <- comm_data_start[commodity == comm]
+      comm_end <- comm_data_end[commodity == comm]
+      
+      # Check each third country as potential transshipment hub
+      for (tc in third_countries) {
+        
+        # ===================================================================
+        # GET TRADE VALUES AND SHARES
+        # ===================================================================
+        
+        # Origin→Third Country (TC)
+        origin_to_tc_val_start <- comm_start[importer == tc & exporter == origin_country, value]
+        origin_to_tc_val_end <- comm_end[importer == tc & exporter == origin_country, value]
+        
+        if (length(origin_to_tc_val_start) == 0) origin_to_tc_val_start <- 0
+        if (length(origin_to_tc_val_end) == 0) origin_to_tc_val_end <- 0
+        
+        # Third Country→Destination
+        tc_to_dest_val_start <- comm_start[importer == destination_country & exporter == tc, value]
+        tc_to_dest_val_end <- comm_end[importer == destination_country & exporter == tc, value]
+        
+        if (length(tc_to_dest_val_start) == 0) tc_to_dest_val_start <- 0
+        if (length(tc_to_dest_val_end) == 0) tc_to_dest_val_end <- 0
+        
+        # Origin→Destination (direct)
+        origin_to_dest_val_start <- comm_start[importer == destination_country & exporter == origin_country, value]
+        origin_to_dest_val_end <- comm_end[importer == destination_country & exporter == origin_country, value]
+        
+        if (length(origin_to_dest_val_start) == 0) origin_to_dest_val_start <- 0
+        if (length(origin_to_dest_val_end) == 0) origin_to_dest_val_end <- 0
+        
+        # Total ("world") imports by commodity-importer-year
+        world_to_tc_val_start <- total_imports_by_country[
+          commodity == comm & importer == tc & year == start_year, total_imports]
+        world_to_tc_val_end <- total_imports_by_country[
+          commodity == comm & importer == tc & year == end_year, total_imports]
+        world_to_dest_val_start <- total_imports_by_country[
+          commodity == comm & importer == destination_country & year == start_year, total_imports]
+        world_to_dest_val_end <- total_imports_by_country[
+          commodity == comm & importer == destination_country & year == end_year, total_imports]
+        
+        if (length(world_to_tc_val_start) == 0) world_to_tc_val_start <- 0
+        if (length(world_to_tc_val_end) == 0) world_to_tc_val_end <- 0
+        if (length(world_to_dest_val_start) == 0) world_to_dest_val_start <- 0
+        if (length(world_to_dest_val_end) == 0) world_to_dest_val_end <- 0
+        
+        # Rest-of-world (ROW) total imports for this commodity (for criterion iii)
+        row_total_start <- row_total_imports[commodity == comm & year == start_year, row_total_imports]
+        row_total_end <- row_total_imports[commodity == comm & year == end_year, row_total_imports]
+        
+        if (length(row_total_start) == 0) row_total_start <- 0
+        if (length(row_total_end) == 0) row_total_end <- 0
+        
+        # Origin exports to ROW (all countries except destination)
+        origin_to_row_start <- comm_start[importer != destination_country & exporter == origin_country, 
+                                          sum(value, na.rm = TRUE)]
+        origin_to_row_end <- comm_end[importer != destination_country & exporter == origin_country, 
+                                      sum(value, na.rm = TRUE)]
+        
+        # TC exports to ROW
+        tc_to_row_start <- comm_start[importer != destination_country & exporter == tc, 
+                                      sum(value, na.rm = TRUE)]
+        tc_to_row_end <- comm_end[importer != destination_country & exporter == tc, 
+                                  sum(value, na.rm = TRUE)]
+        
+        # ===================================================================
+        # FREUND CRITERION ii: THREE-WAY PATTERN
+        # Origin→Dest decreased AND Origin→TC increased AND TC→Dest increased
+        # ===================================================================
+        
+        criterion_ii <- (origin_to_dest_val_end < origin_to_dest_val_start) &
+                        (origin_to_tc_val_end > origin_to_tc_val_start) &
+                        (tc_to_dest_val_end > tc_to_dest_val_start)
+        
+        # ===================================================================
+        # FREUND CRITERION iii: REST-OF-WORLD COMPETITIVENESS
+        # Origin's ROW share growth > TC's ROW share growth
+        # (Excludes cases where TC is becoming globally competitive)
+        # ===================================================================
+        
+        # Calculate shares of rest-of-world imports
+        if (row_total_start > 0) {
+          origin_row_share_start <- origin_to_row_start / row_total_start
+          tc_row_share_start <- tc_to_row_start / row_total_start
         } else {
-          NULL
+          origin_row_share_start <- 0
+          tc_row_share_start <- 0
         }
-      })
-      missing_info <- missing_info[!sapply(missing_info, is.null)]
-      
-      if (length(missing_info) > 0) {
-        warning("Column mismatch across files (using rbindlist with fill=TRUE):\n  ",
-                paste(missing_info, collapse = "\n  "))
+        
+        if (row_total_end > 0) {
+          origin_row_share_end <- origin_to_row_end / row_total_end
+          tc_row_share_end <- tc_to_row_end / row_total_end
+        } else {
+          origin_row_share_end <- 0
+          tc_row_share_end <- 0
+        }
+        
+        # Calculate share growth
+        origin_row_growth <- origin_row_share_end - origin_row_share_start
+        tc_row_growth <- tc_row_share_end - tc_row_share_start
+        
+        criterion_iii <- origin_row_growth > tc_row_growth
+        
+        # ===================================================================
+        # FREUND CRITERION iv: VOLUME THRESHOLD
+        # TC imports from origin ≥ 75% of TC exports to destination
+        # (Ensures TC is importing significant volumes from origin)
+        # ===================================================================
+        
+        if (tc_to_dest_val_end > 0) {
+          volume_ratio <- origin_to_tc_val_end / tc_to_dest_val_end
+          criterion_iv <- volume_ratio >= 0.75
+        } else {
+          criterion_iv <- FALSE
+        }
+        
+        # ===================================================================
+        # CHECK IF ALL CRITERIA MET
+        # ===================================================================
+        
+        if (criterion_ii && criterion_iii && criterion_iv) {
+          
+          # =================================================================
+          # CALCULATE TRANSSHIPMENT VALUE (EXCESS GROWTH METHOD)
+          # =================================================================
+          
+          # Calculate excess growth for Origin→TC
+          # (growth beyond what would be expected from TC's overall import growth)
+          if (world_to_tc_val_start > 0) {
+            expected_origin_to_tc <- (origin_to_tc_val_start / world_to_tc_val_start) * 
+                                     world_to_tc_val_end
+            origin_to_tc_excess <- origin_to_tc_val_end - expected_origin_to_tc
+          } else {
+            # If no baseline, all end-year trade is excess
+            origin_to_tc_excess <- origin_to_tc_val_end
+          }
+          
+          # Calculate excess growth for TC→Destination
+          # (growth beyond what would be expected from destination's overall import growth)
+          if (world_to_dest_val_start > 0) {
+            expected_tc_to_dest <- (tc_to_dest_val_start / world_to_dest_val_start) * 
+                                   world_to_dest_val_end
+            tc_to_dest_excess <- tc_to_dest_val_end - expected_tc_to_dest
+          } else {
+            # If no baseline, all end-year trade is excess
+            tc_to_dest_excess <- tc_to_dest_val_end
+          }
+          
+          # Transshipment value = min of positive excesses
+          # (can't transship more than the excess on either leg)
+          transshipment_value <- min(
+            max(origin_to_tc_excess, 0),
+            max(tc_to_dest_excess, 0)
+          )
+          
+          # Only store if transshipment value is positive
+          if (transshipment_value > 0) {
+            # Store result
+            origin_results[[length(origin_results) + 1]] <- data.table(
+              origin_country = origin_country,
+              commodity = comm,
+              third_country = tc,
+              origin_to_tc_val_end = origin_to_tc_val_end,
+              tc_to_dest_val_end = tc_to_dest_val_end,
+              volume_ratio = volume_ratio,
+              origin_row_share_growth = origin_row_growth,
+              tc_row_share_growth = tc_row_growth,
+              origin_to_tc_excess = max(origin_to_tc_excess, 0),
+              tc_to_dest_excess = max(tc_to_dest_excess, 0),
+              transshipment_value = transshipment_value
+            )
+          }
+        }
       }
     }
     
-    dt <- rbindlist(dt_list, use.names = TRUE, fill = TRUE)
+    # Clean up memory after each chunk
+    gc(verbose = FALSE)
   }
   
-  cat("\nTotal rows loaded:", format(nrow(dt), big.mark = ","), "\n")
-  
-  return(dt)
-}
-
-# =============================================================================
-# DATA VALIDATION
-# =============================================================================
-
-validate_trade_data <- function(dt) {
-#
-# Validates input data and reports issues
-# Returns cleaned data.table or stops with error
-#
-  
-  required_cols <- c("year", "exporter", "importer", "hs6", "value", "quantity", "uom")
-  
-  # Check required columns
-  missing_cols <- setdiff(required_cols, names(dt))
-  if (length(missing_cols) > 0) {
-    stop("Missing required columns: ", paste(missing_cols, collapse = ", "))
-  }
-  
-  dt <- as.data.table(copy(dt))
-  
-  # Type coercion
-  dt[, hs6 := as.character(hs6)]
-  dt[, year := as.integer(year)]
-  dt[, exporter := as.character(exporter)]
-  dt[, importer := as.character(importer)]
-  dt[, uom := as.character(uom)]
-  dt[, value := as.numeric(value)]
-  dt[, quantity := as.numeric(quantity)]
-  
-  # Report data summary
-  cat("\n=== Data Validation Summary ===\n")
-  cat("Rows:           ", format(nrow(dt), big.mark = ","), "\n")
-  cat("Years:          ", paste(range(dt$year, na.rm = TRUE), collapse = " - "), "\n")
-  cat("HS6 codes:      ", format(uniqueN(dt$hs6), big.mark = ","), "\n")
-  cat("Exporters:      ", format(uniqueN(dt$exporter), big.mark = ","), "\n")
-  cat("Importers:      ", format(uniqueN(dt$importer), big.mark = ","), "\n")
-  cat("UOMs:           ", paste(unique(dt$uom), collapse = ", "), "\n")
-  
-  # Check for issues
-  issues <- list()
-  
-  n_na_value <- sum(is.na(dt$value))
-  n_na_qty <- sum(is.na(dt$quantity))
-  n_zero_value <- sum(dt$value == 0, na.rm = TRUE)
-  n_zero_qty <- sum(dt$quantity == 0, na.rm = TRUE)
-  n_neg_value <- sum(dt$value < 0, na.rm = TRUE)
-  n_neg_qty <- sum(dt$quantity < 0, na.rm = TRUE)
-  
-  if (n_na_value > 0) issues <- c(issues, sprintf("NA values: %d rows", n_na_value))
-  if (n_na_qty > 0) issues <- c(issues, sprintf("NA quantities: %d rows", n_na_qty))
-  if (n_zero_value > 0) issues <- c(issues, sprintf("Zero values: %d rows", n_zero_value))
-  if (n_zero_qty > 0) issues <- c(issues, sprintf("Zero quantities: %d rows", n_zero_qty))
-  if (n_neg_value > 0) issues <- c(issues, sprintf("Negative values: %d rows", n_neg_value))
-  if (n_neg_qty > 0) issues <- c(issues, sprintf("Negative quantities: %d rows", n_neg_qty))
-  
-  if (length(issues) > 0) {
-    cat("\nData issues (will be filtered):\n")
-    for (issue in issues) cat("  - ", issue, "\n")
+  # Combine results for this origin country
+  if (length(origin_results) > 0) {
+    origin_results_dt <- rbindlist(origin_results)
+    all_results[[origin_country]] <- origin_results_dt
+    
+    cat(sprintf("  [%s] COMPLETE: Found %s qualifying transshipment routes\n",
+                origin_country, format(nrow(origin_results_dt), big.mark = ",")))
   } else {
-    cat("\nNo data issues detected.\n")
+    cat(sprintf("  [%s] COMPLETE: No qualifying transshipment routes found\n",
+                origin_country))
   }
-  
-  # Filter to valid rows
-  n_before <- nrow(dt)
-  dt <- dt[!is.na(value) & !is.na(quantity) & value > 0 & quantity > 0]
-  n_after <- nrow(dt)
-  
-  if (n_before > n_after) {
-    cat("\nFiltered:", format(n_before - n_after, big.mark = ","), 
-        "rows removed (", round(100 * (n_before - n_after) / n_before, 1), "%)\n")
-  }
-  
-  cat("Final rows:     ", format(nrow(dt), big.mark = ","), "\n")
-  
-  return(dt)
 }
 
-# =============================================================================
-# CORE FUNCTIONS (DO NOT MODIFY)
-# =============================================================================
+################################################################################
+# COMBINE AND SUMMARIZE RESULTS
+################################################################################
 
-# --- Weighted quantile helpers ---
-wtd_quantile <- function(x, w, probs) {
-  ok <- is.finite(x) & is.finite(w) & w > 0
-  x <- x[ok]; w <- w[ok]
-  if (length(x) == 0L) return(rep(NA_real_, length(probs)))
-  o <- order(x)
-  x <- x[o]; w <- w[o]
-  cw <- cumsum(w)
-  sw <- cw[length(cw)]
-  sapply(probs, function(p) x[which(cw >= p * sw)[1L]])
-}
+cat("\n=== GENERATING SUMMARY STATISTICS ===\n\n")
 
-wtd_median <- function(x, w) as.numeric(wtd_quantile(x, w, 0.5))
-
-# --- Permutation-based divergence test ---
-test_divergence_perm <- function(P, V, R_boot = 500, R_perm = 500) {
-  n <- length(P)
-  if (n < 5) {
-    return(list(
-      delta_obs = NA_real_, delta_boot_se = NA_real_,
-      delta_boot_lo = NA_real_, delta_boot_hi = NA_real_,
-      p_value = NA_real_
-    ))
-  }
-  
-  compute_delta <- function(p, v) {
-    gap_eq <- log(quantile(p, 0.90, type = 7)) - log(quantile(p, 0.10, type = 7))
-    q_wt <- wtd_quantile(p, v, c(0.10, 0.90))
-    gap_wt <- log(q_wt[2]) - log(q_wt[1])
-    gap_wt - gap_eq
-  }
-  
-  delta_obs <- compute_delta(P, V)
-  
-  delta_boot <- replicate(R_boot, {
-    idx <- sample.int(n, replace = TRUE)
-    compute_delta(P[idx], V[idx])
-  })
-  
-  delta_null <- replicate(R_perm, {
-    V_perm <- V[sample.int(n)]
-    compute_delta(P, V_perm)
-  })
-  
-  p_value <- mean(abs(delta_null) >= abs(delta_obs))
-  boot_ci <- quantile(delta_boot, c(0.025, 0.975), na.rm = TRUE)
-  
-  list(
-    delta_obs = delta_obs,
-    delta_boot_se = sd(delta_boot, na.rm = TRUE),
-    delta_boot_lo = as.numeric(boot_ci[1]),
-    delta_boot_hi = as.numeric(boot_ci[2]),
-    p_value = p_value
-  )
-}
-
-# --- Dominant-UOM homogeneity pipeline ---
-dominant_uom_metrics <- function(dt, config) {
-  dt <- as.data.table(copy(dt))
-  
-  # 1) Collapse to exporter-year-hs6-uom
-  ex <- dt[
-    , .(V = sum(value, na.rm = TRUE), Q = sum(quantity, na.rm = TRUE)),
-    by = .(hs6, year, uom, exporter)
-  ][
-    Q > config$min_Q_exporter & V > config$min_V_exporter
-  ][, P := V / Q][is.finite(P) & P > 0]
-  
-  # 2) Dominant UOM per hs6-year
-  uom_tot <- ex[, .(V_uom = sum(V), n_exporters_uom = uniqueN(exporter)), by = .(hs6, year, uom)]
-  uom_tot[, V_total := sum(V_uom), by = .(hs6, year)]
-  uom_tot[, coverage := V_uom / V_total]
-  
-  setorder(uom_tot, hs6, year, -V_uom)
-  dom <- uom_tot[, .SD[1L], by = .(hs6, year)]
-  setnames(dom, c("uom", "V_uom"), c("uom_dom", "V_dom"))
-  
-  # 3) Restrict to dominant UOM
-  ex_dom <- ex[dom, on = .(hs6, year, uom = uom_dom), nomatch = 0L]
-  
-  # 4) Optional trimming
-  if (config$trim_tail > 0) {
-    ex_dom[, `:=`(
-      lo = as.numeric(quantile(P, config$trim_tail, na.rm = TRUE, type = 7)),
-      hi = as.numeric(quantile(P, 1 - config$trim_tail, na.rm = TRUE, type = 7))
-    ), by = .(hs6, year)]
-    ex_dom <- ex_dom[P >= lo & P <= hi]
-  }
-  
-  # 5) Compute quantiles
-  eq <- ex_dom[, .(
-    n_exporters_dom = uniqueN(exporter),
-    p10_eq = as.numeric(quantile(P, 0.10, type = 7)),
-    p90_eq = as.numeric(quantile(P, 0.90, type = 7))
-  ), by = .(hs6, year)]
-  
-  wt <- ex_dom[, {
-    q <- wtd_quantile(P, V, c(0.10, 0.90))
-    .(p10_wt = as.numeric(q[1L]), p90_wt = as.numeric(q[2L]))
-  }, by = .(hs6, year)]
-  
-  out <- wt[eq, on = .(hs6, year)]
-  out <- dom[out, on = .(hs6, year)]
-  
-  out[, `:=`(
-    ratio_eq = p90_eq / p10_eq, log_gap_eq = log(p90_eq / p10_eq), H_eq = p10_eq / p90_eq,
-    ratio_wt = p90_wt / p10_wt, log_gap_wt = log(p90_wt / p10_wt), H_wt = p10_wt / p90_wt
-  )]
-  
-  out[, ok_exporters := n_exporters_dom >= config$min_exporters]
-  out[, ok_coverage := coverage >= config$min_coverage]
-  
-  out[ok_exporters == FALSE, `:=`(
-    p10_eq = NA_real_, p90_eq = NA_real_, ratio_eq = NA_real_, log_gap_eq = NA_real_, H_eq = NA_real_,
-    p10_wt = NA_real_, p90_wt = NA_real_, ratio_wt = NA_real_, log_gap_wt = NA_real_, H_wt = NA_real_
-  )]
-  
-  # 6) Aggregate to HS6-level
-  out[, year_w := fifelse(is.finite(V_dom) & is.finite(coverage), V_dom * coverage, NA_real_)]
-  
-  hs6_level <- out[
-    is.finite(log_gap_eq) & is.finite(year_w) & year_w > 0,
-    {
-      medD_eq <- wtd_median(log_gap_eq, year_w)
-      medD_wt <- wtd_median(log_gap_wt, year_w)
-      .(
-        years_used = .N,
-        med_log_gap_eq = medD_eq, med_H_eq = exp(-medD_eq),
-        med_log_gap_wt = medD_wt, med_H_wt = exp(-medD_wt),
-        avg_coverage_w = sum(coverage * year_w) / sum(year_w),
-        years_ok_coverage_share = mean(ok_coverage)
-      )
-    },
-    by = .(hs6)
-  ]
-  
-  list(year_level = out[], hs6_level = hs6_level[], exporter_level = ex_dom[])
-}
-
-# --- Divergence testing pipeline ---
-run_divergence_tests <- function(ex_dom, config) {
-  cat("Running permutation tests...\n")
-  
-  divergence_tests <- ex_dom[, {
-    res <- test_divergence_perm(P, V, R_boot = config$R_boot, R_perm = config$R_perm)
-    .(delta_obs = res$delta_obs, delta_se = res$delta_boot_se,
-      delta_lo = res$delta_boot_lo, delta_hi = res$delta_boot_hi,
-      p_value = res$p_value, n_exporters = .N)
-  }, by = .(hs6, year)]
-  
-  divergence_tests[, p_adj := p.adjust(p_value, method = "BH")]
-  divergence_tests[, flag_year := p_adj < config$fdr_level]
-  divergence_tests[, direction := fifelse(delta_obs > 0, "large_in_tails",
-                                           fifelse(delta_obs < 0, "large_in_center", "neutral"))]
-  
-  hs6_divergence <- divergence_tests[
-    !is.na(p_value),
-    .(n_years = .N, n_flagged = sum(flag_year), pct_flagged = mean(flag_year),
-      med_delta = median(delta_obs), mean_delta = mean(delta_obs), sd_delta = sd(delta_obs),
-      sign_consistency = abs(mean(sign(delta_obs))), pct_positive = mean(delta_obs > 0),
-      fisher_stat = -2 * sum(log(pmax(p_value, 1e-10)))),
-    by = hs6
-  ][n_years >= config$min_years_for_hs6
-  ][, fisher_p := pchisq(fisher_stat, df = 2 * n_years, lower.tail = FALSE)
-  ][, fisher_p_adj := p.adjust(fisher_p, method = "BH")]
-  
-  hs6_divergence[, flag_divergence := fisher_p_adj < config$fdr_level]
-  hs6_divergence[, dominant_direction := fifelse(med_delta > 0, "large_in_tails",
-                                                  fifelse(med_delta < 0, "large_in_center", "neutral"))]
-  
-  list(year_level = divergence_tests[], hs6_level = hs6_divergence[])
-}
-
-# --- Rauch classification (GMM-based) ---
-classify_rauch_gmm <- function(year_level, hs6_level, config) {
-  
-  # Step 1: Compute temporal stability
-  stability <- year_level[
-    is.finite(log_gap_eq),
-    .(mean_log_gap = mean(log_gap_eq), sd_log_gap = sd(log_gap_eq),
-      cv_log_gap = sd(log_gap_eq) / abs(mean(log_gap_eq)),
-      iqr_log_gap = IQR(log_gap_eq), n_years_valid = .N),
-    by = hs6
-  ]
-  
-  dt <- stability[hs6_level, on = "hs6"]
-  dt <- dt[is.finite(med_log_gap_eq) & n_years_valid >= config$min_years_classify]
-  dt[!is.finite(cv_log_gap), cv_log_gap := max(dt$cv_log_gap, na.rm = TRUE) * 2]
-  
-  if (nrow(dt) < config$n_components * 3) {
-    warning("Too few HS6 codes for reliable GMM estimation; results may be unstable")
-  }
-  
-  # Step 2: Fit GMM
-  fit <- NULL
-  fit_2d_success <- FALSE
-  scale_center <- NULL
-  scale_sd <- NULL
-  
-  if (config$use_2d && nrow(dt) >= 10) {
-    X <- as.matrix(dt[, .(med_log_gap_eq, cv_log_gap)])
-    X_scaled <- scale(X)
-    scale_center <- attr(X_scaled, "scaled:center")
-    scale_sd <- attr(X_scaled, "scaled:scale")
-    
-    fit <- tryCatch(Mclust(X_scaled, G = 2:config$n_components, verbose = FALSE), error = function(e) NULL)
-    
-    if (!is.null(fit)) {
-      fit_2d_success <- TRUE
-      centroids_scaled <- fit$parameters$mean
-      homog_score <- 0.7 * centroids_scaled[1, ] + 0.3 * centroids_scaled[2, ]
-      ord <- order(homog_score)
-      n_detected <- ncol(centroids_scaled)
-    }
-  }
-  
-  if (!fit_2d_success) {
-    x <- dt$med_log_gap_eq
-    max_G <- min(config$n_components, max(2, floor(nrow(dt) / 3)))
-    fit <- tryCatch(Mclust(x, G = 2:max_G, modelNames = "V", verbose = FALSE), error = function(e) NULL)
-    
-    if (is.null(fit)) {
-      warning("GMM failed; using quantile-based classification")
-      q <- quantile(x, c(0.33, 0.67), na.rm = TRUE)
-      dt[, gmm_class := fcase(med_log_gap_eq <= q[1], 1L, med_log_gap_eq <= q[2], 2L, default = 3L)]
-      dt[, rauch_category := fcase(gmm_class == 1L, "homogeneous", gmm_class == 2L, "reference", default = "differentiated")]
-      dt[, posterior_prob := 0.5]
-      
-      cv_threshold <- quantile(dt$cv_log_gap, config$instability_override_quantile, na.rm = TRUE)
-      dt[, stability_flag := cv_log_gap > cv_threshold]
-      dt[, rauch_original := rauch_category]
-      n_overridden <- dt[rauch_category == "homogeneous" & stability_flag == TRUE, .N]
-      dt[rauch_category == "homogeneous" & stability_flag == TRUE, rauch_category := "reference"]
-      
-      category_summary <- dt[, .(n_hs6 = .N,
-        med_log_gap_range = paste0("[", round(min(med_log_gap_eq), 3), ", ", round(max(med_log_gap_eq), 3), "]"),
-        med_H_range = paste0("[", round(min(med_H_eq), 3), ", ", round(max(med_H_eq), 3), "]"),
-        mean_cv_log_gap = round(mean(cv_log_gap, na.rm = TRUE), 3),
-        mean_posterior = round(mean(posterior_prob), 3)
-      ), by = rauch_category][order(factor(rauch_category, levels = c("homogeneous", "reference", "differentiated")))]
-      
-      return(list(
-        classification = dt[, .(hs6, med_log_gap_eq, med_H_eq, cv_log_gap, years_used,
-                                 rauch_category, rauch_original, gmm_class, posterior_prob, stability_flag)],
-        fit = NULL,
-        thresholds = list(type = "quantile_fallback", boundaries = q, n_components = 3),
-        category_summary = category_summary,
-        override_summary = list(cv_threshold = cv_threshold, n_overridden = n_overridden),
-        settings = list(use_2d = FALSE, n_components = 3, min_years = config$min_years_classify,
-                        instability_override_quantile = config$instability_override_quantile, method = "quantile_fallback")
-      ))
-    }
-    
-    ord <- order(fit$parameters$mean)
-    n_detected <- length(fit$parameters$mean)
-  }
-  
-  # Step 3: Assign labels
-  labels <- if (n_detected == 2) c("homogeneous", "differentiated") else c("homogeneous", "reference", "differentiated")
-  label_map <- setNames(labels, as.character(ord))
-  
-  dt[, gmm_class := fit$classification]
-  dt[, rauch_category := label_map[as.character(gmm_class)]]
-  dt[, posterior_prob := apply(fit$z, 1, max)]
-  
-  # Step 4: Stability override
-  cv_threshold <- quantile(dt$cv_log_gap, config$instability_override_quantile, na.rm = TRUE)
-  dt[, stability_flag := cv_log_gap > cv_threshold]
-  dt[, rauch_original := rauch_category]
-  n_overridden <- dt[rauch_category == "homogeneous" & stability_flag == TRUE, .N]
-  dt[rauch_category == "homogeneous" & stability_flag == TRUE, rauch_category := "reference"]
-  
-  # Step 5: Summaries
-  category_summary <- dt[, .(n_hs6 = .N,
-    med_log_gap_range = paste0("[", round(min(med_log_gap_eq), 3), ", ", round(max(med_log_gap_eq), 3), "]"),
-    med_H_range = paste0("[", round(min(med_H_eq), 3), ", ", round(max(med_H_eq), 3), "]"),
-    mean_cv_log_gap = round(mean(cv_log_gap, na.rm = TRUE), 3),
-    mean_posterior = round(mean(posterior_prob), 3)
-  ), by = rauch_category][order(factor(rauch_category, levels = c("homogeneous", "reference", "differentiated")))]
-  
-  # Step 6: Thresholds
-  if (fit_2d_success) {
-    centroids_original <- t(t(fit$parameters$mean) * scale_sd + scale_center)
-    colnames(centroids_original) <- labels
-    rownames(centroids_original) <- c("med_log_gap_eq", "cv_log_gap")
-    thresholds <- list(type = "2D_GMM", centroids = centroids_original, n_components = n_detected)
-  } else {
-    means <- fit$parameters$mean[ord]
-    boundaries <- if (n_detected == 2) mean(means) else c(mean(means[1:2]), mean(means[2:3]))
-    thresholds <- list(type = "1D_GMM", component_means = setNames(means, labels),
-                       decision_boundaries = boundaries, n_components = n_detected)
-  }
-  
-  list(
-    classification = dt[, .(hs6, med_log_gap_eq, med_H_eq, cv_log_gap, years_used,
-                             rauch_category, rauch_original, gmm_class, posterior_prob, stability_flag)],
-    fit = fit,
-    thresholds = thresholds,
-    category_summary = category_summary,
-    override_summary = list(cv_threshold = cv_threshold, n_overridden = n_overridden),
-    settings = list(use_2d = fit_2d_success, n_components = config$n_components, min_years = config$min_years_classify,
-                    instability_override_quantile = config$instability_override_quantile,
-                    method = if (fit_2d_success) "2D_GMM" else "1D_GMM")
-  )
-}
-
-# --- Year-level Rauch classification ---
-classify_years_rauch <- function(year_level, hs6_classification) {
-  year_classified <- hs6_classification$classification[, .(hs6, rauch_category, cv_log_gap)][year_level, on = "hs6"]
-  thresholds <- hs6_classification$thresholds
-  
-  if (thresholds$type == "1D_GMM") {
-    bounds <- thresholds$decision_boundaries
-    if (length(bounds) == 1) {
-      year_classified[, rauch_year := fifelse(log_gap_eq <= bounds[1], "homogeneous", "differentiated")]
-    } else {
-      year_classified[, rauch_year := fcase(log_gap_eq <= bounds[1], "homogeneous",
-                                             log_gap_eq <= bounds[2], "reference", default = "differentiated")]
-    }
-  } else if (thresholds$type == "quantile_fallback") {
-    bounds <- thresholds$boundaries
-    year_classified[, rauch_year := fcase(log_gap_eq <= bounds[1], "homogeneous",
-                                           log_gap_eq <= bounds[2], "reference", default = "differentiated")]
-  } else {
-    year_classified[, rauch_year := rauch_category]
-  }
-  
-  transitions <- year_classified[
-    !is.na(rauch_year) & !is.na(rauch_category),
-    .(n_years = .N, n_categories_year = uniqueN(rauch_year),
-      modal_category = names(sort(table(rauch_year), decreasing = TRUE))[1],
-      matches_hs6_category = mean(rauch_year == rauch_category)),
-    by = hs6
-  ]
-  
-  list(year_classified = year_classified[], transitions = transitions[])
-}
-
-# =============================================================================
-# RAUCH (1999) BENCHMARK INTEGRATION
-# =============================================================================
-
-get_rauch_sitc4 <- function(variant = "conservative") {
-#
-# Retrieves original Rauch (1999) classifications at SITC Rev.2 4-digit level
-# Uses the concordance package
-#
-# Arguments:
-#   variant: "conservative" or "liberal" (Rauch provides both)
-#
-# Returns:
-#   data.table with columns: sitc4, rauch_original
-#
-  
-  if (!requireNamespace("concordance", quietly = TRUE)) {
-    stop("Package 'concordance' is required for Rauch benchmark. Install with: install.packages('concordance')")
-  }
-  
-  # sitc2_rauch is a dataset, not a function
-  rauch_raw <- concordance::sitc2_rauch
-  rauch_dt <- as.data.table(rauch_raw)
-  
-  # Standardize column names to lowercase
-  setnames(rauch_dt, names(rauch_dt), tolower(names(rauch_dt)))
-  
-  # Rename sitc2 to sitc4 (it's actually 4-digit SITC Rev.2)
-  if ("sitc2" %in% names(rauch_dt)) {
-    setnames(rauch_dt, "sitc2", "sitc4")
-  }
-  
-  # Determine which column to use for classification
-  col <- if (variant == "conservative") "con" else "lib"
-  
-  if (!col %in% names(rauch_dt)) {
-    stop("Rauch variant column '", col, "' not found. Available columns: ", 
-         paste(names(rauch_dt), collapse = ", "))
-  }
-  
-  # Map Rauch codes to categories
-  col_vals <- rauch_dt[[col]]
-  rauch_dt$rauch_original <- NA_character_
-  rauch_dt$rauch_original[col_vals == "w"] <- "homogeneous"
-  rauch_dt$rauch_original[col_vals == "r"] <- "reference"
-  rauch_dt$rauch_original[col_vals == "n"] <- "differentiated"
-  
-  rauch_dt <- rauch_dt[!is.na(rauch_original), .(sitc4, rauch_original)]
-  rauch_dt[, sitc4 := as.character(sitc4)]
-  
-  # Pad to 4 digits if needed
-  rauch_dt[nchar(sitc4) < 4, sitc4 := sprintf("%04d", as.integer(sitc4))]
-  
-  return(rauch_dt[])
-}
-
-get_sitc4_hs6_crosswalk <- function(hs_vintage = "HS6") {
-#
-# Builds a crosswalk from SITC Rev.2 4-digit to HS 6-digit
-# Uses the concordance package
-#
-# Arguments:
-#   hs_vintage: HS revision identifier (used for documentation; 
-#               concordance package handles the mapping)
-#
-# Returns:
-#   data.table with columns: sitc4, hs6
-#
-# Note: This is a many-to-many mapping. One SITC4 can map to multiple HS6 codes
-#       and vice versa.
-#
-  
-  if (!requireNamespace("concordance", quietly = TRUE)) {
-    stop("Package 'concordance' is required. Install with: install.packages('concordance')")
-  }
-  
-  # Get all SITC4 codes from Rauch
-  rauch_sitc4 <- get_rauch_sitc4()
-  sitc4_codes <- unique(rauch_sitc4$sitc4)
-  
-  cat("  Building crosswalk for", length(sitc4_codes), "SITC4 codes...\n")
-  
-  # Use concordance to map SITC4 -> HS6
-  # Try different concordance approaches based on what's available
-  
-  crosswalk_list <- lapply(seq_along(sitc4_codes), function(i) {
-    s4 <- sitc4_codes[i]
-    
-    # Progress indicator every 100 codes
-    if (i %% 200 == 0) {
-      cat("    Processed", i, "of", length(sitc4_codes), "codes\n")
-    }
-    
-    # Try to concord each SITC4 code
-    hs6_matches <- tryCatch({
-      concordance::concord(
-        sourcevar = s4,
-        origin = "SITC2", 
-        destination = "HS",
-        dest.digit = 6
-      )
-    }, error = function(e) {
-      # If concord fails, return NA
-      NA_character_
-    })
-    
-    if (length(hs6_matches) == 0 || all(is.na(hs6_matches))) {
-      return(NULL)
-    }
-    
-    data.table(sitc4 = s4, hs6 = as.character(hs6_matches))
-  })
-  
-  crosswalk <- rbindlist(crosswalk_list, use.names = TRUE, fill = TRUE)
-  
-  if (nrow(crosswalk) == 0) {
-    warning("Concordance returned no mappings. Check concordance package version and data.")
-    return(data.table(sitc4 = character(), hs6 = character()))
-  }
-  
-  # Clean HS6 codes (ensure 6 digits, remove any with letters unless valid)
-  crosswalk <- crosswalk[!is.na(hs6) & nchar(hs6) >= 4]
-  crosswalk[, hs6 := gsub("[^0-9]", "", hs6)]
-  crosswalk[nchar(hs6) == 4, hs6 := paste0(hs6, "00")]
-  crosswalk[nchar(hs6) == 5, hs6 := paste0(hs6, "0")]
-  crosswalk <- crosswalk[nchar(hs6) == 6]
-  
-  # Remove duplicates
-  crosswalk <- unique(crosswalk)
-  
-  cat("  Crosswalk complete:", nrow(crosswalk), "mappings\n")
-  
-  return(crosswalk[])
-}
-
-integrate_rauch_benchmark <- function(
-    classification,
-    config,
-    crosswalk = NULL,
-    verbose = TRUE
-) {
-#
-# Integrates original Rauch (1999) classifications as benchmark/prior
-#
-# Arguments:
-#   classification: Output from classify_rauch_gmm() - the $classification table
-#   config:         Configuration list with rauch_variant and hs_vintage
-#   crosswalk:      Optional pre-computed SITC4-HS6 crosswalk (if NULL, computed fresh)
-#   verbose:        Print progress
-#
-# Returns:
-#   List with:
-#     - classification: Enhanced classification with benchmark columns
-#     - coverage_summary: Coverage statistics
-#     - agreement_matrix: Confusion matrix for Tier 1 matches
-#     - crosswalk: The SITC4-HS6 crosswalk used
-#
-  
-  dt <- copy(classification)
-  
-  if (verbose) cat("Loading Rauch (1999) original classifications...\n")
-  
-  # --- Step 1: Get Rauch classifications at SITC4 ---
-  rauch_sitc4 <- get_rauch_sitc4(variant = config$rauch_variant)
-  
-  if (verbose) {
-    cat("  Rauch SITC4 codes loaded: ", format(nrow(rauch_sitc4), big.mark = ","), "\n")
-    cat("  Variant: ", config$rauch_variant, "\n")
-    cat("  Distribution:\n")
-    print(rauch_sitc4[, .N, by = rauch_original][order(-N)])
-  }
-  
-  # --- Step 2: Build or use provided crosswalk ---
-  if (is.null(crosswalk)) {
-    if (verbose) cat("\nBuilding SITC4 -> HS6 crosswalk (this may take a moment)...\n")
-    crosswalk <- get_sitc4_hs6_crosswalk(hs_vintage = config$hs_vintage)
-  }
-  
-  if (nrow(crosswalk) == 0) {
-    warning("Empty crosswalk; cannot integrate Rauch benchmark")
-    dt[, `:=`(
-      rauch_benchmark = NA_character_,
-      rauch_unanimous = NA,
-      concordance_quality = NA_character_,
-      benchmark_tier = "no_crosswalk",
-      benchmark_match = NA
-    )]
-    return(list(
-      classification = dt,
-      coverage_summary = data.table(
-        n_hs6 = nrow(dt), pct_with_benchmark = 0,
-        pct_match = NA_real_, pct_tier1 = 0, pct_tier2 = 0, pct_no_coverage = 1
-      ),
-      agreement_matrix = NULL,
-      crosswalk = crosswalk
-    ))
-  }
-  
-  if (verbose) {
-    cat("  Crosswalk mappings: ", format(nrow(crosswalk), big.mark = ","), "\n")
-    cat("  Unique SITC4 codes: ", format(uniqueN(crosswalk$sitc4), big.mark = ","), "\n")
-    cat("  Unique HS6 codes: ", format(uniqueN(crosswalk$hs6), big.mark = ","), "\n")
-  }
-  
-  # --- Step 3: Assess concordance quality ---
-  crosswalk[, n_hs6_per_sitc4 := .N, by = sitc4]
-  crosswalk[, n_sitc4_per_hs6 := .N, by = hs6]
-  
-  crosswalk[, concordance_quality := fcase(
-    n_hs6_per_sitc4 == 1 & n_sitc4_per_hs6 == 1, "exact",
-    n_hs6_per_sitc4 <= 3 & n_sitc4_per_hs6 == 1, "good",
-    n_sitc4_per_hs6 == 1, "acceptable",
-    default = "poor"
-  )]
-  
-  # --- Step 4: Merge Rauch to crosswalk ---
-  crosswalk_rauch <- rauch_sitc4[crosswalk, on = "sitc4"]
-  
-  # --- Step 5: Aggregate to HS6 level ---
-  # For HS6 codes mapping to multiple SITC4 with different Rauch categories,
-  # take modal category and flag if not unanimous
-  hs6_rauch <- crosswalk_rauch[
-    !is.na(rauch_original),
-    .(
-      rauch_benchmark = {
-        tab <- table(rauch_original)
-        names(tab)[which.max(tab)]
-      },
-      rauch_unanimous = uniqueN(rauch_original) == 1,
-      n_sitc4_sources = uniqueN(sitc4),
-      concordance_quality = {
-        # Take best quality among sources
-        quals <- unique(concordance_quality)
-        if ("exact" %in% quals) "exact"
-        else if ("good" %in% quals) "good"
-        else if ("acceptable" %in% quals) "acceptable"
-        else "poor"
-      }
-    ),
-    by = hs6
-  ]
-  
-  if (verbose) {
-    cat("\nHS6 codes with Rauch benchmark: ", format(nrow(hs6_rauch), big.mark = ","), "\n")
-  }
-  
-  # --- Step 6: Merge with GMM classification ---
-  dt <- hs6_rauch[dt, on = "hs6"]
-  
-  # --- Step 7: Determine benchmark tier ---
-  dt[, benchmark_tier := fcase(
-    is.na(rauch_benchmark), "no_coverage",
-    concordance_quality == "exact" & rauch_unanimous == TRUE, "tier1_direct",
-    concordance_quality %in% c("good", "acceptable") & rauch_unanimous == TRUE, "tier2_inherited",
-    rauch_unanimous == FALSE, "tier2_ambiguous",
-    concordance_quality == "poor", "tier3_poor_concordance",
-    default = "tier2_inherited"
-  )]
-  
-  # --- Step 8: Compare classifications ---
-  dt[, benchmark_match := rauch_category == rauch_benchmark]
-  
- # --- Step 9: Reconcile to final classification ---
-  # Priority: Use Rauch (1999) for high-confidence benchmarks, GMM elsewhere
-  dt[, rauch_final := fcase(
-    benchmark_tier == "tier1_direct", rauch_benchmark,
-    benchmark_tier == "tier2_inherited" & rauch_unanimous == TRUE, rauch_benchmark,
-    default = rauch_category
-  )]
-  
-  # Track source of final classification
- dt[, final_source := fcase(
-    benchmark_tier == "tier1_direct", "rauch_1999",
-    benchmark_tier == "tier2_inherited" & rauch_unanimous == TRUE, "rauch_1999",
-    default = "gmm"
-  )]
-  
-  # --- Step 10: Compute summaries ---
-  coverage_summary <- dt[, .(
-    n_hs6 = .N,
-    n_with_benchmark = sum(!is.na(rauch_benchmark)),
-    pct_with_benchmark = round(100 * mean(!is.na(rauch_benchmark)), 1),
-    pct_match_all = round(100 * mean(benchmark_match, na.rm = TRUE), 1),
-    pct_match_tier1 = round(100 * mean(benchmark_match[benchmark_tier == "tier1_direct"], na.rm = TRUE), 1),
-    pct_match_tier2 = round(100 * mean(benchmark_match[benchmark_tier %in% c("tier2_inherited", "tier2_ambiguous")], na.rm = TRUE), 1),
-    n_tier1 = sum(benchmark_tier == "tier1_direct", na.rm = TRUE),
-    n_tier2 = sum(benchmark_tier %in% c("tier2_inherited", "tier2_ambiguous"), na.rm = TRUE),
-    n_tier3 = sum(benchmark_tier == "tier3_poor_concordance", na.rm = TRUE),
-    n_no_coverage = sum(benchmark_tier == "no_coverage", na.rm = TRUE),
-    n_final_from_rauch = sum(final_source == "rauch_1999", na.rm = TRUE),
-    n_final_from_gmm = sum(final_source == "gmm", na.rm = TRUE)
-  )]
-  
-  # Agreement matrix (confusion matrix) for Tier 1 only
-  agreement_matrix <- dt[
-    benchmark_tier == "tier1_direct" & !is.na(rauch_benchmark),
-    .N,
-    by = .(gmm_category = rauch_category, rauch_1999 = rauch_benchmark)
-  ]
-  
-  # Convert to wide format for easier reading
-  if (nrow(agreement_matrix) > 0) {
-    agreement_wide <- dcast(
-      agreement_matrix, 
-      gmm_category ~ rauch_1999, 
-      value.var = "N", 
-      fill = 0
+# Combine all origin results into single data.table
+if (length(all_results) > 0) {
+  results <- rbindlist(all_results)
+  
+  cat(sprintf("Total transshipment routes identified: %s\n", 
+              format(nrow(results), big.mark = ",")))
+  
+  # SUMMARY 1: By Origin Country
+  cat("\nSummary by Origin Country:\n")
+  origin_summary <- results[, .(
+    total_transshipment_value = sum(transshipment_value),
+    n_routes = .N,
+    n_commodities = uniqueN(commodity),
+    n_third_countries = uniqueN(third_country),
+    top_third_country = third_country[which.max(transshipment_value)],
+    top_third_country_value = max(transshipment_value)
+  ), by = origin_country][order(-total_transshipment_value)]
+  
+  print(origin_summary)
+  
+  # SUMMARY 2: By Commodity (across all origins)
+  cat("\n\nTop 20 Commodities by Total Transshipment Value:\n")
+  commodity_summary <- results[, .(
+    total_transshipment_value = sum(transshipment_value),
+    n_origins = uniqueN(origin_country),
+    n_third_countries = uniqueN(third_country),
+    n_routes = .N,
+    main_origin = origin_country[which.max(transshipment_value)],
+    main_third_country = third_country[which.max(transshipment_value)]
+  ), by = commodity][order(-total_transshipment_value)][1:20]
+  
+  print(commodity_summary)
+  
+  # SUMMARY 3: By Third Country (across all origins)
+  cat("\n\nTop 20 Third Countries by Total Transshipment Value:\n")
+  third_country_summary <- results[, .(
+    total_transshipment_value = sum(transshipment_value),
+    n_origins = uniqueN(origin_country),
+    n_commodities = uniqueN(commodity),
+    n_routes = .N,
+    main_origin = origin_country[which.max(transshipment_value)],
+    top_commodity = commodity[which.max(transshipment_value)]
+  ), by = third_country][order(-total_transshipment_value)][1:20]
+  
+  print(third_country_summary)
+  
+  # SUMMARY 4: By Origin-Third Country Pair
+  cat("\n\nTop 20 Origin-Third Country Pairs by Transshipment Value:\n")
+  origin_tc_summary <- results[, .(
+    total_transshipment_value = sum(transshipment_value),
+    n_commodities = uniqueN(commodity),
+    top_commodity = commodity[which.max(transshipment_value)],
+    top_commodity_value = max(transshipment_value)
+  ), by = .(origin_country, third_country)][order(-total_transshipment_value)][1:20]
+  
+  print(origin_tc_summary)
+  
+  # Overall statistics
+  cat("\n\n=== OVERALL STATISTICS ===\n")
+  cat(sprintf("Total estimated transshipment value: $%s\n", 
+              format(sum(results$transshipment_value), big.mark = ",", scientific = FALSE)))
+  cat(sprintf("Number of origin countries with transshipment: %d\n", 
+              uniqueN(results$origin_country)))
+  cat(sprintf("Number of third countries involved: %d\n", 
+              uniqueN(results$third_country)))
+  cat(sprintf("Number of commodities transshipped: %d\n", 
+              uniqueN(results$commodity)))
+  cat(sprintf("Total number of routes: %d\n", nrow(results)))
+  
+  ################################################################################
+  # SAVE RESULTS
+  ################################################################################
+  
+  cat("\n=== SAVING RESULTS ===\n")
+  
+  # Create output object with all results and summaries
+  output <- list(
+    detailed_routes = results,
+    origin_summary = origin_summary,
+    commodity_summary = commodity_summary,
+    third_country_summary = third_country_summary,
+    origin_tc_summary = origin_tc_summary,
+    parameters = list(
+      origin_countries = origin_countries,
+      destination_country = destination_country,
+      allow_origin_crossover = allow_origin_crossover,
+      start_year = start_year,
+      end_year = end_year,
+      n_third_countries = length(third_countries)
     )
-  } else {
-    agreement_wide <- NULL
-  }
-  
-  if (verbose) {
-    cat("\n=== Benchmark Coverage Summary ===\n")
-    cat("Total HS6 codes: ", coverage_summary$n_hs6, "\n")
-    cat("With Rauch benchmark: ", coverage_summary$n_with_benchmark, 
-        " (", coverage_summary$pct_with_benchmark, "%)\n", sep = "")
-    cat("\nBy tier:\n")
-    cat("  Tier 1 (direct match): ", coverage_summary$n_tier1, "\n")
-    cat("  Tier 2 (inherited): ", coverage_summary$n_tier2, "\n")
-    cat("  Tier 3 (poor concordance): ", coverage_summary$n_tier3, "\n")
-    cat("  No coverage: ", coverage_summary$n_no_coverage, "\n")
-    cat("\nAgreement with Rauch (1999):\n")
-    cat("  Overall: ", coverage_summary$pct_match_all, "%\n", sep = "")
-    cat("  Tier 1 only: ", coverage_summary$pct_match_tier1, "%\n", sep = "")
-    
-    cat("\n=== Final Classification Sources ===\n")
-    cat("  From Rauch (1999): ", coverage_summary$n_final_from_rauch, 
-        " (", round(100 * coverage_summary$n_final_from_rauch / coverage_summary$n_hs6, 1), "%)\n", sep = "")
-    cat("  From GMM: ", coverage_summary$n_final_from_gmm,
-        " (", round(100 * coverage_summary$n_final_from_gmm / coverage_summary$n_hs6, 1), "%)\n", sep = "")
-    
-    if (!is.null(agreement_wide) && nrow(agreement_wide) > 0) {
-      cat("\n=== Agreement Matrix (Tier 1) ===\n")
-      cat("Rows = GMM classification, Columns = Rauch (1999)\n\n")
-      print(agreement_wide)
-    }
-  }
-  
-  list(
-    classification = dt[],
-    coverage_summary = coverage_summary,
-    agreement_matrix = agreement_wide,
-    crosswalk = crosswalk
   )
+  
+  # Save to file
+  saveRDS(output, output_file)
+  cat(sprintf("Results saved to: %s\n", output_file))
+  
+} else {
+  cat("No transshipment routes identified for any origin country.\n")
 }
 
-# =============================================================================
-# MAIN PIPELINE FUNCTION
-# =============================================================================
-
-run_full_pipeline <- function(dt, config, verbose = TRUE) {
-#
-# Runs the complete pipeline:
-#   1. Homogeneity metrics
-#   2. Divergence tests
-#   3. Rauch classification (GMM-based)
-#   4. Year-level classification
-#   5. Rauch (1999) benchmark comparison (optional)
-#
-# Arguments:
-#   dt:      Validated trade data (data.table)
-#   config:  Configuration list
-#   verbose: Print progress and summaries
-#
-# Returns:
-#   List with all results
-#
-  
-  if (verbose) cat("\n=== Step 1: Computing Homogeneity Metrics ===\n")
-  homog <- dominant_uom_metrics(dt, config)
-  
-  if (verbose) {
-    cat("Year-level observations: ", format(nrow(homog$year_level), big.mark = ","), "\n")
-    cat("HS6 codes with valid estimates: ", format(nrow(homog$hs6_level), big.mark = ","), "\n")
-  }
-  
-  if (verbose) cat("\n=== Step 2: Running Divergence Tests ===\n")
-  div <- run_divergence_tests(homog$exporter_level, config)
-  
-  if (verbose) {
-    n_flagged <- sum(div$hs6_level$flag_divergence, na.rm = TRUE)
-    cat("HS6 codes with significant divergence: ", n_flagged, "\n")
-  }
-  
-  if (verbose) cat("\n=== Step 3: Rauch Classification (GMM) ===\n")
-  rauch <- classify_rauch_gmm(homog$year_level, homog$hs6_level, config)
-  
-  if (verbose) {
-    cat("Method used: ", rauch$settings$method, "\n")
-    cat("\nCategory distribution:\n")
-    print(rauch$category_summary)
-  }
-  
-  if (verbose) cat("\n=== Step 4: Year-Level Classification ===\n")
-  year_rauch <- classify_years_rauch(homog$year_level, rauch)
-  
-  # --- Step 5: Rauch (1999) Benchmark Integration ---
-  benchmark <- NULL
-  if (isTRUE(config$use_rauch_benchmark)) {
-    if (verbose) cat("\n=== Step 5: Rauch (1999) Benchmark Comparison ===\n")
-    
-    benchmark <- tryCatch({
-      integrate_rauch_benchmark(
-        classification = rauch$classification,
-        config = config,
-        verbose = verbose
-      )
-    }, error = function(e) {
-      warning("Rauch benchmark integration failed: ", e$message)
-      if (verbose) cat("Benchmark integration skipped due to error.\n")
-      NULL
-    })
-  }
-  
-  # --- Combine results ---
-  # Start with divergence results
-  combined <- div$hs6_level[, .(hs6, med_delta, flag_divergence, dominant_direction)]
-  
-  # Merge with classification (use benchmark-enhanced if available)
-  if (!is.null(benchmark)) {
-    combined <- benchmark$classification[combined, on = "hs6"]
-  } else {
-    combined <- rauch$classification[combined, on = "hs6"]
-  }
-  
-  if (verbose) {
-    cat("\n=== Pipeline Complete ===\n")
-    cat("Results available in output list.\n")
-  }
-  
-  list(
-    homogeneity = homog,
-    divergence = div,
-    rauch = rauch,
-    year_rauch = year_rauch,
-    benchmark = benchmark,
-    combined = combined,
-    config = config
-  )
-}
-
-# =============================================================================
-# EXPORT FUNCTIONS
-# =============================================================================
-
-export_results <- function(results, output_dir = "output", prefix = "homogeneity") {
-#
-# Exports results to CSV files
-#
-  
-  if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
-  
-  # Year-level homogeneity
-  fwrite(results$homogeneity$year_level, 
-         file.path(output_dir, paste0(prefix, "_year_level.csv")))
-  
-  # HS6-level homogeneity
-  fwrite(results$homogeneity$hs6_level,
-         file.path(output_dir, paste0(prefix, "_hs6_level.csv")))
-  
-  # Divergence results
-  fwrite(results$divergence$hs6_level,
-         file.path(output_dir, paste0(prefix, "_divergence.csv")))
-  
-  # Rauch classification
-  fwrite(results$rauch$classification,
-         file.path(output_dir, paste0(prefix, "_rauch_classification.csv")))
-  
-  # Combined output
-  fwrite(results$combined,
-         file.path(output_dir, paste0(prefix, "_combined.csv")))
-  
-  # Year-level Rauch
-  fwrite(results$year_rauch$year_classified,
-         file.path(output_dir, paste0(prefix, "_year_rauch.csv")))
-  
-  # Benchmark outputs (if available)
-  if (!is.null(results$benchmark)) {
-    fwrite(results$benchmark$coverage_summary,
-           file.path(output_dir, paste0(prefix, "_benchmark_coverage.csv")))
-    
-    if (!is.null(results$benchmark$agreement_matrix)) {
-      fwrite(results$benchmark$agreement_matrix,
-             file.path(output_dir, paste0(prefix, "_benchmark_agreement.csv")))
-    }
-    
-    fwrite(results$benchmark$crosswalk,
-           file.path(output_dir, paste0(prefix, "_sitc4_hs6_crosswalk.csv")))
-  }
-  
-  cat("Results exported to:", output_dir, "\n")
-  cat("Files:\n")
-  cat("  - ", prefix, "_year_level.csv\n", sep = "")
-  cat("  - ", prefix, "_hs6_level.csv\n", sep = "")
-  cat("  - ", prefix, "_divergence.csv\n", sep = "")
-  cat("  - ", prefix, "_rauch_classification.csv\n", sep = "")
-  cat("  - ", prefix, "_combined.csv\n", sep = "")
-  cat("  - ", prefix, "_year_rauch.csv\n", sep = "")
-  
-  if (!is.null(results$benchmark)) {
-    cat("  - ", prefix, "_benchmark_coverage.csv\n", sep = "")
-    cat("  - ", prefix, "_benchmark_agreement.csv\n", sep = "")
-    cat("  - ", prefix, "_sitc4_hs6_crosswalk.csv\n", sep = "")
-  }
-}
-
-# =============================================================================
-# USAGE EXAMPLE
-# =============================================================================
-
-#' To run the pipeline:
-#'
-#' 1. Load your data (multiple options):
-#'
-#'    # Single file
-#'    dt <- load_trade_data("data/trade_all_years.csv")
-#'
-#'    # Multiple files by year
-#'    dt <- load_trade_data(c(
-#'      "data/trade_2022.csv",
-#'      "data/trade_2023.csv", 
-#'      "data/trade_2024.csv"
-#'    ))
-#'
-#'    # All files in a directory
-#'    dt <- load_trade_data("data/annual/")
-#'
-#'    # With source tracking (adds column identifying origin file)
-#'    dt <- load_trade_data(
-#'      c("data/comtrade_2023.csv", "data/census_2023.csv"),
-#'      id_col = "data_source"
-#'    )
-#'
-#' 2. Validate:
-#'    dt <- validate_trade_data(dt)
-#'
-#' 3. Run pipeline:
-#'    results <- run_full_pipeline(dt, config)
-#'
-#' 4. Access results:
-#'    results$combined                    # Main HS6-level output (includes benchmark if enabled)
-#'    results$homogeneity$year_level      # Year-level metrics
-#'    results$rauch$classification        # Rauch categories (GMM-based)
-#'    results$divergence$hs6_level        # Divergence test results
-#'    results$benchmark$coverage_summary  # Rauch (1999) benchmark coverage
-#'    results$benchmark$agreement_matrix  # GMM vs Rauch (1999) confusion matrix
-#'
-#' 5. Export:
-#'    export_results(results, output_dir = "output")
-#'
-#' 6. Final classification queries:
-#'
-#'    # Use rauch_final for the reconciled classification
-#'    results$combined[, .N, by = rauch_final]
-#'
-#'    # See where final classification came from
-#'    results$combined[, .N, by = final_source]
-#'
-#'    # Homogeneous goods (final)
-#'    results$combined[rauch_final == "homogeneous"]
-#'
-#' 7. Benchmark-specific queries:
-#'
-#'    # HS6 codes where GMM disagrees with Rauch (1999) - Tier 1 only
-#'    results$combined[benchmark_tier == "tier1_direct" & benchmark_match == FALSE]
-#'
-#'    # HS6 codes with no Rauch (1999) coverage (new products)
-#'    results$combined[benchmark_tier == "no_coverage"]
-#'
-#'    # Agreement rate by GMM category
-#'    results$combined[!is.na(rauch_benchmark), 
-#'      .(n = .N, pct_match = mean(benchmark_match)), 
-#'      by = rauch_category]
-#'
-#' 8. Disable benchmark (if concordance package unavailable):
-#'    config$use_rauch_benchmark <- FALSE
-#'    results <- run_full_pipeline(dt, config)
-
-
-# =============================================================================
-# UNCOMMENT BELOW TO RUN
-# =============================================================================
-
-# # --- Prerequisites ---
-# # install.packages("concordance")  # Required for Rauch (1999) benchmark
-# # install.packages("mclust")       # Required for GMM classification
-#
-# # --- Load and validate data ---
-# dt <- load_trade_data(c(
-#   "data/trade_2022.csv",
-#   "data/trade_2023.csv",
-#   "data/trade_2024.csv"
-# ))
-# dt <- validate_trade_data(dt)
-#
-# # --- Run pipeline (with benchmark) ---
-# results <- run_full_pipeline(dt, config, verbose = TRUE)
-#
-# # --- View key outputs ---
-# print(results$combined[order(med_log_gap_eq)])
-# print(results$rauch$category_summary)
-#
-# # --- View final classification distribution ---
-# print(results$combined[, .N, by = .(rauch_final, final_source)])
-#
-# # --- View benchmark results ---
-# if (!is.null(results$benchmark)) {
-#   print(results$benchmark$coverage_summary)
-#   print(results$benchmark$agreement_matrix)
-#   
-#   # Disagreements worth investigating
-#   print(results$combined[
-#     benchmark_tier == "tier1_direct" & benchmark_match == FALSE,
-#     .(hs6, rauch_category, rauch_benchmark, rauch_final, med_H_eq)
-#   ])
-# }
-#
-# # --- Export ---
-# export_results(results, output_dir = "output", prefix = "trade_homogeneity")
+cat("\n=== ANALYSIS COMPLETE ===\n")
