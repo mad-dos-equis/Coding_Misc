@@ -142,14 +142,26 @@ row_total_imports <- trade_data[importer != destination_country, .(
 
 setkey(row_total_imports, commodity, year)
 
+# OPTIMIZATION: Pre-calculate ROW exports by exporter-commodity-year
+# This avoids repeated aggregations in the innermost loop
+cat("Pre-calculating ROW exports for criterion iii...\n")
+row_exports <- trade_data[importer != destination_country, .(
+  row_exports = sum(value, na.rm = TRUE)
+), by = .(exporter, commodity, year)]
+
+row_exports_start <- row_exports[year == start_year]
+row_exports_end <- row_exports[year == end_year]
+setkey(row_exports_start, exporter, commodity)
+setkey(row_exports_end, exporter, commodity)
+
 # Create separate datasets for each year
 shares_start <- trade_data[year == start_year, 
                            .(importer, exporter, commodity, value, share)]
-setkey(shares_start, importer, exporter, commodity)
+setkey(shares_start, commodity, importer, exporter)  # OPTIMIZATION: compound key
 
 shares_end <- trade_data[year == end_year, 
                          .(importer, exporter, commodity, value, share)]
-setkey(shares_end, importer, exporter, commodity)
+setkey(shares_end, commodity, importer, exporter)  # OPTIMIZATION: compound key
 
 # Get unique commodities
 all_commodities <- unique(trade_data$commodity)
@@ -188,8 +200,11 @@ for (origin_idx in seq_along(origin_countries)) {
     end_idx <- min(chunk_idx * chunk_size, n_commodities)
     chunk_commodities <- all_commodities[start_idx:end_idx]
     
-    cat(sprintf("  [%s] Processing chunk %d/%d (commodities %d-%d)...\n",
+    cat(sprintf("  [%s] Processing chunk %d/%d (commodities %d-%d)...",
                 origin_country, chunk_idx, n_chunks, start_idx, end_idx))
+    
+    # Track results before this chunk
+    results_before_chunk <- length(origin_results)
     
     # Filter data for this chunk
     comm_data_start <- shares_start[commodity %in% chunk_commodities]
@@ -206,63 +221,50 @@ for (origin_idx in seq_along(origin_countries)) {
       for (tc in third_countries) {
         
         # ===================================================================
-        # GET TRADE VALUES AND SHARES
+        # GET TRADE VALUES AND SHARES (OPTIMIZED WITH KEYED LOOKUPS)
         # ===================================================================
         
         # Origin→Third Country (TC)
-        origin_to_tc_val_start <- comm_start[importer == tc & exporter == origin_country, value]
-        origin_to_tc_val_end <- comm_end[importer == tc & exporter == origin_country, value]
+        origin_to_tc_val_start <- shares_start[.(comm, tc, origin_country), value]
+        origin_to_tc_val_end <- shares_end[.(comm, tc, origin_country), value]
         
-        if (length(origin_to_tc_val_start) == 0) origin_to_tc_val_start <- 0
-        if (length(origin_to_tc_val_end) == 0) origin_to_tc_val_end <- 0
+        if (length(origin_to_tc_val_start) == 0 || is.na(origin_to_tc_val_start)) origin_to_tc_val_start <- 0
+        if (length(origin_to_tc_val_end) == 0 || is.na(origin_to_tc_val_end)) origin_to_tc_val_end <- 0
+        
+        # OPTIMIZATION: Early exit if no trade on origin→TC leg in end year
+        if (origin_to_tc_val_end == 0) next
         
         # Third Country→Destination
-        tc_to_dest_val_start <- comm_start[importer == destination_country & exporter == tc, value]
-        tc_to_dest_val_end <- comm_end[importer == destination_country & exporter == tc, value]
+        tc_to_dest_val_start <- shares_start[.(comm, destination_country, tc), value]
+        tc_to_dest_val_end <- shares_end[.(comm, destination_country, tc), value]
         
-        if (length(tc_to_dest_val_start) == 0) tc_to_dest_val_start <- 0
-        if (length(tc_to_dest_val_end) == 0) tc_to_dest_val_end <- 0
+        if (length(tc_to_dest_val_start) == 0 || is.na(tc_to_dest_val_start)) tc_to_dest_val_start <- 0
+        if (length(tc_to_dest_val_end) == 0 || is.na(tc_to_dest_val_end)) tc_to_dest_val_end <- 0
+        
+        # OPTIMIZATION: Early exit if no trade on TC→dest leg in end year
+        if (tc_to_dest_val_end == 0) next
         
         # Origin→Destination (direct)
-        origin_to_dest_val_start <- comm_start[importer == destination_country & exporter == origin_country, value]
-        origin_to_dest_val_end <- comm_end[importer == destination_country & exporter == origin_country, value]
+        origin_to_dest_val_start <- shares_start[.(comm, destination_country, origin_country), value]
+        origin_to_dest_val_end <- shares_end[.(comm, destination_country, origin_country), value]
         
-        if (length(origin_to_dest_val_start) == 0) origin_to_dest_val_start <- 0
-        if (length(origin_to_dest_val_end) == 0) origin_to_dest_val_end <- 0
+        if (length(origin_to_dest_val_start) == 0 || is.na(origin_to_dest_val_start)) origin_to_dest_val_start <- 0
+        if (length(origin_to_dest_val_end) == 0 || is.na(origin_to_dest_val_end)) origin_to_dest_val_end <- 0
         
-        # Total ("world") imports by commodity-importer-year
+        # Total ("world") imports by commodity-importer-year (for excess growth)
         world_to_tc_val_start <- total_imports_by_country[
-          commodity == comm & importer == tc & year == start_year, total_imports]
+          .(comm, tc, start_year), total_imports]
         world_to_tc_val_end <- total_imports_by_country[
-          commodity == comm & importer == tc & year == end_year, total_imports]
+          .(comm, tc, end_year), total_imports]
         world_to_dest_val_start <- total_imports_by_country[
-          commodity == comm & importer == destination_country & year == start_year, total_imports]
+          .(comm, destination_country, start_year), total_imports]
         world_to_dest_val_end <- total_imports_by_country[
-          commodity == comm & importer == destination_country & year == end_year, total_imports]
+          .(comm, destination_country, end_year), total_imports]
         
-        if (length(world_to_tc_val_start) == 0) world_to_tc_val_start <- 0
-        if (length(world_to_tc_val_end) == 0) world_to_tc_val_end <- 0
-        if (length(world_to_dest_val_start) == 0) world_to_dest_val_start <- 0
-        if (length(world_to_dest_val_end) == 0) world_to_dest_val_end <- 0
-        
-        # Rest-of-world (ROW) total imports for this commodity (for criterion iii)
-        row_total_start <- row_total_imports[commodity == comm & year == start_year, row_total_imports]
-        row_total_end <- row_total_imports[commodity == comm & year == end_year, row_total_imports]
-        
-        if (length(row_total_start) == 0) row_total_start <- 0
-        if (length(row_total_end) == 0) row_total_end <- 0
-        
-        # Origin exports to ROW (all countries except destination)
-        origin_to_row_start <- comm_start[importer != destination_country & exporter == origin_country, 
-                                          sum(value, na.rm = TRUE)]
-        origin_to_row_end <- comm_end[importer != destination_country & exporter == origin_country, 
-                                      sum(value, na.rm = TRUE)]
-        
-        # TC exports to ROW
-        tc_to_row_start <- comm_start[importer != destination_country & exporter == tc, 
-                                      sum(value, na.rm = TRUE)]
-        tc_to_row_end <- comm_end[importer != destination_country & exporter == tc, 
-                                  sum(value, na.rm = TRUE)]
+        if (length(world_to_tc_val_start) == 0 || is.na(world_to_tc_val_start)) world_to_tc_val_start <- 0
+        if (length(world_to_tc_val_end) == 0 || is.na(world_to_tc_val_end)) world_to_tc_val_end <- 0
+        if (length(world_to_dest_val_start) == 0 || is.na(world_to_dest_val_start)) world_to_dest_val_start <- 0
+        if (length(world_to_dest_val_end) == 0 || is.na(world_to_dest_val_end)) world_to_dest_val_end <- 0
         
         # ===================================================================
         # FREUND CRITERION ii: THREE-WAY PATTERN
@@ -273,11 +275,32 @@ for (origin_idx in seq_along(origin_countries)) {
                         (origin_to_tc_val_end > origin_to_tc_val_start) &
                         (tc_to_dest_val_end > tc_to_dest_val_start)
         
+        # OPTIMIZATION: Early exit if criterion ii fails (skip expensive ROW calculations)
+        if (!criterion_ii) next
+        
         # ===================================================================
         # FREUND CRITERION iii: REST-OF-WORLD COMPETITIVENESS
         # Origin's ROW share growth > TC's ROW share growth
         # (Excludes cases where TC is becoming globally competitive)
         # ===================================================================
+        
+        # Rest-of-world (ROW) total imports for this commodity
+        row_total_start <- row_total_imports[.(comm, start_year), row_total_imports]
+        row_total_end <- row_total_imports[.(comm, end_year), row_total_imports]
+        
+        if (length(row_total_start) == 0 || is.na(row_total_start)) row_total_start <- 0
+        if (length(row_total_end) == 0 || is.na(row_total_end)) row_total_end <- 0
+        
+        # OPTIMIZATION: Use pre-computed ROW exports (instead of aggregating in loop)
+        origin_to_row_start <- row_exports_start[.(origin_country, comm), row_exports]
+        origin_to_row_end <- row_exports_end[.(origin_country, comm), row_exports]
+        tc_to_row_start <- row_exports_start[.(tc, comm), row_exports]
+        tc_to_row_end <- row_exports_end[.(tc, comm), row_exports]
+        
+        if (length(origin_to_row_start) == 0 || is.na(origin_to_row_start)) origin_to_row_start <- 0
+        if (length(origin_to_row_end) == 0 || is.na(origin_to_row_end)) origin_to_row_end <- 0
+        if (length(tc_to_row_start) == 0 || is.na(tc_to_row_start)) tc_to_row_start <- 0
+        if (length(tc_to_row_end) == 0 || is.na(tc_to_row_end)) tc_to_row_end <- 0
         
         # Calculate shares of rest-of-world imports
         if (row_total_start > 0) {
@@ -302,6 +325,9 @@ for (origin_idx in seq_along(origin_countries)) {
         
         criterion_iii <- origin_row_growth > tc_row_growth
         
+        # OPTIMIZATION: Early exit if criterion iii fails
+        if (!criterion_iii) next
+        
         # ===================================================================
         # FREUND CRITERION iv: VOLUME THRESHOLD
         # TC imports from origin ≥ 75% of TC exports to destination
@@ -316,14 +342,12 @@ for (origin_idx in seq_along(origin_countries)) {
         }
         
         # ===================================================================
-        # CHECK IF ALL CRITERIA MET
+        # ALL CRITERIA MET - CALCULATE TRANSSHIPMENT VALUE
         # ===================================================================
         
-        if (criterion_ii && criterion_iii && criterion_iv) {
-          
-          # =================================================================
-          # CALCULATE TRANSSHIPMENT VALUE (EXCESS GROWTH METHOD)
-          # =================================================================
+        # =================================================================
+        # CALCULATE TRANSSHIPMENT VALUE (EXCESS GROWTH METHOD)
+        # =================================================================
           
           # Calculate excess growth for Origin→TC
           # (growth beyond what would be expected from TC's overall import growth)
@@ -371,8 +395,17 @@ for (origin_idx in seq_along(origin_countries)) {
               transshipment_value = transshipment_value
             )
           }
-        }
       }
+    }
+    
+    # Report if transshipment was detected in this chunk
+    results_after_chunk <- length(origin_results)
+    new_routes <- results_after_chunk - results_before_chunk
+    
+    if (new_routes > 0) {
+      cat(sprintf(" Transshipment detected (%d routes)\n", new_routes))
+    } else {
+      cat(" No transshipment detected\n")
     }
     
     # Clean up memory after each chunk
