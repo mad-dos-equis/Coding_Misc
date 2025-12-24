@@ -127,7 +127,7 @@ for (origin_country in ORIGIN_COUNTRIES) {
     end_idx <- min(chunk_num * CHUNK_SIZE, length(all_commodities))
     chunk_commodities <- all_commodities[start_idx:end_idx]
     
-    cat(sprintf("Processing chunk %d/%d - Commodities %d to %d\n", 
+    cat(sprintf("Processing chunk %d/%d - Commodities %d to %d... ", 
                 chunk_num, n_chunks, start_idx, end_idx))
     
     # Filter data for this chunk
@@ -135,6 +135,7 @@ for (origin_country in ORIGIN_COUNTRIES) {
     
     # Initialize results storage for this chunk
     chunk_results <- list()
+    chunk_routes_count <- 0
     
     # ------------------------------------------------------------------------------
     # COMMODITY LOOP
@@ -356,6 +357,9 @@ for (origin_country in ORIGIN_COUNTRIES) {
           tc_results[, description := NA_character_]
         }
         
+        # Track number of routes in this chunk
+        chunk_routes_count <- chunk_routes_count + nrow(tc_results)
+        
         # Add to chunk results
         chunk_results[[length(chunk_results) + 1]] <- tc_results[, .(
           origin_country = origin_country,
@@ -367,6 +371,13 @@ for (origin_country in ORIGIN_COUNTRIES) {
           transshipment_value
         )]
       }
+    }
+    
+    # Report chunk completion
+    if (chunk_routes_count > 0) {
+      cat(sprintf("Found %s transshipment routes\n", format(chunk_routes_count, big.mark=",")))
+    } else {
+      cat("No transshipment detected\n")
     }
     
     # Combine chunk results
