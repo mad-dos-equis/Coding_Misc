@@ -19,6 +19,12 @@ DESTINATION_COUNTRY <- "USA"  # ISO3 code
 START_YEAR <- 2018            # Start year for analysis
 END_YEAR <- 2023              # End year for analysis
 
+# Origin country handling
+# When multiple origin countries are specified, should they be allowed as third countries for each other?
+# TRUE: Germany → France → USA would be analyzed (detects intra-bloc transshipment)
+# FALSE: France excluded when analyzing Germany (only external third countries)
+ALLOW_ORIGIN_COUNTRIES_AS_TC <- FALSE  # Default: exclude origin countries from TC list
+
 # Processing parameters
 CHUNK_SIZE <- 50              # Number of commodities to process at once
 MIN_SHARE_FOR_GROWTH <- 0     # Minimum share threshold (typically 0)
@@ -42,6 +48,7 @@ cat(sprintf("  Input file: %s\n", INPUT_FILE_PATH))
 cat(sprintf("  Origin countries: %s\n", paste(ORIGIN_COUNTRIES, collapse=", ")))
 cat(sprintf("  Destination: %s\n", DESTINATION_COUNTRY))
 cat(sprintf("  Period: %d to %d\n", START_YEAR, END_YEAR))
+cat(sprintf("  Allow origins as third countries: %s\n", ALLOW_ORIGIN_COUNTRIES_AS_TC))
 cat(sprintf("  Chunk size: %d commodities\n\n", CHUNK_SIZE))
 
 # ------------------------------------------------------------------------------
@@ -84,11 +91,21 @@ data_filtered[, share := value_imp_pref / total_value]
 
 # Get lists
 all_commodities <- unique(data_filtered$commodity)
-third_countries <- unique(data_filtered$imp_iso[!(data_filtered$imp_iso %in% c(DESTINATION_COUNTRY))])
+
+# Define third countries based on configuration
+if (ALLOW_ORIGIN_COUNTRIES_AS_TC) {
+  # Allow origin countries to serve as third countries for each other
+  third_countries <- unique(data_filtered$imp_iso[!(data_filtered$imp_iso %in% c(DESTINATION_COUNTRY))])
+  tc_description <- "all countries except destination"
+} else {
+  # Exclude all origin countries from third country list
+  third_countries <- unique(data_filtered$imp_iso[!(data_filtered$imp_iso %in% c(DESTINATION_COUNTRY, ORIGIN_COUNTRIES))])
+  tc_description <- "all countries except destination and origins"
+}
 
 cat(sprintf("Analysis scope:\n"))
 cat(sprintf("  Commodities: %s\n", format(length(all_commodities), big.mark=",")))
-cat(sprintf("  Third countries: %s\n\n", format(length(third_countries), big.mark=",")))
+cat(sprintf("  Third countries (%s): %s\n\n", tc_description, format(length(third_countries), big.mark=",")))
 
 # ------------------------------------------------------------------------------
 # CHUNKED PROCESSING SETUP
@@ -219,10 +236,18 @@ for (origin_country in ORIGIN_COUNTRIES) {
       for (i in 1:nrow(tc_results)) {
         tc <- tc_results$third_country[i]
         
-        # Define ROW (exclude destination and origin, not current TC yet)
-        row_countries <- unique(comm_data$imp_iso[!comm_data$imp_iso %in% c(DESTINATION_COUNTRY)])
+        # Define ROW (Rest of World)
+        # Always exclude: destination country and current third country
+        # Conditionally exclude: origin country being analyzed, and possibly other origin countries
+        if (ALLOW_ORIGIN_COUNTRIES_AS_TC) {
+          # Exclude destination and current origin only
+          row_countries <- unique(comm_data$imp_iso[!comm_data$imp_iso %in% c(DESTINATION_COUNTRY)])
+        } else {
+          # Exclude destination and all origin countries
+          row_countries <- unique(comm_data$imp_iso[!comm_data$imp_iso %in% c(DESTINATION_COUNTRY, ORIGIN_COUNTRIES)])
+        }
         
-        # Origin to ROW
+        # Origin to ROW (always exclude the current origin from ROW as importer)
         origin_row_yr_start <- comm_data[year == START_YEAR & exp_iso == origin_country & 
                                           imp_iso != origin_country & imp_iso %in% row_countries, 
                                          sum(value_imp_pref, na.rm = TRUE)]
@@ -236,7 +261,7 @@ for (origin_country in ORIGIN_COUNTRIES) {
         total_row_yr_end <- comm_data[year == END_YEAR & imp_iso %in% row_countries, 
                                       sum(value_imp_pref, na.rm = TRUE)]
         
-        # Third country to ROW
+        # Third country to ROW (exclude current TC from ROW as importer)
         tc_row_yr_start <- comm_data[year == START_YEAR & exp_iso == tc & 
                                       imp_iso != tc & imp_iso %in% row_countries, 
                                      sum(value_imp_pref, na.rm = TRUE)]
