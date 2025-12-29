@@ -340,12 +340,6 @@ for (origin_country in ORIGIN_COUNTRIES) {
       tc_results <- merge(tc_results, tc_to_dest, by = "third_country", all.x = TRUE)
       tc_results <- merge(tc_results, world_to_tc, by = "third_country", all.x = TRUE)
       
-      # Filter to routes with established baseline trade to destination
-      # (required for meaningful excess growth calculation)
-      tc_results <- tc_results[!is.na(tc_to_dest_val_yr_start) & tc_to_dest_val_yr_start > 0]
-      
-      if (nrow(tc_results) == 0) next
-      
       # Add world_to_dest scalars as columns
       tc_results[, world_to_dest_val_yr_start := world_to_dest_val_yr_start]
       tc_results[, world_to_dest_val_yr_end := world_to_dest_val_yr_end]
