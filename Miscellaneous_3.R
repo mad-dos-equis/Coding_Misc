@@ -340,15 +340,19 @@ for (origin_country in ORIGIN_COUNTRIES) {
       
       world_to_dest <- merge(world_to_dest_yr_start, world_to_dest_yr_end, by = "third_country", all.x = TRUE)
       
-      # Join the different data frames of trade flows using data.table merges
-      tc_results <- merge(tc_results, origin_to_tc, by = "third_country", all.x = TRUE)
-      tc_results <- merge(tc_results, tc_to_dest, by = "third_country", all.x = TRUE)
-      tc_results <- merge(tc_results, world_to_tc, by = "third_country", all.x = TRUE)
-      tc_results <- merge(tc_results, world_to_dest, by = "third_country", all.x = TRUE)
+      # Join the different data frames of trade flows
+      tc_results <- tc_results %>%
+        left_join(origin_to_tc, by = "third_country") %>%
+        left_join(tc_to_dest, by = "third_country") %>%
+        left_join(world_to_tc, by = "third_country") %>%
+        left_join(world_to_dest, by = "third_country") %>%
+        mutate(
+          origin_to_tc = origin_to_tc_val_yr_end - ((origin_to_tc_val_yr_start/world_to_tc_val_yr_start) * world_to_tc_val_yr_end),
+          tc_to_dest = tc_to_dest_val_yr_end - ((tc_to_dest_val_yr_start/world_to_dest_val_yr_start) * world_to_dest_val_yr_end)
+        )
       
-      # Calculate excess flows
-      tc_results[, origin_to_tc := origin_to_tc_val_yr_end - ((origin_to_tc_val_yr_start/world_to_tc_val_yr_start) * world_to_tc_val_yr_end)]
-      tc_results[, tc_to_dest := tc_to_dest_val_yr_end - ((tc_to_dest_val_yr_start/world_to_dest_val_yr_start) * world_to_dest_val_yr_end)]
+      # Convert back to data.table for subsequent operations
+      setDT(tc_results)
       
       # Replace NAs with 0
       tc_results[is.na(origin_to_tc), origin_to_tc := 0]
