@@ -307,7 +307,7 @@ for (origin_country in ORIGIN_COUNTRIES) {
       
       origin_to_tc <- merge(origin_to_tc_yr_start, origin_to_tc_yr_end, by = "third_country", all.x = TRUE)
       
-      # World to third countries (total imports by each TC)
+      # World to third countries
       world_to_tc_yr_start <- values_yr_start[imp_iso %in% tc_results$third_country,
                                                .(world_to_tc_val_yr_start = sum(value_imp_pref, na.rm = TRUE)),
                                                by = .(third_country = imp_iso)]
@@ -329,7 +329,7 @@ for (origin_country in ORIGIN_COUNTRIES) {
       
       tc_to_dest <- merge(tc_to_dest_yr_start, tc_to_dest_yr_end, by = "third_country", all.x = TRUE)
       
-      # World to destination (total imports, repeated for each TC for merging)
+      # World to destination
       world_to_dest_yr_start <- values_yr_start[imp_iso == DESTINATION_COUNTRY,
                                                  .(third_country = exp_iso,
                                                    world_to_dest_val_yr_start = sum(value_imp_pref, na.rm = TRUE))]
@@ -350,9 +350,6 @@ for (origin_country in ORIGIN_COUNTRIES) {
           origin_to_tc = origin_to_tc_val_yr_end - ((origin_to_tc_val_yr_start/world_to_tc_val_yr_start) * world_to_tc_val_yr_end),
           tc_to_dest = tc_to_dest_val_yr_end - ((tc_to_dest_val_yr_start/world_to_dest_val_yr_start) * world_to_dest_val_yr_end)
         )
-      
-      # Convert back to data.table for subsequent operations
-      setDT(tc_results)
       
       # Replace NAs with 0
       tc_results[is.na(origin_to_tc), origin_to_tc := 0]
