@@ -329,20 +329,22 @@ for (origin_country in ORIGIN_COUNTRIES) {
       
       tc_to_dest <- merge(tc_to_dest_yr_start, tc_to_dest_yr_end, by = "third_country", all.x = TRUE)
       
-      # World to destination (scalar totals for the commodity)
-      world_to_dest_val_yr_start <- values_yr_start[imp_iso == DESTINATION_COUNTRY,
-                                                     sum(value_imp_pref, na.rm = TRUE)]
-      world_to_dest_val_yr_end <- values_yr_end[imp_iso == DESTINATION_COUNTRY,
-                                                 sum(value_imp_pref, na.rm = TRUE)]
+      # World to destination (total imports, repeated for each TC for merging)
+      world_to_dest_yr_start <- values_yr_start[imp_iso == DESTINATION_COUNTRY,
+                                                 .(third_country = exp_iso,
+                                                   world_to_dest_val_yr_start = sum(value_imp_pref, na.rm = TRUE))]
+      
+      world_to_dest_yr_end <- values_yr_end[imp_iso == DESTINATION_COUNTRY,
+                                             .(third_country = exp_iso,
+                                               world_to_dest_val_yr_end = sum(value_imp_pref, na.rm = TRUE))]
+      
+      world_to_dest <- merge(world_to_dest_yr_start, world_to_dest_yr_end, by = "third_country", all.x = TRUE)
       
       # Join the different data frames of trade flows using data.table merges
       tc_results <- merge(tc_results, origin_to_tc, by = "third_country", all.x = TRUE)
       tc_results <- merge(tc_results, tc_to_dest, by = "third_country", all.x = TRUE)
       tc_results <- merge(tc_results, world_to_tc, by = "third_country", all.x = TRUE)
-      
-      # Add world_to_dest scalars as columns
-      tc_results[, world_to_dest_val_yr_start := world_to_dest_val_yr_start]
-      tc_results[, world_to_dest_val_yr_end := world_to_dest_val_yr_end]
+      tc_results <- merge(tc_results, world_to_dest, by = "third_country", all.x = TRUE)
       
       # Calculate excess flows
       tc_results[, origin_to_tc := origin_to_tc_val_yr_end - ((origin_to_tc_val_yr_start/world_to_tc_val_yr_start) * world_to_tc_val_yr_end)]
