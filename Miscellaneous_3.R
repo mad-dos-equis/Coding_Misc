@@ -280,6 +280,13 @@ for (origin_country in ORIGIN_COUNTRIES) {
       tc_results[, tc_share_row_yr_end := ifelse(total_row_yr_end == 0, 0, tc_row_val_yr_end / total_row_yr_end)]
       tc_results[, tc_row_growth := tc_share_row_yr_end - tc_share_row_yr_start]
       
+      # Store origin ROW values as columns for vectorized comparison
+      tc_results[, `:=`(
+        origin_share_row_yr_start = origin_share_row_yr_start,
+        origin_share_row_yr_end = origin_share_row_yr_end,
+        origin_row_growth = origin_row_growth
+      )]
+      
       # Apply Criterion 3 logic vectorized
       tc_results[, criterion3 := fcase(
         # Both are new/tiny in base year - compare end year shares
