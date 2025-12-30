@@ -285,8 +285,8 @@ for (origin_country in ORIGIN_COUNTRIES) {
       set(tc_results, which(is.na(tc_results$tc_row_val_yr_end)), "tc_row_val_yr_end", 0)
       
       # Calculate TC shares of ROW
-      tc_results[, tc_share_yr_start := fifelse(total_row_yr_start == 0, 0, tc_row_val_yr_start / total_row_yr_start)]
-      tc_results[, tc_share_yr_end := fifelse(total_row_yr_end == 0, 0, tc_row_val_yr_end / total_row_yr_end)]
+      tc_results[, tc_share_yr_start := if (total_row_yr_start == 0) 0 else tc_row_val_yr_start / total_row_yr_start]
+      tc_results[, tc_share_yr_end := if (total_row_yr_end == 0) 0 else tc_row_val_yr_end / total_row_yr_end]
       
       # Apply Criterion 3 logic vectorized but preserving exact original branching
       # Original: if (origin_share < MIN | tc_share < MIN) { ... } else { normal growth }
