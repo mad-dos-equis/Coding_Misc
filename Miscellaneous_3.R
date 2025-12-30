@@ -290,16 +290,15 @@ for (origin_country in ORIGIN_COUNTRIES) {
       
       # Apply Criterion 3 logic vectorized but preserving exact original branching
       # Original: if (origin_share < MIN | tc_share < MIN) { ... } else { normal growth }
+      # Note: origin_share_yr_start/end are scalars, tc_share_yr_start/end are vectors
       
       tc_results[, criterion3 := {
-        # Determine which branch each row falls into
+        # Origin values are scalar (same for all TCs in this commodity)
         origin_below_min <- origin_share_yr_start < MIN_SHARE_FOR_GROWTH
-        tc_below_min <- tc_share_yr_start < MIN_SHARE_FOR_GROWTH
-        either_below_min <- origin_below_min | tc_below_min
-        both_below_min <- origin_below_min & tc_below_min
-        
-        # Calculate growth rates
         origin_growth <- origin_share_yr_end - origin_share_yr_start
+        
+        # TC values are vectors (one per TC)
+        tc_below_min <- tc_share_yr_start < MIN_SHARE_FOR_GROWTH
         tc_growth <- tc_share_yr_end - tc_share_yr_start
         
         # Apply logic matching original's if/else structure:
@@ -311,19 +310,19 @@ for (origin_country in ORIGIN_COUNTRIES) {
         #   normal growth comparison
         # }
         
-        fifelse(
-          either_below_min,
-          fifelse(
-            both_below_min,
-            origin_share_yr_end > tc_share_yr_end,
-            fifelse(
-              origin_below_min,
-              FALSE,
-              origin_growth > tc_growth  # TC is new entrant case
-            )
-          ),
-          origin_growth > tc_growth  # Normal case
-        )
+        if (origin_below_min) {
+          # Origin is below min for all rows
+          # If TC also below min -> compare end shares; else -> FALSE
+          fifelse(tc_below_min,
+                  origin_share_yr_end > tc_share_yr_end,
+                  FALSE)
+        } else {
+          # Origin has sufficient baseline
+          # If TC below min -> compare absolute changes; else -> normal growth
+          fifelse(tc_below_min,
+                  origin_growth > tc_growth,
+                  origin_growth > tc_growth)
+        }
       }]
       
       # Filter to only those passing criterion 3
