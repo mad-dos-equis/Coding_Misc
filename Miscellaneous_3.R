@@ -1,9 +1,9 @@
 # ==============================================================================
-# TRANSSHIPMENT DETECTION ANALYSIS - PARAMETERIZED VERSION (OPTIMIZED V3)
+# TRANSSHIPMENT DETECTION ANALYSIS - PARAMETERIZED VERSION (CORRECTED V2)
 # ==============================================================================
 # Based on Freund et al. methodology with configurable parameters
 # Detects trade transshipment through third countries using four criteria
-# Logic identical to original script, optimized for efficiency
+# Logic aligned with original script implementation
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
@@ -38,9 +38,10 @@ VOLUME_RATIO_THRESHOLD <- 0.75  # Criterion 4: Origin→TC must be ≥ 75% of TC
 # ------------------------------------------------------------------------------
 
 library(data.table)
+library(dplyr)
 
 cat("==============================================================================\n")
-cat("TRANSSHIPMENT DETECTION ANALYSIS (OPTIMIZED V3)\n")
+cat("TRANSSHIPMENT DETECTION ANALYSIS (CORRECTED V2)\n")
 cat("==============================================================================\n\n")
 
 cat("Configuration:\n")
@@ -68,14 +69,15 @@ if (length(missing_cols) > 0) {
 
 # Calculate value_imp_pref (importer-preferred values)
 trade_data[, value_avg := rowSums(cbind(value_importer, value_exporter), na.rm = TRUE) / 2]
-trade_data[, value_imp_pref := fifelse(value_importer == 0 | is.na(value_importer), 
-                                        value_exporter, 
-                                        value_importer)]
-trade_data[, value_exp_pref := fifelse(value_exporter == 0 | is.na(value_exporter), 
-                                        value_importer, 
-                                        value_exporter)]
+trade_data[, value_imp_pref := ifelse(value_importer == 0 | is.na(value_importer), 
+                                       value_exporter, 
+                                       value_importer)]
+trade_data[, value_exp_pref := ifelse(value_exporter == 0 | is.na(value_exporter), 
+                                       value_importer, 
+                                       value_exporter)]
 
-# Filter and prepare
+# Convert to data.table and filter
+trade_data <- as.data.table(trade_data)
 trade_data <- trade_data[imp_iso != exp_iso]  # Exclude re-imports/exports
 
 cat(sprintf("Loaded %s trade records\n", format(nrow(trade_data), big.mark=",")))
@@ -93,9 +95,11 @@ all_commodities <- unique(data_filtered$commodity)
 
 # Define third countries based on configuration
 if (ALLOW_ORIGIN_COUNTRIES_AS_TC) {
+  # Allow origin countries to serve as third countries for each other
   third_countries <- unique(data_filtered$imp_iso[!(data_filtered$imp_iso %in% c(DESTINATION_COUNTRY))])
   tc_description <- "all countries except destination"
 } else {
+  # Exclude all origin countries from third country list
   third_countries <- unique(data_filtered$imp_iso[!(data_filtered$imp_iso %in% c(DESTINATION_COUNTRY, ORIGIN_COUNTRIES))])
   tc_description <- "all countries except destination and origins"
 }
@@ -119,8 +123,7 @@ cat(sprintf("Processing %s commodities in %d chunks of up to %d\n\n",
             CHUNK_SIZE))
 
 # Initialize results storage
-all_results <- vector("list", length(ORIGIN_COUNTRIES) * n_chunks)
-result_idx <- 0L
+all_results <- list()
 
 # ------------------------------------------------------------------------------
 # MAIN PROCESSING LOOP - BY ORIGIN COUNTRY
@@ -138,7 +141,7 @@ for (origin_country in ORIGIN_COUNTRIES) {
   for (chunk_num in 1:n_chunks) {
     
     # Get commodities for this chunk
-    start_idx <- (chunk_num - 1L) * CHUNK_SIZE + 1L
+    start_idx <- (chunk_num - 1) * CHUNK_SIZE + 1
     end_idx <- min(chunk_num * CHUNK_SIZE, length(all_commodities))
     chunk_commodities <- all_commodities[start_idx:end_idx]
     
@@ -149,9 +152,8 @@ for (origin_country in ORIGIN_COUNTRIES) {
     chunk_data <- data_filtered[commodity %in% chunk_commodities]
     
     # Initialize results storage for this chunk
-    chunk_results <- vector("list", length(chunk_commodities))
-    chunk_result_idx <- 0L
-    chunk_routes_count <- 0L
+    chunk_results <- list()
+    chunk_routes_count <- 0
     
     # ------------------------------------------------------------------------------
     # COMMODITY LOOP
@@ -162,18 +164,11 @@ for (origin_country in ORIGIN_COUNTRIES) {
       # Get commodity-specific data
       comm_data <- chunk_data[commodity == comm]
       
-      # Skip if no data
-      if (nrow(comm_data) == 0) next
-      
-      # Split by year for efficiency
-      comm_data_start <- comm_data[year == START_YEAR]
-      comm_data_end <- comm_data[year == END_YEAR]
-      
       # Pre-calculate shares for this commodity
-      shares_yr_start <- comm_data_start[, .(imp_iso, exp_iso, share)]
-      shares_yr_end <- comm_data_end[, .(imp_iso, exp_iso, share)]
+      shares_yr_start <- comm_data[year == START_YEAR, .(imp_iso, exp_iso, share)]
+      shares_yr_end <- comm_data[year == END_YEAR, .(imp_iso, exp_iso, share)]
       
-      # Initialize tc_results
+      # Process each third country for this commodity
       tc_results <- data.table(
         commodity = comm,
         third_country = third_countries
@@ -183,15 +178,12 @@ for (origin_country in ORIGIN_COUNTRIES) {
       # CRITERION 2: Calculate share changes vectorially
       # ------------------------------------------------------------------------------
       
-      # Origin's share of destination imports (scalar)
+      # Origin's share of destination imports
       origin_dest_yr_start <- shares_yr_start[imp_iso == DESTINATION_COUNTRY & exp_iso == origin_country, share]
-      origin_dest_yr_start <- if (length(origin_dest_yr_start) == 0) 0 else origin_dest_yr_start
+      origin_dest_yr_start <- ifelse(length(origin_dest_yr_start) == 0, 0, origin_dest_yr_start)
       
       origin_dest_yr_end <- shares_yr_end[imp_iso == DESTINATION_COUNTRY & exp_iso == origin_country, share]
-      origin_dest_yr_end <- if (length(origin_dest_yr_end) == 0) 0 else origin_dest_yr_end
-      
-      # Quick check: if origin's share didn't decline, no routes can pass criterion 2
-      if (origin_dest_yr_end >= origin_dest_yr_start) next
+      origin_dest_yr_end <- ifelse(length(origin_dest_yr_end) == 0, 0, origin_dest_yr_end)
       
       tc_results[, `:=`(
         origin_dest_yr_start = origin_dest_yr_start,
@@ -220,15 +212,14 @@ for (origin_country in ORIGIN_COUNTRIES) {
                           origin_tc_shares_yr_end[, .(third_country = imp_iso, origin_tc_yr_end = share)],
                           by = "third_country", all.x = TRUE)
       
-      # Replace NAs with 0 using setnafill for numeric columns
+      # Replace NAs with 0
       cols_to_fill <- c("tc_dest_yr_start", "tc_dest_yr_end", "origin_tc_yr_start", "origin_tc_yr_end")
-      for (col in cols_to_fill) {
-        set(tc_results, which(is.na(tc_results[[col]])), col, 0)
-      }
+      tc_results[, (cols_to_fill) := lapply(.SD, function(x) ifelse(is.na(x), 0, x)), 
+                 .SDcols = cols_to_fill]
       
-      # Check criterion 2: origin share declined (already checked above), 
-      # origin's share of TC increased, TC's share of destination increased
-      tc_results[, criterion2 := (origin_tc_yr_end > origin_tc_yr_start) &
+      # Check criterion 2
+      tc_results[, criterion2 := (origin_dest_yr_end < origin_dest_yr_start) &
+                                  (origin_tc_yr_end > origin_tc_yr_start) &
                                   (tc_dest_yr_end > tc_dest_yr_start)]
       
       # Filter to only those passing criterion 2
@@ -237,93 +228,73 @@ for (origin_country in ORIGIN_COUNTRIES) {
       if (nrow(tc_results) == 0) next
       
       # ------------------------------------------------------------------------------
-      # CRITERION 3: ROW analysis (optimized but logic-preserving)
+      # CRITERION 3: ROW analysis (matching original's row-by-row loop)
       # ------------------------------------------------------------------------------
       
-      # Define ROW once per commodity (excludes only destination)
-      row_countries <- unique(comm_data$imp_iso[!comm_data$imp_iso %in% c(DESTINATION_COUNTRY)])
+      # Initialize criterion3 column
+      tc_results[, criterion3 := NA]
       
-      # Pre-compute origin's ROW values (constant across all TCs)
-      origin_row_yr_start <- comm_data_start[exp_iso == origin_country & 
-                                              imp_iso != origin_country & 
-                                              imp_iso %in% row_countries, 
-                                             sum(value_imp_pref, na.rm = TRUE)]
-      origin_row_yr_end <- comm_data_end[exp_iso == origin_country & 
-                                          imp_iso != origin_country & 
-                                          imp_iso %in% row_countries, 
+      for (i in 1:nrow(tc_results)) {
+        tc <- tc_results$third_country[i]
+        
+        # Define ROW - matching original line 231: excludes only USA
+        row_countries <- unique(comm_data$imp_iso[!comm_data$imp_iso %in% c(DESTINATION_COUNTRY)])
+        
+        # Origin to ROW
+        origin_row_yr_start <- comm_data[year == START_YEAR & exp_iso == origin_country & 
+                                          imp_iso != origin_country & imp_iso %in% row_countries, 
                                          sum(value_imp_pref, na.rm = TRUE)]
-      
-      # Pre-compute total ROW imports (constant across all TCs)
-      total_row_yr_start <- comm_data_start[imp_iso %in% row_countries, 
-                                            sum(value_imp_pref, na.rm = TRUE)]
-      total_row_yr_end <- comm_data_end[imp_iso %in% row_countries, 
+        origin_row_yr_end <- comm_data[year == END_YEAR & exp_iso == origin_country & 
+                                        imp_iso != origin_country & imp_iso %in% row_countries, 
+                                       sum(value_imp_pref, na.rm = TRUE)]
+        
+        # Total ROW imports
+        total_row_yr_start <- comm_data[year == START_YEAR & imp_iso %in% row_countries, 
                                         sum(value_imp_pref, na.rm = TRUE)]
-      
-      # Origin's share of ROW (constant across all TCs)
-      origin_share_yr_start <- if (total_row_yr_start == 0) 0 else origin_row_yr_start / total_row_yr_start
-      origin_share_yr_end <- if (total_row_yr_end == 0) 0 else origin_row_yr_end / total_row_yr_end
-      
-      # Pre-compute TC-specific ROW exports for all TCs at once (excluding self-exports)
-      tc_row_start_all <- comm_data_start[exp_iso %in% tc_results$third_country & 
-                                           imp_iso %in% row_countries & 
-                                           imp_iso != exp_iso,
-                                          .(tc_row_val_yr_start = sum(value_imp_pref, na.rm = TRUE)),
-                                          by = .(third_country = exp_iso)]
-      
-      tc_row_end_all <- comm_data_end[exp_iso %in% tc_results$third_country & 
-                                       imp_iso %in% row_countries & 
-                                       imp_iso != exp_iso,
-                                      .(tc_row_val_yr_end = sum(value_imp_pref, na.rm = TRUE)),
-                                      by = .(third_country = exp_iso)]
-      
-      # Merge TC ROW values
-      tc_results <- merge(tc_results, tc_row_start_all, by = "third_country", all.x = TRUE)
-      tc_results <- merge(tc_results, tc_row_end_all, by = "third_country", all.x = TRUE)
-      
-      # Fill NAs with 0
-      set(tc_results, which(is.na(tc_results$tc_row_val_yr_start)), "tc_row_val_yr_start", 0)
-      set(tc_results, which(is.na(tc_results$tc_row_val_yr_end)), "tc_row_val_yr_end", 0)
-      
-      # Calculate TC shares of ROW
-      tc_results[, tc_share_yr_start := if (total_row_yr_start == 0) 0 else tc_row_val_yr_start / total_row_yr_start]
-      tc_results[, tc_share_yr_end := if (total_row_yr_end == 0) 0 else tc_row_val_yr_end / total_row_yr_end]
-      
-      # Apply Criterion 3 logic vectorized but preserving exact original branching
-      # Original: if (origin_share < MIN | tc_share < MIN) { ... } else { normal growth }
-      # Note: origin_share_yr_start/end are scalars, tc_share_yr_start/end are vectors
-      
-      tc_results[, criterion3 := {
-        # Origin values are scalar (same for all TCs in this commodity)
-        origin_below_min <- origin_share_yr_start < MIN_SHARE_FOR_GROWTH
-        origin_growth <- origin_share_yr_end - origin_share_yr_start
+        total_row_yr_end <- comm_data[year == END_YEAR & imp_iso %in% row_countries, 
+                                      sum(value_imp_pref, na.rm = TRUE)]
         
-        # TC values are vectors (one per TC)
-        tc_below_min <- tc_share_yr_start < MIN_SHARE_FOR_GROWTH
-        tc_growth <- tc_share_yr_end - tc_share_yr_start
+        # TC to ROW (excluding TC itself as destination) - matching original lines 242-243
+        tc_row_yr_start <- comm_data[year == START_YEAR & exp_iso == tc & 
+                                      imp_iso != tc & imp_iso %in% row_countries, 
+                                     sum(value_imp_pref, na.rm = TRUE)]
+        tc_row_yr_end <- comm_data[year == END_YEAR & exp_iso == tc & 
+                                    imp_iso != tc & imp_iso %in% row_countries, 
+                                   sum(value_imp_pref, na.rm = TRUE)]
         
-        # Apply logic matching original's if/else structure:
-        # if (either below min) {
-        #   if (both below min) -> compare end shares
-        #   else if (origin below min) -> FALSE
-        #   else (tc below min) -> compare absolute changes
-        # } else {
-        #   normal growth comparison
-        # }
+        # Calculate shares
+        origin_share_yr_start <- ifelse(total_row_yr_start == 0, 0, origin_row_yr_start / total_row_yr_start)
+        origin_share_yr_end <- ifelse(total_row_yr_end == 0, 0, origin_row_yr_end / total_row_yr_end)
+        tc_share_yr_start <- ifelse(total_row_yr_start == 0, 0, tc_row_yr_start / total_row_yr_start)
+        tc_share_yr_end <- ifelse(total_row_yr_end == 0, 0, tc_row_yr_end / total_row_yr_end)
         
-        if (origin_below_min) {
-          # Origin is below min for all rows
-          # If TC also below min -> compare end shares; else -> FALSE
-          fifelse(tc_below_min,
-                  origin_share_yr_end > tc_share_yr_end,
-                  FALSE)
+        # Handling of growth rates based on baseline shares - matching original lines 252-278
+        if (origin_share_yr_start < MIN_SHARE_FOR_GROWTH | tc_share_yr_start < MIN_SHARE_FOR_GROWTH) {
+          # Can't calculate meaningful growth rates - use alternative logic
+          
+          if (origin_share_yr_start < MIN_SHARE_FOR_GROWTH & tc_share_yr_start < MIN_SHARE_FOR_GROWTH) {
+            # Both are new/tiny in base year
+            # Check if origin's entry is larger than TC's entry (suspicious if TC suddenly bigger)
+            tc_results[i, criterion3 := origin_share_yr_end > tc_share_yr_end]
+          } else if (origin_share_yr_start < MIN_SHARE_FOR_GROWTH) {
+            # Origin is new entrant, TC is established
+            # Less likely to be transshipment (origin entering new market)
+            tc_results[i, criterion3 := FALSE]
+          } else {
+            # TC is new entrant, origin is established
+            # This could be transshipment (TC suddenly entering where origin was)
+            # Compare absolute changes instead of growth rates
+            origin_change <- origin_share_yr_end - origin_share_yr_start
+            tc_change <- tc_share_yr_end - tc_share_yr_start
+            tc_results[i, criterion3 := origin_change > tc_change]
+          }
         } else {
-          # Origin has sufficient baseline
-          # If TC below min -> compare absolute changes; else -> normal growth
-          fifelse(tc_below_min,
-                  origin_growth > tc_growth,
-                  origin_growth > tc_growth)
+          # Both have sufficient baseline - use normal growth rates
+          origin_growth <- origin_share_yr_end - origin_share_yr_start
+          tc_growth <- tc_share_yr_end - tc_share_yr_start
+          tc_results[i, criterion3 := origin_growth > tc_growth]
         }
-      }]
+      }
       
       # Filter to only those passing criterion 3
       tc_results <- tc_results[criterion3 == TRUE]
@@ -331,114 +302,117 @@ for (origin_country in ORIGIN_COUNTRIES) {
       if (nrow(tc_results) == 0) next
       
       # ------------------------------------------------------------------------------
-      # CRITERION 4: Volume check (optimized)
+      # CRITERION 4: Volume check (matching original's dplyr left_join approach)
       # ------------------------------------------------------------------------------
       
       # Get trade values for both years
-      values_yr_start <- comm_data_start[, .(imp_iso, exp_iso, share, value_imp_pref)]
-      values_yr_end <- comm_data_end[, .(imp_iso, exp_iso, share, value_imp_pref)]
-      
-      # Get list of TCs still in consideration
-      tc_list <- tc_results$third_country
+      values_yr_start <- comm_data[year == START_YEAR, .(imp_iso, exp_iso, share, value_imp_pref)]
+      values_yr_end <- comm_data[year == END_YEAR, .(imp_iso, exp_iso, share, value_imp_pref)]
       
       # Origin to third countries
-      origin_to_tc_yr_start <- values_yr_start[exp_iso == origin_country & imp_iso %in% tc_list,
+      origin_to_tc_yr_start <- values_yr_start[exp_iso == origin_country & imp_iso %in% tc_results$third_country,
                                                 .(third_country = imp_iso, 
                                                   origin_to_tc_share_yr_start = share, 
                                                   origin_to_tc_val_yr_start = value_imp_pref)]
       
-      origin_to_tc_yr_end <- values_yr_end[exp_iso == origin_country & imp_iso %in% tc_list,
+      origin_to_tc_yr_end <- values_yr_end[exp_iso == origin_country & imp_iso %in% tc_results$third_country,
                                             .(third_country = imp_iso, 
                                               origin_to_tc_share_yr_end = share, 
                                               origin_to_tc_val_yr_end = value_imp_pref)]
       
+      # Merge start and end for origin_to_tc
       origin_to_tc <- merge(origin_to_tc_yr_start, origin_to_tc_yr_end, 
                             by = "third_country", all = TRUE)
       
       # World to third countries
-      world_to_tc_yr_start <- values_yr_start[imp_iso %in% tc_list,
+      world_to_tc_yr_start <- values_yr_start[imp_iso %in% tc_results$third_country,
                                                .(world_to_tc_val_yr_start = sum(value_imp_pref, na.rm = TRUE)),
                                                by = .(third_country = imp_iso)]
       
-      world_to_tc_yr_end <- values_yr_end[imp_iso %in% tc_list,
+      world_to_tc_yr_end <- values_yr_end[imp_iso %in% tc_results$third_country,
                                            .(world_to_tc_val_yr_end = sum(value_imp_pref, na.rm = TRUE)),
                                            by = .(third_country = imp_iso)]
       
+      # Merge start and end for world_to_tc
       world_to_tc <- merge(world_to_tc_yr_start, world_to_tc_yr_end, 
                            by = "third_country", all = TRUE)
       
       # Third countries to destination
-      tc_to_dest_yr_start <- values_yr_start[imp_iso == DESTINATION_COUNTRY & exp_iso %in% tc_list,
+      tc_to_dest_yr_start <- values_yr_start[imp_iso == DESTINATION_COUNTRY & exp_iso %in% tc_results$third_country,
                                               .(third_country = exp_iso, 
                                                 tc_to_dest_share_yr_start = share, 
                                                 tc_to_dest_val_yr_start = value_imp_pref)]
       
-      tc_to_dest_yr_end <- values_yr_end[imp_iso == DESTINATION_COUNTRY & exp_iso %in% tc_list,
+      tc_to_dest_yr_end <- values_yr_end[imp_iso == DESTINATION_COUNTRY & exp_iso %in% tc_results$third_country,
                                           .(third_country = exp_iso, 
                                             tc_to_dest_share_yr_end = share, 
                                             tc_to_dest_val_yr_end = value_imp_pref)]
       
+      # Merge start and end for tc_to_dest
       tc_to_dest <- merge(tc_to_dest_yr_start, tc_to_dest_yr_end, 
                           by = "third_country", all = TRUE)
       
-      # World to destination (scalar totals)
+      # World to destination (scalar totals for the commodity)
       world_to_dest_val_yr_start <- values_yr_start[imp_iso == DESTINATION_COUNTRY,
                                                      sum(value_imp_pref, na.rm = TRUE)]
       world_to_dest_val_yr_end <- values_yr_end[imp_iso == DESTINATION_COUNTRY,
                                                  sum(value_imp_pref, na.rm = TRUE)]
       
-      # Join all trade flow data
-      tc_results <- merge(tc_results, origin_to_tc, by = "third_country", all.x = TRUE)
-      tc_results <- merge(tc_results, tc_to_dest, by = "third_country", all.x = TRUE)
-      tc_results <- merge(tc_results, world_to_tc, by = "third_country", all.x = TRUE)
+      # Use dplyr left_join to match original script (Image 6, lines 343-347)
+      tc_results <- tc_results %>%
+        left_join(origin_to_tc, by = "third_country") %>%
+        left_join(tc_to_dest, by = "third_country") %>%
+        left_join(world_to_tc, by = "third_country") %>%
+        mutate(
+          world_to_dest_val_yr_start = world_to_dest_val_yr_start,
+          world_to_dest_val_yr_end = world_to_dest_val_yr_end
+        )
       
-      # Add world_to_dest scalars
-      tc_results[, `:=`(
-        world_to_dest_val_yr_start = world_to_dest_val_yr_start,
-        world_to_dest_val_yr_end = world_to_dest_val_yr_end
-      )]
+      # Convert back to data.table
+      tc_results <- as.data.table(tc_results)
       
-      # Calculate excess flows (matching original formula)
+      # Calculate excess flows - matching original lines 349-350
       tc_results[, origin_to_tc := origin_to_tc_val_yr_end - 
                    ((origin_to_tc_val_yr_start / world_to_tc_val_yr_start) * world_to_tc_val_yr_end)]
       tc_results[, tc_to_dest := tc_to_dest_val_yr_end - 
                    ((tc_to_dest_val_yr_start / world_to_dest_val_yr_start) * world_to_dest_val_yr_end)]
       
       # Replace NAs with 0
-      set(tc_results, which(is.na(tc_results$origin_to_tc)), "origin_to_tc", 0)
-      set(tc_results, which(is.na(tc_results$tc_to_dest)), "tc_to_dest", 0)
+      tc_results[is.na(origin_to_tc), origin_to_tc := 0]
+      tc_results[is.na(tc_to_dest), tc_to_dest := 0]
       
-      # Check criterion 4
+      # Check criterion 4 - matching original line 358
       tc_results[, criterion4 := origin_to_tc_val_yr_end >= VOLUME_RATIO_THRESHOLD * tc_to_dest_val_yr_end]
       
       # Filter to qualifying routes
       tc_results <- tc_results[criterion4 == TRUE]
       
       if (nrow(tc_results) > 0) {
-        # Calculate transshipment value
+        # Calculate transshipment value - matching original line 365
         tc_results[, transshipment_value := pmin(pmax(origin_to_tc, 0), pmax(tc_to_dest, 0))]
         
         # Get description if available
         if ("description" %in% names(comm_data)) {
-          commodity_desc <- comm_data[1, description]
-          tc_results[, description := commodity_desc]
+          commodity_desc <- unique(comm_data[commodity == comm, description])
+          if (length(commodity_desc) > 0) {
+            tc_results[, description := commodity_desc[1]]
+          } else {
+            tc_results[, description := NA_character_]
+          }
         } else {
           tc_results[, description := NA_character_]
         }
         
-        # Track number of routes
+        # Track number of routes in this chunk
         chunk_routes_count <- chunk_routes_count + nrow(tc_results)
         
         # Add to chunk results
-        chunk_result_idx <- chunk_result_idx + 1L
-        chunk_results[[chunk_result_idx]] <- tc_results[, .(
+        chunk_results[[length(chunk_results) + 1]] <- tc_results[, .(
           origin_country = origin_country,
           commodity, description, third_country,
-          origin_to_tc_val_yr_end, origin_to_tc_val_yr_start, 
-          world_to_tc_val_yr_start, world_to_tc_val_yr_end,
+          origin_to_tc_val_yr_end, origin_to_tc_val_yr_start, world_to_tc_val_yr_start, world_to_tc_val_yr_end,
           origin_to_tc,
-          tc_to_dest_val_yr_end, tc_to_dest_val_yr_start, 
-          world_to_dest_val_yr_start, world_to_dest_val_yr_end,
+          tc_to_dest_val_yr_end, tc_to_dest_val_yr_start, world_to_dest_val_yr_start, world_to_dest_val_yr_end,
           tc_to_dest,
           transshipment_value
         )]
@@ -453,12 +427,12 @@ for (origin_country in ORIGIN_COUNTRIES) {
     }
     
     # Combine chunk results
-    if (chunk_result_idx > 0) {
-      result_idx <- result_idx + 1L
-      all_results[[result_idx]] <- rbindlist(chunk_results[1:chunk_result_idx])
+    if (length(chunk_results) > 0) {
+      chunk_results_dt <- rbindlist(chunk_results)
+      all_results[[length(all_results) + 1]] <- chunk_results_dt
     }
     
-    # Clean up
+    # Clean up chunk objects
     rm(chunk_data, chunk_results)
   }
   
@@ -477,15 +451,15 @@ cat("\n=========================================================================
 cat("FINALIZING RESULTS\n")
 cat("==============================================================================\n\n")
 
-if (result_idx > 0) {
-  final_results <- rbindlist(all_results[1:result_idx])
+if (length(all_results) > 0) {
+  final_results <- rbindlist(all_results)
   
   # Calculate summary statistics by origin
   summary_by_origin <- final_results[, .(
     total_transshipment = sum(transshipment_value, na.rm = TRUE),
     n_routes = .N,
-    n_third_countries = uniqueN(third_country),
-    n_commodities = uniqueN(commodity)
+    n_third_countries = length(unique(third_country)),
+    n_commodities = length(unique(commodity))
   ), by = origin_country]
   
   cat("=== RESULTS BY ORIGIN COUNTRY ===\n")
@@ -503,12 +477,13 @@ if (result_idx > 0) {
   summary_by_tc <- final_results[, .(
     total_transshipment = sum(transshipment_value, na.rm = TRUE),
     n_routes = .N,
-    n_origins = uniqueN(origin_country),
-    n_commodities = uniqueN(commodity)
-  ), by = third_country][order(-total_transshipment)]
+    n_origins = length(unique(origin_country)),
+    n_commodities = length(unique(commodity))
+  ), by = third_country]
+  summary_by_tc <- summary_by_tc[order(-total_transshipment)]
   
   cat("=== TOP 20 THIRD COUNTRIES BY TRANSSHIPMENT VALUE ===\n")
-  top_n <- min(20L, nrow(summary_by_tc))
+  top_n <- min(20, nrow(summary_by_tc))
   for (i in 1:top_n) {
     cat(sprintf("  %2d. %s: $%s (%s routes, %s commodities)\n",
                 i,
@@ -523,13 +498,14 @@ if (result_idx > 0) {
   summary_by_commodity <- final_results[, .(
     total_transshipment = sum(transshipment_value, na.rm = TRUE),
     n_routes = .N,
-    n_third_countries = uniqueN(third_country),
-    n_origins = uniqueN(origin_country),
+    n_third_countries = length(unique(third_country)),
+    n_origins = length(unique(origin_country)),
     description = first(description)
-  ), by = commodity][order(-total_transshipment)]
+  ), by = commodity]
+  summary_by_commodity <- summary_by_commodity[order(-total_transshipment)]
   
   cat("=== TOP 20 COMMODITIES BY TRANSSHIPMENT VALUE ===\n")
-  top_n <- min(20L, nrow(summary_by_commodity))
+  top_n <- min(20, nrow(summary_by_commodity))
   for (i in 1:top_n) {
     desc_text <- if (!is.na(summary_by_commodity$description[i])) {
       paste0(" (", substr(summary_by_commodity$description[i], 1, 50), ")")
@@ -551,10 +527,11 @@ if (result_idx > 0) {
     description = first(description),
     origin_to_tc_excess = first(origin_to_tc),
     tc_to_dest_excess = first(tc_to_dest)
-  ), by = .(origin_country, commodity, third_country)][order(-total_transshipment)]
+  ), by = .(origin_country, commodity, third_country)]
+  summary_by_route <- summary_by_route[order(-total_transshipment)]
   
   cat("=== TOP 20 INDIVIDUAL ROUTES BY TRANSSHIPMENT VALUE ===\n")
-  top_n <- min(20L, nrow(summary_by_route))
+  top_n <- min(20, nrow(summary_by_route))
   for (i in 1:top_n) {
     desc_text <- if (!is.na(summary_by_route$description[i])) {
       paste0(" - ", substr(summary_by_route$description[i], 1, 40))
@@ -573,11 +550,11 @@ if (result_idx > 0) {
   }
   cat("\n")
   
-  # Overall statistics
+  # Calculate summary statistics
   total_transshipment <- sum(final_results$transshipment_value, na.rm = TRUE)
   n_routes <- nrow(final_results)
-  n_origins <- uniqueN(final_results$origin_country)
-  n_third_countries <- uniqueN(final_results$third_country)
+  n_origins <- length(unique(final_results$origin_country))
+  n_third_countries <- length(unique(final_results$third_country))
   
   cat("=== OVERALL STATISTICS ===\n")
   cat(sprintf("Total estimated transshipment value: $%s\n", 
