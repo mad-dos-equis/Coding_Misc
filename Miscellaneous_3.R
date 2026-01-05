@@ -33,6 +33,9 @@ MIN_SHARE_FOR_GROWTH <- 0     # Minimum share threshold for Criterion 3 growth c
 # Criterion thresholds
 VOLUME_RATIO_THRESHOLD <- 0.75  # Criterion 4: Origin→TC must be ≥ 75% of TC→Dest
 
+# Diagnostic options
+RUN_DIAGNOSTICS <- TRUE         # Set to TRUE to export zero-bottleneck routes for inspection
+
 # ------------------------------------------------------------------------------
 # PACKAGE LOADING
 # ------------------------------------------------------------------------------
@@ -420,6 +423,20 @@ for (origin_country in ORIGIN_COUNTRIES) {
         # Calculate transshipment value
         tc_results[, transshipment_value := pmin(pmax(origin_to_tc, 0), pmax(tc_to_dest, 0))]
         
+        # Add diagnostic columns
+        tc_results[, `:=`(
+          origin_to_tc_clamped = pmax(origin_to_tc, 0),
+          tc_to_dest_clamped = pmax(tc_to_dest, 0)
+        )]
+        tc_results[, `:=`(
+          bottleneck = fifelse(origin_to_tc_clamped <= tc_to_dest_clamped, 
+                               "origin_to_tc", "tc_to_dest"),
+          origin_to_tc_is_zero = origin_to_tc_clamped == 0,
+          tc_to_dest_is_zero = tc_to_dest_clamped == 0,
+          value_if_pmax = pmax(origin_to_tc_clamped, tc_to_dest_clamped),
+          value_lost = abs(origin_to_tc_clamped - tc_to_dest_clamped)
+        )]
+        
         # Get description if available
         if ("description" %in% names(comm_data)) {
           commodity_desc <- comm_data[1, description]
@@ -442,7 +459,11 @@ for (origin_country in ORIGIN_COUNTRIES) {
           tc_to_dest_val_yr_end, tc_to_dest_val_yr_start, 
           world_to_dest_val_yr_start, world_to_dest_val_yr_end,
           tc_to_dest,
-          transshipment_value
+          transshipment_value,
+          # Diagnostic columns
+          origin_to_tc_clamped, tc_to_dest_clamped,
+          bottleneck, origin_to_tc_is_zero, tc_to_dest_is_zero,
+          value_if_pmax, value_lost
         )]
       }
     }
@@ -641,6 +662,121 @@ if (result_idx > 0) {
   cat(sprintf("Summary by route saved to: %s\n", output_file_by_route))
   
   cat("\nAll summary files successfully saved!\n")
+  
+  # ------------------------------------------------------------------------------
+  # DIAGNOSTIC: Zero-bottleneck analysis
+  # ------------------------------------------------------------------------------
+  
+  if (RUN_DIAGNOSTICS) {
+    cat("\n==============================================================================\n")
+    cat("DIAGNOSTIC: EXCESS FLOW BOTTLENECK ANALYSIS\n")
+    cat("==============================================================================\n\n")
+    
+    # Aggregate statistics
+    n_both_positive <- final_results[origin_to_tc_clamped > 0 & tc_to_dest_clamped > 0, .N]
+    n_origin_zero_only <- final_results[origin_to_tc_is_zero & !tc_to_dest_is_zero, .N]
+    n_dest_zero_only <- final_results[!origin_to_tc_is_zero & tc_to_dest_is_zero, .N]
+    n_both_zero <- final_results[origin_to_tc_is_zero & tc_to_dest_is_zero, .N]
+    
+    total_value_pmin <- sum(final_results$transshipment_value, na.rm = TRUE)
+    total_value_pmax <- sum(final_results$value_if_pmax, na.rm = TRUE)
+    total_value_lost <- sum(final_results$value_lost, na.rm = TRUE)
+    
+    cat("=== ROUTE COUNTS BY EXCESS FLOW PATTERN ===\n")
+    cat(sprintf("  Both excess flows > 0:           %s routes (%s%%)\n", 
+                format(n_both_positive, big.mark=","),
+                round(100 * n_both_positive / n_routes, 1)))
+    cat(sprintf("  Only origin→TC excess = 0:       %s routes (%s%%)\n", 
+                format(n_origin_zero_only, big.mark=","),
+                round(100 * n_origin_zero_only / n_routes, 1)))
+    cat(sprintf("  Only TC→dest excess = 0:         %s routes (%s%%)\n", 
+                format(n_dest_zero_only, big.mark=","),
+                round(100 * n_dest_zero_only / n_routes, 1)))
+    cat(sprintf("  Both excess flows = 0:           %s routes (%s%%)\n", 
+                format(n_both_zero, big.mark=","),
+                round(100 * n_both_zero / n_routes, 1)))
+    cat("\n")
+    
+    cat("=== VALUE COMPARISON: pmin vs pmax ===\n")
+    cat(sprintf("  Total transshipment (pmin):      $%s\n", 
+                format(round(total_value_pmin), big.mark=",")))
+    cat(sprintf("  Total transshipment (pmax):      $%s\n", 
+                format(round(total_value_pmax), big.mark=",")))
+    cat(sprintf("  Difference ('left on table'):    $%s (%s%% of pmin)\n",
+                format(round(total_value_lost), big.mark=","),
+                round(100 * total_value_lost / total_value_pmin, 1)))
+    cat("\n")
+    
+    # Bottleneck distribution (excluding both-zero routes)
+    bottleneck_summary <- final_results[!(origin_to_tc_is_zero & tc_to_dest_is_zero), 
+                                        .(n_routes = .N,
+                                          total_value = sum(transshipment_value, na.rm = TRUE),
+                                          total_lost = sum(value_lost, na.rm = TRUE)),
+                                        by = bottleneck]
+    
+    cat("=== BOTTLENECK DISTRIBUTION (excluding both-zero routes) ===\n")
+    for (i in 1:nrow(bottleneck_summary)) {
+      cat(sprintf("  %s is bottleneck: %s routes, $%s value, $%s 'lost'\n",
+                  bottleneck_summary$bottleneck[i],
+                  format(bottleneck_summary$n_routes[i], big.mark=","),
+                  format(round(bottleneck_summary$total_value[i]), big.mark=","),
+                  format(round(bottleneck_summary$total_lost[i]), big.mark=",")))
+    }
+    cat("\n")
+    
+    # Export zero-bottleneck routes for inspection
+    zero_bottleneck_routes <- final_results[
+      (origin_to_tc_is_zero & !tc_to_dest_is_zero) |
+      (!origin_to_tc_is_zero & tc_to_dest_is_zero),
+      .(origin_country, commodity, description, third_country,
+        # Raw values
+        origin_to_tc_val_yr_start, origin_to_tc_val_yr_end,
+        tc_to_dest_val_yr_start, tc_to_dest_val_yr_end,
+        # World totals for context
+        world_to_tc_val_yr_start, world_to_tc_val_yr_end,
+        world_to_dest_val_yr_start, world_to_dest_val_yr_end,
+        # Excess flows
+        origin_to_tc, tc_to_dest,
+        # Diagnostic info
+        bottleneck, 
+        transshipment_value,
+        value_if_pmax,
+        value_lost)
+    ][order(-value_lost)]
+    
+    output_file_diagnostic <- file.path(OUTPUT_DIR, 
+                                        sprintf("diagnostic_zero_bottleneck_%s_to_%s_%d_%d.csv",
+                                                paste(ORIGIN_COUNTRIES, collapse="_"),
+                                                DESTINATION_COUNTRY,
+                                                START_YEAR,
+                                                END_YEAR))
+    fwrite(zero_bottleneck_routes, output_file_diagnostic)
+    cat(sprintf("Zero-bottleneck routes exported to: %s\n", output_file_diagnostic))
+    cat(sprintf("  (%s routes for inspection)\n", format(nrow(zero_bottleneck_routes), big.mark=",")))
+    
+    # Top 10 routes by value lost
+    cat("\n=== TOP 20 ROUTES BY VALUE 'LOST' (pmax - pmin) ===\n")
+    top_lost <- zero_bottleneck_routes[1:min(20, nrow(zero_bottleneck_routes))]
+    for (i in 1:nrow(top_lost)) {
+      cat(sprintf("  %2d. %s → %s → %s: %s [bottleneck: %s]\n",
+                  i,
+                  top_lost$origin_country[i],
+                  top_lost$third_country[i],
+                  DESTINATION_COUNTRY,
+                  top_lost$commodity[i],
+                  top_lost$bottleneck[i]))
+      cat(sprintf("      pmin=$%s, pmax=$%s, lost=$%s\n",
+                  format(round(top_lost$transshipment_value[i]), big.mark=","),
+                  format(round(top_lost$value_if_pmax[i]), big.mark=","),
+                  format(round(top_lost$value_lost[i]), big.mark=",")))
+      cat(sprintf("      Raw: origin→TC yr_end=$%s, TC→dest yr_end=$%s\n",
+                  format(round(top_lost$origin_to_tc_val_yr_end[i]), big.mark=","),
+                  format(round(top_lost$tc_to_dest_val_yr_end[i]), big.mark=",")))
+      cat(sprintf("      Excess: origin→TC=$%s, TC→dest=$%s\n",
+                  format(round(top_lost$origin_to_tc[i]), big.mark=","),
+                  format(round(top_lost$tc_to_dest[i]), big.mark=",")))
+    }
+  }
   
 } else {
   cat("No transshipment routes detected across any origin countries.\n")
