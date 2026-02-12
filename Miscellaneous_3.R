@@ -17,9 +17,6 @@
 #   C4  TC imports from origin ≥ 75% of destination imports from TC.
 #       (Raw end-year values, per Freund's specification.)
 #
-# Transshipment value (for downstream calculation):
-#   min(origin exports to TC, TC exports to destination) for qualifying routes.
-#
 # Output: route-level CSV with flags and all intermediate values.
 # ==============================================================================
 
@@ -410,18 +407,6 @@ for (oc_idx in seq_along(ORIGIN_COUNTRIES)) {
               format(nrow(routes), big.mark = ",")))
 
   # --------------------------------------------------------------------------
-  # TRANSSHIPMENT VALUE COMPONENTS (for downstream use)
-  # Freund: "transshipment is defined as the minimum of China's exports to
-  # the third country or third country exports to U.S."
-  # --------------------------------------------------------------------------
-
-  routes[, transshipment_value := fifelse(
-    all_criteria == 1L,
-    pmin(origin_to_tc_val_end, tc_to_dest_val_end),
-    NA_real_
-  )]
-
-  # --------------------------------------------------------------------------
   # ATTACH COMMODITY DESCRIPTION IF AVAILABLE
   # --------------------------------------------------------------------------
 
@@ -467,9 +452,7 @@ c3_cols <- c("origin_row_share_start", "origin_row_share_end", "origin_row_growt
 c4_cols <- c("origin_to_tc_val_start", "origin_to_tc_val_end",
              "tc_to_dest_val_start", "tc_to_dest_val_end")
 
-value_cols <- c("transshipment_value")
-
-col_order <- c(id_cols, flag_cols, c2_cols, c3_cols, c4_cols, value_cols)
+col_order <- c(id_cols, flag_cols, c2_cols, c3_cols, c4_cols)
 col_order <- intersect(col_order, names(flagged_routes))
 remaining <- setdiff(names(flagged_routes), col_order)
 setcolorder(flagged_routes, c(col_order, remaining))
@@ -527,8 +510,7 @@ join_cols <- c("origin_country",
                "origin_row_share_start", "origin_row_share_end", "origin_row_growth",
                "tc_row_share_start", "tc_row_share_end", "tc_row_growth",
                "origin_to_tc_val_start", "origin_to_tc_val_end",
-               "tc_to_dest_val_start", "tc_to_dest_val_end",
-               "transshipment_value")
+               "tc_to_dest_val_start", "tc_to_dest_val_end")
 join_cols <- intersect(join_cols, names(flagged_routes))
 
 route_flags <- flagged_routes[, .SD, .SDcols = c("commodity", "third_country", join_cols)]
