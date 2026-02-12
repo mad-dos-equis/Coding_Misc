@@ -1,248 +1,500 @@
-###############################################################################
-# pull_china_imports.R
+# ==============================================================================
+# TRANSSHIPMENT DETECTION - STEP 1: FLAG ROUTES BY CRITERION
+# ==============================================================================
+# Implements Freund (2025) "The China Wash" methodology.
+# Produces one row per (origin, commodity, third_country) route, flagged with
+# binary indicators for each criterion plus intermediate values.
 #
-# Pull monthly HTS-10 U.S. import data from China (CTY_CODE = 5700)
-# for January 2020 – November 2025 via the Census Bureau International
-# Trade API, using the {censusapi} package.
+# Freund's four criteria:
+#   C1  301 tariff on the product.
+#       → Assumed satisfied by construction (input data pre-filtered to
+#         tariff-affected products). No flag generated.
+#   C2  (a) Origin's share of destination imports declines,
+#       (b) origin's share of TC imports increases, AND
+#       (c) TC's share of destination imports rises.
+#   C3  Origin's share of ROW imports grows faster than TC's share of ROW
+#       imports in the product.
+#   C4  TC imports from origin ≥ 75% of destination imports from TC.
+#       (Raw end-year values, per Freund's specification.)
 #
-# Inputs:
-#   - A Census API key (stored in .Renviron or passed directly)
-#   - A vector of 312 exact HTS-10 codes
-#   - 1 HS4 code and 2 HS6 codes (pulled via wildcard to get all
-#     underlying HTS-10 lines)
+# Transshipment value (for downstream calculation):
+#   min(origin exports to TC, TC exports to destination) for qualifying routes.
 #
-# Strategy:
-#   - One API call per code, using time = "from 2020-01 to 2025-11"
-#     to retrieve all 71 months in a single request.
-#   - Wildcard pulls for HS4/HS6 prefixes return all HTS-10 children.
-#   - Results are deduplicated and combined into a single data frame.
-#   - Total calls: ~315. Estimated runtime: 5–10 minutes.
-#
-# Output:
-#   - china_imports_2020_2025.csv in the working directory
-###############################################################################
+# Output: route-level CSV with flags and all intermediate values.
+# ==============================================================================
 
-library(censusapi)
-library(purrr)
-library(dplyr)
-library(readr)
+# ------------------------------------------------------------------------------
+# CONFIGURATION SECTION
+# ------------------------------------------------------------------------------
 
-# ── 0. CONFIG ────────────────────────────────────────────────────────────────
+# File paths
+INPUT_FILE_PATH <- "path/to/your/trade_data.csv"  # Update this path
+OUTPUT_DIR <- "path/to/output/directory"          # Update this path
 
-# Census API key — reads from .Renviron (expects CENSUS_KEY=your_key_here)
-RENVIRON_PATH <- file.path(Sys.getenv("HOME"), ".Renviron")
-message(sprintf("Looking for API key in: %s", RENVIRON_PATH))
+# Analysis parameters
+ORIGIN_COUNTRIES <- c("CHN")  # ISO3 codes, e.g., c("CHN", "VNM", "MEX")
+DESTINATION_COUNTRY <- "USA"  # ISO3 code
+START_YEAR <- 2018            # Start year (pre-tariff baseline)
+END_YEAR <- 2023              # End year for analysis
 
-if (!file.exists(RENVIRON_PATH)) {
-  stop(
-    sprintf(".Renviron file not found at: %s\n", RENVIRON_PATH),
-    "Create it and add: CENSUS_KEY=your_key_here\n",
-    "Get a free key at: https://api.census.gov/data/key_signup.html"
-  )
+# Origin country handling
+# When multiple origins specified, allow them as third countries for each other?
+# TRUE:  e.g., VNM is a valid TC when analyzing CHN
+# FALSE: origin countries excluded from TC list (default)
+ALLOW_ORIGIN_COUNTRIES_AS_TC <- FALSE
+
+# Criterion thresholds
+MIN_SHARE_FOR_GROWTH <- 0       # Minimum baseline share for C3 growth calc
+VOLUME_RATIO_THRESHOLD <- 0.75  # C4: TC imports from origin ≥ 75% of dest imports from TC
+
+# ------------------------------------------------------------------------------
+# PACKAGE LOADING
+# ------------------------------------------------------------------------------
+
+library(data.table)
+
+cat("==============================================================================\n")
+cat("TRANSSHIPMENT DETECTION - STEP 1: FLAG ROUTES\n")
+cat("Methodology: Freund (2025) 'The China Wash'\n")
+cat("==============================================================================\n\n")
+
+cat("Configuration:\n")
+cat(sprintf("  Input file: %s\n", INPUT_FILE_PATH))
+cat(sprintf("  Origin countries: %s\n", paste(ORIGIN_COUNTRIES, collapse = ", ")))
+cat(sprintf("  Destination: %s\n", DESTINATION_COUNTRY))
+cat(sprintf("  Period: %d to %d\n", START_YEAR, END_YEAR))
+cat(sprintf("  Allow origins as third countries: %s\n", ALLOW_ORIGIN_COUNTRIES_AS_TC))
+cat(sprintf("  Min share for growth (C3): %s\n", MIN_SHARE_FOR_GROWTH))
+cat(sprintf("  Volume ratio threshold (C4): %s\n\n", VOLUME_RATIO_THRESHOLD))
+
+# ------------------------------------------------------------------------------
+# DATA LOADING AND PREPARATION
+# ------------------------------------------------------------------------------
+
+cat("Loading trade data...\n")
+trade_data <- fread(INPUT_FILE_PATH)
+
+# Validate required columns
+required_cols <- c("commodity", "year", "imp_iso", "exp_iso",
+                   "value_importer", "value_exporter")
+missing_cols <- setdiff(required_cols, names(trade_data))
+if (length(missing_cols) > 0) {
+  stop(sprintf("Missing required columns: %s", paste(missing_cols, collapse = ", ")))
 }
 
-CENSUS_KEY <- Sys.getenv("CENSUS_KEY")
-if (CENSUS_KEY == "") {
-  CENSUS_KEY <- Sys.getenv("CENSUS_API_KEY")
+# Calculate preferred values
+trade_data[, value_imp_pref := fifelse(
+  value_importer == 0 | is.na(value_importer),
+  value_exporter,
+  value_importer
+)]
+trade_data[, value_exp_pref := fifelse(
+  value_exporter == 0 | is.na(value_exporter),
+  value_importer,
+  value_exporter
+)]
+
+# Exclude self-trade
+trade_data <- trade_data[imp_iso != exp_iso]
+
+cat(sprintf("Loaded %s trade records\n", format(nrow(trade_data), big.mark = ",")))
+
+# Split by year
+data_start <- trade_data[year == START_YEAR]
+data_end   <- trade_data[year == END_YEAR]
+
+# Calculate import shares: exporter's share of importer's total imports per commodity
+calc_shares <- function(dt) {
+  dt[, total_value := sum(value_imp_pref, na.rm = TRUE), by = .(imp_iso, commodity)]
+  dt[, share := fifelse(total_value > 0, value_imp_pref / total_value, 0)]
+  dt
 }
-if (CENSUS_KEY == "") {
-  stop(
-    sprintf(".Renviron exists at %s but no CENSUS_KEY or CENSUS_API_KEY found.\n", RENVIRON_PATH),
-    "Add CENSUS_KEY=your_key to that file and restart R.\n",
-    "Get a free key at: https://api.census.gov/data/key_signup.html"
-  )
+
+data_start <- calc_shares(data_start)
+data_end   <- calc_shares(data_end)
+
+# Enumerate analysis dimensions
+all_commodities <- union(unique(data_start$commodity), unique(data_end$commodity))
+
+if (ALLOW_ORIGIN_COUNTRIES_AS_TC) {
+  all_third_countries <- unique(c(
+    data_start$imp_iso[data_start$imp_iso != DESTINATION_COUNTRY],
+    data_end$imp_iso[data_end$imp_iso != DESTINATION_COUNTRY]
+  ))
+} else {
+  all_third_countries <- unique(c(
+    data_start$imp_iso[!data_start$imp_iso %in% c(DESTINATION_COUNTRY, ORIGIN_COUNTRIES)],
+    data_end$imp_iso[!data_end$imp_iso %in% c(DESTINATION_COUNTRY, ORIGIN_COUNTRIES)]
+  ))
 }
-message(sprintf("Census API key loaded: %s...%s",
-                substr(CENSUS_KEY, 1, 4),
-                substr(CENSUS_KEY, nchar(CENSUS_KEY) - 3, nchar(CENSUS_KEY))))
 
-# Time range
-TIME_RANGE <- "from 2020-01 to 2025-11"
+cat(sprintf("Analysis scope:\n"))
+cat(sprintf("  Commodities:      %s\n", format(length(all_commodities), big.mark = ",")))
+cat(sprintf("  Origin countries: %s\n", length(ORIGIN_COUNTRIES)))
+cat(sprintf("  Third countries:  %s\n\n", format(length(all_third_countries), big.mark = ",")))
 
-# Country: China
-CTY <- "5700"
+# ==============================================================================
+# MAIN LOOP: Build route-level flags by origin country
+# ==============================================================================
 
-# Variables to retrieve from the imports/hs endpoint
-IMPORT_VARS <- c(
-  "I_COMMODITY",          # HTS-10 code
+all_route_results <- vector("list", length(ORIGIN_COUNTRIES))
 
-"I_COMMODITY_LDESC",    # Long description
-  "GEN_VAL_MO",           # General imports value (monthly)
-  "GEN_VAL_YR",           # General imports value (year-to-date)
-  "CON_VAL_MO",           # Imports for consumption value (monthly)
-  "CON_VAL_YR",           # Imports for consumption value (YTD)
-  "DUT_VAL_MO",           # Dutiable value (monthly)
-  "DUT_VAL_YR",           # Dutiable value (YTD)
-  "CAL_DUT_MO",           # Calculated duty (monthly)
-  "CAL_DUT_YR",           # Calculated duty (YTD)
-  "GEN_CHA_MO",           # General imports charges (monthly)
-  "GEN_CIF_MO",           # General imports CIF value (monthly)
-  "GEN_QY1_MO",           # General imports quantity 1 (monthly)
-  "GEN_QY1_MO_FLAG",      # True-zero flag for quantity 1
-  "UNIT_QY1",             # Unit of quantity 1
-  "CTY_NAME"              # Country name
-)
+for (oc_idx in seq_along(ORIGIN_COUNTRIES)) {
 
-# ── 1. DEFINE YOUR CODES ────────────────────────────────────────────────────
-# Replace these placeholders with your actual codes.
+  origin_country <- ORIGIN_COUNTRIES[oc_idx]
+  cat(sprintf("==============================================================================\n"))
+  cat(sprintf("PROCESSING ORIGIN: %s\n", origin_country))
+  cat(sprintf("==============================================================================\n\n"))
+  origin_timer <- Sys.time()
 
-# 312 exact HTS-10 codes (10-digit strings, no dots)
-hs10_codes <- c(
-  # "8517120060",
-  # "8471300100",
-  # ... add all 312 codes here ...
-  NULL
-) |> Filter(Negate(is.null), x = _)
-
-# 1 HS4 code (4-digit string) — will pull all HTS-10 underneath
-hs4_code <- c(
-  # "8517"
-  NULL
-) |> Filter(Negate(is.null), x = _)
-
-# 2 HS6 codes (6-digit strings) — will pull all HTS-10 underneath
-hs6_codes <- c(
-  # "854231",
-  # "847130"
-  NULL
-) |> Filter(Negate(is.null), x = _)
-
-
-# ── 2. PULL FUNCTIONS ───────────────────────────────────────────────────────
-
-#' Pull all months for a single exact HTS-10 code
-pull_exact <- function(code, call_num = NULL, total_calls = NULL) {
-  progress <- if (!is.null(call_num)) {
-    sprintf(" [%d/%d]", call_num, total_calls)
+  # Determine third countries for this origin
+  if (ALLOW_ORIGIN_COUNTRIES_AS_TC) {
+    tc_list <- all_third_countries
   } else {
-    ""
+    tc_list <- all_third_countries[all_third_countries != origin_country]
   }
-  message(sprintf("Pulling HTS-10: %s%s", code, progress))
 
-  tryCatch({
-    df <- getCensus(
-      name    = "timeseries/intltrade/imports/hs",
-      vars    = IMPORT_VARS,
-      time    = TIME_RANGE,
-      CTY_CODE    = CTY,
-      COMM_LVL    = "HS10",
-      SUMMARY_LVL = "DET",
-      I_COMMODITY  = code
-    )
-    df$pull_type <- "exact"
-    df
-  }, error = function(e) {
-    warning(sprintf("  FAILED %s: %s", code, conditionMessage(e)))
-    NULL
-  })
-}
+  # --------------------------------------------------------------------------
+  # Build route skeleton: one row per (commodity, third_country)
+  # --------------------------------------------------------------------------
 
-#' Pull all months for all HTS-10 codes under a wildcard prefix (HS4 or HS6)
-pull_wildcard <- function(prefix, call_num = NULL, total_calls = NULL) {
-  progress <- if (!is.null(call_num)) {
-    sprintf(" [%d/%d]", call_num, total_calls)
-  } else {
-    ""
-  }
-  n_digits <- nchar(prefix)
-  level <- if (n_digits == 4) "HS4" else if (n_digits == 6) "HS6" else "other"
-  message(sprintf("Pulling %s wildcard: %s*%s", level, prefix, progress))
+  routes <- CJ(commodity = all_commodities, third_country = tc_list)
+  routes[, origin_country := origin_country]
 
-  tryCatch({
-    df <- getCensus(
-      name    = "timeseries/intltrade/imports/hs",
-      vars    = IMPORT_VARS,
-      time    = TIME_RANGE,
-      CTY_CODE    = CTY,
-      COMM_LVL    = "HS10",
-      SUMMARY_LVL = "DET",
-      I_COMMODITY  = paste0(prefix, "*")
-    )
-    df$pull_type   <- "wildcard"
-    df$pull_prefix <- prefix
-    df
-  }, error = function(e) {
-    warning(sprintf("  FAILED %s*: %s", prefix, conditionMessage(e)))
-    NULL
-  })
-}
+  cat(sprintf("  Route skeleton: %s rows (%s commodities x %s TCs)\n",
+              format(nrow(routes), big.mark = ","),
+              format(length(all_commodities), big.mark = ","),
+              format(length(tc_list), big.mark = ",")))
 
+  # ==========================================================================
+  # CRITERION 2: Three-part share test
+  #   (a) Origin's share of destination imports declines
+  #   (b) Origin's share of TC imports increases
+  #   (c) TC's share of destination imports rises
+  # ==========================================================================
 
-# ── 3. EXECUTE PULLS ────────────────────────────────────────────────────────
+  cat("  Computing Criterion 2 (three-part share test)...\n")
 
-total_exact    <- length(hs10_codes)
-total_wildcard <- length(hs4_code) + length(hs6_codes)
-total_calls    <- total_exact + total_wildcard
+  # --- C2a: Origin's share of destination imports (one value per commodity) ---
+  origin_dest_start <- data_start[
+    imp_iso == DESTINATION_COUNTRY & exp_iso == origin_country,
+    .(commodity, origin_dest_share_start = share)
+  ]
+  origin_dest_end <- data_end[
+    imp_iso == DESTINATION_COUNTRY & exp_iso == origin_country,
+    .(commodity, origin_dest_share_end = share)
+  ]
 
-message(sprintf(
-  "\n=== Starting %d API calls (%d exact + %d wildcard) ===\n",
-  total_calls, total_exact, total_wildcard
-))
+  c2a <- merge(data.table(commodity = all_commodities),
+               origin_dest_start, by = "commodity", all.x = TRUE)
+  c2a <- merge(c2a, origin_dest_end, by = "commodity", all.x = TRUE)
+  setnafill(c2a, fill = 0, cols = c("origin_dest_share_start", "origin_dest_share_end"))
 
-start_time <- Sys.time()
+  routes <- merge(routes, c2a, by = "commodity", all.x = TRUE)
 
-# 3a. Exact HTS-10 pulls
-exact_results <- imap_dfr(hs10_codes, function(code, i) {
-  pull_exact(code, call_num = i, total_calls = total_calls)
-})
+  # --- C2b: Origin's share of TC imports ---
+  origin_tc_start <- data_start[
+    exp_iso == origin_country & imp_iso %in% tc_list,
+    .(commodity, third_country = imp_iso, origin_tc_share_start = share)
+  ]
+  origin_tc_end <- data_end[
+    exp_iso == origin_country & imp_iso %in% tc_list,
+    .(commodity, third_country = imp_iso, origin_tc_share_end = share)
+  ]
 
-# 3b. Wildcard pulls (HS4 + HS6 prefixes)
-wildcard_prefixes <- c(hs4_code, hs6_codes)
-wildcard_results <- imap_dfr(wildcard_prefixes, function(prefix, i) {
-  pull_wildcard(
-    prefix,
-    call_num  = total_exact + i,
-    total_calls = total_calls
+  routes <- merge(routes, origin_tc_start, by = c("commodity", "third_country"), all.x = TRUE)
+  routes <- merge(routes, origin_tc_end,   by = c("commodity", "third_country"), all.x = TRUE)
+
+  # --- C2c: TC's share of destination imports ---
+  tc_dest_start <- data_start[
+    imp_iso == DESTINATION_COUNTRY & exp_iso %in% tc_list,
+    .(commodity, third_country = exp_iso, tc_dest_share_start = share)
+  ]
+  tc_dest_end <- data_end[
+    imp_iso == DESTINATION_COUNTRY & exp_iso %in% tc_list,
+    .(commodity, third_country = exp_iso, tc_dest_share_end = share)
+  ]
+
+  routes <- merge(routes, tc_dest_start, by = c("commodity", "third_country"), all.x = TRUE)
+  routes <- merge(routes, tc_dest_end,   by = c("commodity", "third_country"), all.x = TRUE)
+
+  # Fill NAs
+  c2_share_cols <- c("origin_tc_share_start", "origin_tc_share_end",
+                     "tc_dest_share_start", "tc_dest_share_end")
+  setnafill(routes, fill = 0, cols = c2_share_cols)
+
+  # Apply three-part criterion
+  routes[, criterion2 := as.integer(
+    (origin_dest_share_end < origin_dest_share_start) &  # (a) origin share declined
+    (origin_tc_share_end > origin_tc_share_start) &      # (b) origin share of TC increased
+    (tc_dest_share_end > tc_dest_share_start)            # (c) TC share of dest increased
+  )]
+
+  cat(sprintf("    Routes passing C2: %s / %s\n",
+              format(sum(routes$criterion2), big.mark = ","),
+              format(nrow(routes), big.mark = ",")))
+
+  # ==========================================================================
+  # CRITERION 3: Origin's share of ROW imports grows faster than TC's share
+  # ==========================================================================
+
+  cat("  Computing Criterion 3 (ROW growth comparison)...\n")
+
+  # ROW = all importers except destination
+  row_countries <- union(
+    unique(data_start$imp_iso[data_start$imp_iso != DESTINATION_COUNTRY]),
+    unique(data_end$imp_iso[data_end$imp_iso != DESTINATION_COUNTRY])
   )
-})
 
-elapsed <- round(difftime(Sys.time(), start_time, units = "mins"), 1)
-message(sprintf("\n=== All pulls complete in %s minutes ===\n", elapsed))
+  # --- Total ROW imports per commodity ---
+  total_row_start <- data_start[
+    imp_iso %in% row_countries,
+    .(total_row_start = sum(value_imp_pref, na.rm = TRUE)),
+    by = commodity
+  ]
+  total_row_end <- data_end[
+    imp_iso %in% row_countries,
+    .(total_row_end = sum(value_imp_pref, na.rm = TRUE)),
+    by = commodity
+  ]
 
+  # --- Origin's exports to ROW per commodity (excluding self-imports) ---
+  origin_row_start <- data_start[
+    exp_iso == origin_country & imp_iso %in% row_countries & imp_iso != origin_country,
+    .(origin_row_val_start = sum(value_imp_pref, na.rm = TRUE)),
+    by = commodity
+  ]
+  origin_row_end <- data_end[
+    exp_iso == origin_country & imp_iso %in% row_countries & imp_iso != origin_country,
+    .(origin_row_val_end = sum(value_imp_pref, na.rm = TRUE)),
+    by = commodity
+  ]
 
-# ── 4. COMBINE & DEDUPLICATE ────────────────────────────────────────────────
+  # Build commodity-level C3 table
+  c3_commodity <- merge(data.table(commodity = all_commodities),
+                        total_row_start, by = "commodity", all.x = TRUE)
+  c3_commodity <- merge(c3_commodity, total_row_end,    by = "commodity", all.x = TRUE)
+  c3_commodity <- merge(c3_commodity, origin_row_start, by = "commodity", all.x = TRUE)
+  c3_commodity <- merge(c3_commodity, origin_row_end,   by = "commodity", all.x = TRUE)
+  setnafill(c3_commodity, fill = 0,
+            cols = c("total_row_start", "total_row_end",
+                     "origin_row_val_start", "origin_row_val_end"))
 
-china_imports <- bind_rows(exact_results, wildcard_results)
+  c3_commodity[, origin_row_share_start := fifelse(
+    total_row_start == 0, 0, origin_row_val_start / total_row_start
+  )]
+  c3_commodity[, origin_row_share_end := fifelse(
+    total_row_end == 0, 0, origin_row_val_end / total_row_end
+  )]
 
-# Deduplicate: if a wildcard pull returned an HTS-10 code that was also
-# in the exact list, keep the exact version.
-china_imports <- china_imports |>
-  arrange(pull_type) |>                           # "exact" sorts before "wildcard"
-  distinct(time, I_COMMODITY, .keep_all = TRUE)
+  routes <- merge(routes,
+                  c3_commodity[, .(commodity, total_row_start, total_row_end,
+                                  origin_row_share_start, origin_row_share_end)],
+                  by = "commodity", all.x = TRUE)
 
-# Clean up helper columns
-china_imports <- china_imports |>
-  select(-pull_type, -any_of("pull_prefix"))
+  # --- TC's exports to ROW per (commodity, TC), excluding self-trade ---
+  tc_row_start <- data_start[
+    exp_iso %in% tc_list & imp_iso %in% row_countries & imp_iso != exp_iso,
+    .(tc_row_val_start = sum(value_imp_pref, na.rm = TRUE)),
+    by = .(commodity, third_country = exp_iso)
+  ]
+  tc_row_end <- data_end[
+    exp_iso %in% tc_list & imp_iso %in% row_countries & imp_iso != exp_iso,
+    .(tc_row_val_end = sum(value_imp_pref, na.rm = TRUE)),
+    by = .(commodity, third_country = exp_iso)
+  ]
 
-# Parse the time column into YEAR and MONTH if not already present
-if (!"YEAR" %in% names(china_imports)) {
-  china_imports <- china_imports |>
-    mutate(
-      YEAR  = substr(time, 1, 4),
-      MONTH = substr(time, 6, 7)
+  routes <- merge(routes, tc_row_start, by = c("commodity", "third_country"), all.x = TRUE)
+  routes <- merge(routes, tc_row_end,   by = c("commodity", "third_country"), all.x = TRUE)
+  setnafill(routes, fill = 0, cols = c("tc_row_val_start", "tc_row_val_end"))
+
+  routes[, tc_row_share_start := fifelse(
+    total_row_start == 0, 0, tc_row_val_start / total_row_start
+  )]
+  routes[, tc_row_share_end := fifelse(
+    total_row_end == 0, 0, tc_row_val_end / total_row_end
+  )]
+
+  # Growth values
+  routes[, `:=`(
+    origin_row_growth = origin_row_share_end - origin_row_share_start,
+    tc_row_growth     = tc_row_share_end - tc_row_share_start
+  )]
+
+  # Apply Criterion 3 with small-share edge cases
+  routes[, criterion3 := {
+    origin_below <- origin_row_share_start < MIN_SHARE_FOR_GROWTH
+    tc_below     <- tc_row_share_start < MIN_SHARE_FOR_GROWTH
+
+    fifelse(
+      origin_below & tc_below,
+      # Both below minimum: compare end-year shares
+      as.integer(origin_row_share_end > tc_row_share_end),
+      fifelse(
+        origin_below & !tc_below,
+        # Only origin below minimum: cannot pass
+        0L,
+        # Origin has sufficient baseline: compare absolute growth
+        as.integer(origin_row_growth > tc_row_growth)
+      )
     )
+  }]
+
+  cat(sprintf("    Routes passing C3: %s / %s\n",
+              format(sum(routes$criterion3), big.mark = ","),
+              format(nrow(routes), big.mark = ",")))
+
+  # ==========================================================================
+  # CRITERION 4: Volume plausibility (raw end-year values per Freund)
+  # TC imports from origin ≥ 75% of destination imports from TC
+  # ==========================================================================
+
+  cat("  Computing Criterion 4 (volume plausibility)...\n")
+
+  # --- Origin -> TC trade values ---
+  origin_to_tc_start <- data_start[
+    exp_iso == origin_country & imp_iso %in% tc_list,
+    .(commodity, third_country = imp_iso,
+      origin_to_tc_val_start = value_imp_pref)
+  ]
+  origin_to_tc_end <- data_end[
+    exp_iso == origin_country & imp_iso %in% tc_list,
+    .(commodity, third_country = imp_iso,
+      origin_to_tc_val_end = value_imp_pref)
+  ]
+
+  routes <- merge(routes, origin_to_tc_start, by = c("commodity", "third_country"), all.x = TRUE)
+  routes <- merge(routes, origin_to_tc_end,   by = c("commodity", "third_country"), all.x = TRUE)
+
+  # --- TC -> Destination trade values ---
+  tc_to_dest_start <- data_start[
+    imp_iso == DESTINATION_COUNTRY & exp_iso %in% tc_list,
+    .(commodity, third_country = exp_iso,
+      tc_to_dest_val_start = value_imp_pref)
+  ]
+  tc_to_dest_end <- data_end[
+    imp_iso == DESTINATION_COUNTRY & exp_iso %in% tc_list,
+    .(commodity, third_country = exp_iso,
+      tc_to_dest_val_end = value_imp_pref)
+  ]
+
+  routes <- merge(routes, tc_to_dest_start, by = c("commodity", "third_country"), all.x = TRUE)
+  routes <- merge(routes, tc_to_dest_end,   by = c("commodity", "third_country"), all.x = TRUE)
+
+  # Fill NAs
+  c4_val_cols <- c("origin_to_tc_val_start", "origin_to_tc_val_end",
+                   "tc_to_dest_val_start", "tc_to_dest_val_end")
+  setnafill(routes, fill = 0, cols = c4_val_cols)
+
+  # Criterion 4: raw end-year comparison per Freund
+  routes[, criterion4 := as.integer(
+    origin_to_tc_val_end >= VOLUME_RATIO_THRESHOLD * tc_to_dest_val_end
+  )]
+
+  cat(sprintf("    Routes passing C4: %s / %s\n",
+              format(sum(routes$criterion4), big.mark = ","),
+              format(nrow(routes), big.mark = ",")))
+
+  # --------------------------------------------------------------------------
+  # COMPOSITE FLAG
+  # --------------------------------------------------------------------------
+
+  routes[, all_criteria := as.integer(
+    criterion2 == 1L & criterion3 == 1L & criterion4 == 1L
+  )]
+
+  n_pass <- sum(routes$all_criteria, na.rm = TRUE)
+  cat(sprintf("\n  Routes passing ALL criteria: %s / %s\n",
+              format(n_pass, big.mark = ","),
+              format(nrow(routes), big.mark = ",")))
+
+  # --------------------------------------------------------------------------
+  # TRANSSHIPMENT VALUE COMPONENTS (for downstream use)
+  # Freund: "transshipment is defined as the minimum of China's exports to
+  # the third country or third country exports to U.S."
+  # --------------------------------------------------------------------------
+
+  routes[, transshipment_value := fifelse(
+    all_criteria == 1L,
+    pmin(origin_to_tc_val_end, tc_to_dest_val_end),
+    NA_real_
+  )]
+
+  # --------------------------------------------------------------------------
+  # ATTACH COMMODITY DESCRIPTION IF AVAILABLE
+  # --------------------------------------------------------------------------
+
+  if ("description" %in% names(trade_data)) {
+    desc_lookup <- unique(trade_data[, .(commodity, description)])[
+      , .SD[1], by = commodity
+    ]
+    routes <- merge(routes, desc_lookup, by = "commodity", all.x = TRUE)
+  }
+
+  # Store
+  all_route_results[[oc_idx]] <- routes
+
+  elapsed <- as.numeric(difftime(Sys.time(), origin_timer, units = "secs"))
+  cat(sprintf("  [%s] completed in %.1f seconds\n\n", origin_country, elapsed))
 }
 
-# ── 5. SUMMARY ──────────────────────────────────────────────────────────────
+# ==============================================================================
+# COMBINE AND SAVE
+# ==============================================================================
 
-n_codes  <- n_distinct(china_imports$I_COMMODITY)
-n_months <- n_distinct(china_imports$time)
-n_rows   <- nrow(china_imports)
+cat("==============================================================================\n")
+cat("COMBINING RESULTS\n")
+cat("==============================================================================\n\n")
 
-message(sprintf("Result: %s rows | %d unique HTS-10 codes | %d months",
-                format(n_rows, big.mark = ","), n_codes, n_months))
+flagged_routes <- rbindlist(all_route_results, use.names = TRUE, fill = TRUE)
 
-# Quick check: which months are present?
-month_coverage <- china_imports |>
-  distinct(YEAR, MONTH) |>
-  arrange(YEAR, MONTH)
-message(sprintf("Date range: %s-%s to %s-%s",
-                first(month_coverage$YEAR), first(month_coverage$MONTH),
-                last(month_coverage$YEAR), last(month_coverage$MONTH)))
+# Reorder columns for clarity
+id_cols <- c("origin_country", "commodity", "third_country")
+if ("description" %in% names(flagged_routes)) id_cols <- c(id_cols, "description")
 
+flag_cols <- c("criterion2", "criterion3", "criterion4", "all_criteria")
 
-# ── 6. EXPORT ────────────────────────────────────────────────────────────────
+c2_cols <- c("origin_dest_share_start", "origin_dest_share_end",
+             "origin_tc_share_start", "origin_tc_share_end",
+             "tc_dest_share_start", "tc_dest_share_end")
 
-output_path <- "china_imports_2020_2025.csv"
-write_csv(china_imports, output_path)
-message(sprintf("Saved to: %s", output_path))
+c3_cols <- c("origin_row_share_start", "origin_row_share_end", "origin_row_growth",
+             "tc_row_share_start", "tc_row_share_end", "tc_row_growth",
+             "tc_row_val_start", "tc_row_val_end",
+             "total_row_start", "total_row_end")
+
+c4_cols <- c("origin_to_tc_val_start", "origin_to_tc_val_end",
+             "tc_to_dest_val_start", "tc_to_dest_val_end")
+
+value_cols <- c("transshipment_value")
+
+col_order <- c(id_cols, flag_cols, c2_cols, c3_cols, c4_cols, value_cols)
+col_order <- intersect(col_order, names(flagged_routes))
+remaining <- setdiff(names(flagged_routes), col_order)
+setcolorder(flagged_routes, c(col_order, remaining))
+
+# Summary
+cat(sprintf("Total routes evaluated: %s\n", format(nrow(flagged_routes), big.mark = ",")))
+cat(sprintf("Routes passing all criteria: %s\n",
+            format(sum(flagged_routes$all_criteria, na.rm = TRUE), big.mark = ",")))
+
+cat("\nCriterion pass rates:\n")
+for (cc in c("criterion2", "criterion3", "criterion4")) {
+  n_pass <- sum(flagged_routes[[cc]], na.rm = TRUE)
+  pct <- round(100 * n_pass / nrow(flagged_routes), 2)
+  cat(sprintf("  %s: %s (%s%%)\n", cc, format(n_pass, big.mark = ","), pct))
+}
+
+# Save
+output_file <- file.path(OUTPUT_DIR,
+                          sprintf("flagged_routes_%s_to_%s_%d_%d.csv",
+                                  paste(ORIGIN_COUNTRIES, collapse = "_"),
+                                  DESTINATION_COUNTRY,
+                                  START_YEAR, END_YEAR))
+
+fwrite(flagged_routes, output_file)
+cat(sprintf("\nFlagged route dataset saved to: %s\n", output_file))
+
+cat("\n==============================================================================\n")
+cat("STEP 1 COMPLETE\n")
+cat("==============================================================================\n")
