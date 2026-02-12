@@ -73,6 +73,7 @@ cat(sprintf("  Volume ratio threshold (C4): %s\n\n", VOLUME_RATIO_THRESHOLD))
 
 cat("Loading trade data...\n")
 trade_data <- fread(INPUT_FILE_PATH)
+setDT(trade_data)  # Ensure data.table class (guards against class-stripping)
 
 # Validate required columns
 required_cols <- c("commodity", "year", "imp_iso", "exp_iso",
@@ -485,15 +486,91 @@ for (cc in c("criterion2", "criterion3", "criterion4")) {
   cat(sprintf("  %s: %s (%s%%)\n", cc, format(n_pass, big.mark = ","), pct))
 }
 
-# Save
-output_file <- file.path(OUTPUT_DIR,
-                          sprintf("flagged_routes_%s_to_%s_%d_%d.csv",
-                                  paste(ORIGIN_COUNTRIES, collapse = "_"),
-                                  DESTINATION_COUNTRY,
-                                  START_YEAR, END_YEAR))
+# Save route-level results
+output_file_routes <- file.path(OUTPUT_DIR,
+                                sprintf("flagged_routes_%s_to_%s_%d_%d.csv",
+                                        paste(ORIGIN_COUNTRIES, collapse = "_"),
+                                        DESTINATION_COUNTRY,
+                                        START_YEAR, END_YEAR))
 
-fwrite(flagged_routes, output_file)
-cat(sprintf("\nFlagged route dataset saved to: %s\n", output_file))
+fwrite(flagged_routes, output_file_routes)
+cat(sprintf("\nFlagged route dataset saved to: %s\n", output_file_routes))
+
+# ==============================================================================
+# BUILD FLAGGED END-YEAR TRADE DATA
+# ==============================================================================
+# Join route-level flags onto end-year trade records at the destination.
+# Each record where imp_iso == DESTINATION_COUNTRY is a potential TC->dest leg.
+# The join key is (exp_iso = third_country, commodity), with one row per
+# origin country that evaluated that route.
+#
+# Records that are not TC->dest flows into the destination (or that have no
+# matching route evaluation) receive flag values of 0.
+#
+# When filtered to all_criteria == 1, this dataset is the correct input for
+# downstream aggregation by country, product, and route.
+# ==============================================================================
+
+cat("\n==============================================================================\n")
+cat("BUILDING FLAGGED END-YEAR TRADE DATA\n")
+cat("==============================================================================\n\n")
+
+# Start with all end-year trade records
+trade_data_end_year <- copy(data_end)
+
+# Select the flag and value columns to join from the route-level results
+join_cols <- c("origin_country",
+               "criterion2", "criterion3", "criterion4", "all_criteria",
+               "origin_dest_share_start", "origin_dest_share_end",
+               "origin_tc_share_start", "origin_tc_share_end",
+               "tc_dest_share_start", "tc_dest_share_end",
+               "origin_row_share_start", "origin_row_share_end", "origin_row_growth",
+               "tc_row_share_start", "tc_row_share_end", "tc_row_growth",
+               "origin_to_tc_val_start", "origin_to_tc_val_end",
+               "tc_to_dest_val_start", "tc_to_dest_val_end",
+               "transshipment_value")
+join_cols <- intersect(join_cols, names(flagged_routes))
+
+route_flags <- flagged_routes[, .SD, .SDcols = c("commodity", "third_country", join_cols)]
+
+# Join: trade records at the destination get matched to route flags
+# A TC->dest record is (imp_iso == DESTINATION_COUNTRY, exp_iso == third_country)
+trade_data_end_year <- merge(
+  trade_data_end_year,
+  route_flags,
+  by.x = c("commodity", "exp_iso"),
+  by.y = c("commodity", "third_country"),
+  all.x = TRUE,
+  allow.cartesian = TRUE  # One trade record can match multiple origin countries
+)
+
+# Fill NA flags with 0 for records that aren't part of any evaluated route
+flag_fill_cols <- c("criterion2", "criterion3", "criterion4", "all_criteria")
+flag_fill_cols <- intersect(flag_fill_cols, names(trade_data_end_year))
+for (col in flag_fill_cols) {
+  set(trade_data_end_year, which(is.na(trade_data_end_year[[col]])), col, 0L)
+}
+
+# Summary
+n_total <- nrow(trade_data_end_year)
+n_flagged <- sum(trade_data_end_year$all_criteria == 1L, na.rm = TRUE)
+n_origins <- uniqueN(trade_data_end_year$origin_country[!is.na(trade_data_end_year$origin_country)])
+
+cat(sprintf("End-year trade records (with route expansion): %s\n",
+            format(n_total, big.mark = ",")))
+cat(sprintf("Records flagged as transshipment (all_criteria == 1): %s\n",
+            format(n_flagged, big.mark = ",")))
+cat(sprintf("Origin countries in flags: %d\n", n_origins))
+
+# Save
+output_file_trade <- file.path(OUTPUT_DIR,
+                                sprintf("trade_data_end_year_flagged_%s_to_%s_%d_%d.csv",
+                                        paste(ORIGIN_COUNTRIES, collapse = "_"),
+                                        DESTINATION_COUNTRY,
+                                        START_YEAR, END_YEAR))
+
+fwrite(trade_data_end_year, output_file_trade)
+cat(sprintf("\nFlagged end-year trade data saved to: %s\n", output_file_trade))
 
 cat("\n==============================================================================\n")
 cat("STEP 1 COMPLETE\n")
