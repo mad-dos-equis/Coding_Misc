@@ -169,15 +169,27 @@ cat("--- Aggregation 2: By Commodity ---\n")
 commodity_group <- c("origin_country", "commodity")
 if ("description" %in% names(ts_routes)) commodity_group <- c(commodity_group, "description")
 
+# Identify top TC per (origin, commodity) by transshipment value
+top_tc_by_commodity <- ts_routes[,
+  .(tc_transshipment = sum(transshipment_value, na.rm = TRUE)),
+  by = c(commodity_group, "third_country")
+][order(-tc_transshipment), .SD[1], by = commodity_group]
+setnames(top_tc_by_commodity,
+         c("third_country", "tc_transshipment"),
+         c("top_third_country", "top_third_country_value"))
+
 ts_by_commodity <- ts_routes[, .(
-  transshipment_value    = sum(transshipment_value, na.rm = TRUE),
-  n_third_countries      = uniqueN(third_country),
-  third_countries        = paste(sort(unique(third_country)), collapse = "; "),
+  transshipment_value     = sum(transshipment_value, na.rm = TRUE),
+  n_third_countries       = uniqueN(third_country),
+  third_countries         = paste(sort(unique(third_country)), collapse = "; "),
   sum_origin_to_tc_excess = sum(origin_to_tc_excess, na.rm = TRUE),
   sum_tc_to_dest_excess   = sum(tc_to_dest_excess, na.rm = TRUE),
-  sum_origin_to_tc_end   = sum(origin_to_tc_val_end, na.rm = TRUE),
-  sum_tc_to_dest_end     = sum(tc_to_dest_val_end, na.rm = TRUE)
+  sum_origin_to_tc_end    = sum(origin_to_tc_val_end, na.rm = TRUE),
+  sum_tc_to_dest_end      = sum(tc_to_dest_val_end, na.rm = TRUE)
 ), by = commodity_group]
+
+ts_by_commodity <- merge(ts_by_commodity, top_tc_by_commodity,
+                         by = commodity_group, all.x = TRUE)
 
 setorderv(ts_by_commodity, "transshipment_value", order = -1L)
 
@@ -191,6 +203,21 @@ cat(sprintf("  Total:       $%s\n\n",
 
 cat("--- Aggregation 3: By Third Country ---\n")
 
+# Identify top commodity per (origin, TC) by transshipment value
+top_commodity_by_tc <- ts_routes[,
+  .(commodity_transshipment = sum(transshipment_value, na.rm = TRUE)),
+  by = .(origin_country, third_country, commodity)
+][order(-commodity_transshipment), .SD[1], by = .(origin_country, third_country)]
+setnames(top_commodity_by_tc,
+         c("commodity", "commodity_transshipment"),
+         c("top_commodity", "top_commodity_value"))
+if ("description" %in% names(ts_routes)) {
+  desc_lookup <- unique(ts_routes[, .(commodity, description)])[, .SD[1], by = commodity]
+  top_commodity_by_tc <- merge(top_commodity_by_tc, desc_lookup,
+                               by.x = "top_commodity", by.y = "commodity", all.x = TRUE)
+  setnames(top_commodity_by_tc, "description", "top_commodity_description")
+}
+
 ts_by_tc <- ts_routes[, .(
   transshipment_value     = sum(transshipment_value, na.rm = TRUE),
   n_commodities           = uniqueN(commodity),
@@ -199,6 +226,9 @@ ts_by_tc <- ts_routes[, .(
   sum_origin_to_tc_end    = sum(origin_to_tc_val_end, na.rm = TRUE),
   sum_tc_to_dest_end      = sum(tc_to_dest_val_end, na.rm = TRUE)
 ), by = .(origin_country, third_country)]
+
+ts_by_tc <- merge(ts_by_tc, top_commodity_by_tc,
+                  by = c("origin_country", "third_country"), all.x = TRUE)
 
 setorderv(ts_by_tc, "transshipment_value", order = -1L)
 
