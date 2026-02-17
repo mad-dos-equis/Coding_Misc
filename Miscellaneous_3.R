@@ -126,6 +126,12 @@ if (ALLOW_ORIGIN_COUNTRIES_AS_TC) {
   ))
 }
 
+# Build observed commodity-TC pairs (used to filter route skeleton)
+observed_pairs <- unique(rbind(
+  data_start[, .(commodity, third_country = exp_iso)],
+  data_end[, .(commodity, third_country = exp_iso)]
+))
+
 cat(sprintf("Analysis scope:\n"))
 cat(sprintf("  Commodities:      %s\n", format(length(all_commodities), big.mark = ",")))
 cat(sprintf("  Origin countries: %s\n", length(ORIGIN_COUNTRIES)))
@@ -154,15 +160,16 @@ for (oc_idx in seq_along(ORIGIN_COUNTRIES)) {
 
   # --------------------------------------------------------------------------
   # Build route skeleton: one row per (commodity, third_country)
+  # Filtered to commodity-TC pairs actually observed in the data
   # --------------------------------------------------------------------------
 
-  routes <- CJ(commodity = all_commodities, third_country = tc_list)
+  routes <- merge(CJ(commodity = all_commodities, third_country = tc_list),
+                  observed_pairs, by = c("commodity", "third_country"))
   routes[, origin_country := origin_country]
+  routes[, destination_country := DESTINATION_COUNTRY]
 
-  cat(sprintf("  Route skeleton: %s rows (%s commodities x %s TCs)\n",
-              format(nrow(routes), big.mark = ","),
-              format(length(all_commodities), big.mark = ","),
-              format(length(tc_list), big.mark = ",")))
+  cat(sprintf("  Route skeleton: %s rows (filtered to observed pairs)\n",
+              format(nrow(routes), big.mark = ",")))
 
   # ==========================================================================
   # CRITERION 2: Three-part share test
@@ -384,13 +391,61 @@ for (oc_idx in seq_along(ORIGIN_COUNTRIES)) {
                    "tc_to_dest_val_start", "tc_to_dest_val_end")
   setnafill(routes, fill = 0, cols = c4_val_cols)
 
-  # Criterion 4: raw end-year comparison per Freund
+  # Criterion 4: raw end-year comparison per Freund, with zero-trade guard
   routes[, criterion4 := as.integer(
+    tc_to_dest_val_end > 0 &
     origin_to_tc_val_end >= VOLUME_RATIO_THRESHOLD * tc_to_dest_val_end
   )]
 
   cat(sprintf("    Routes passing C4: %s / %s\n",
               format(sum(routes$criterion4), big.mark = ","),
+              format(nrow(routes), big.mark = ",")))
+
+  # ==========================================================================
+  # WORLD IMPORT TOTALS (for excess flow estimation in Step 2)
+  # Total imports by TC and by destination, per commodity
+  # ==========================================================================
+
+  cat("  Computing world import totals (for downstream excess flow estimation)...\n")
+
+  # --- World -> TC: total imports by each TC per commodity ---
+  # Uses total_value from calc_shares (sum of all exporters to that importer)
+  world_to_tc_start <- data_start[
+    imp_iso %in% tc_list,
+    .(world_to_tc_val_start = sum(value_imp_pref, na.rm = TRUE)),
+    by = .(commodity, third_country = imp_iso)
+  ]
+  world_to_tc_end <- data_end[
+    imp_iso %in% tc_list,
+    .(world_to_tc_val_end = sum(value_imp_pref, na.rm = TRUE)),
+    by = .(commodity, third_country = imp_iso)
+  ]
+
+  routes <- merge(routes, world_to_tc_start, by = c("commodity", "third_country"), all.x = TRUE)
+  routes <- merge(routes, world_to_tc_end,   by = c("commodity", "third_country"), all.x = TRUE)
+
+  # --- World -> Destination: total imports by destination per commodity ---
+  # One value per commodity (does not vary by TC)
+  world_to_dest_start <- data_start[
+    imp_iso == DESTINATION_COUNTRY,
+    .(world_to_dest_val_start = sum(value_imp_pref, na.rm = TRUE)),
+    by = commodity
+  ]
+  world_to_dest_end <- data_end[
+    imp_iso == DESTINATION_COUNTRY,
+    .(world_to_dest_val_end = sum(value_imp_pref, na.rm = TRUE)),
+    by = commodity
+  ]
+
+  routes <- merge(routes, world_to_dest_start, by = "commodity", all.x = TRUE)
+  routes <- merge(routes, world_to_dest_end,   by = "commodity", all.x = TRUE)
+
+  # Fill NAs
+  world_val_cols <- c("world_to_tc_val_start", "world_to_tc_val_end",
+                      "world_to_dest_val_start", "world_to_dest_val_end")
+  setnafill(routes, fill = 0, cols = world_val_cols)
+
+  cat(sprintf("    World import totals attached for %s routes\n",
               format(nrow(routes), big.mark = ",")))
 
   # --------------------------------------------------------------------------
@@ -435,7 +490,7 @@ cat("===========================================================================
 flagged_routes <- rbindlist(all_route_results, use.names = TRUE, fill = TRUE)
 
 # Reorder columns for clarity
-id_cols <- c("origin_country", "commodity", "third_country")
+id_cols <- c("origin_country", "commodity", "third_country", "destination_country")
 if ("description" %in% names(flagged_routes)) id_cols <- c(id_cols, "description")
 
 flag_cols <- c("criterion2", "criterion3", "criterion4", "all_criteria")
@@ -452,7 +507,10 @@ c3_cols <- c("origin_row_share_start", "origin_row_share_end", "origin_row_growt
 c4_cols <- c("origin_to_tc_val_start", "origin_to_tc_val_end",
              "tc_to_dest_val_start", "tc_to_dest_val_end")
 
-col_order <- c(id_cols, flag_cols, c2_cols, c3_cols, c4_cols)
+world_cols <- c("world_to_tc_val_start", "world_to_tc_val_end",
+                "world_to_dest_val_start", "world_to_dest_val_end")
+
+col_order <- c(id_cols, flag_cols, c2_cols, c3_cols, c4_cols, world_cols)
 col_order <- intersect(col_order, names(flagged_routes))
 remaining <- setdiff(names(flagged_routes), col_order)
 setcolorder(flagged_routes, c(col_order, remaining))
@@ -502,7 +560,7 @@ cat("===========================================================================
 trade_data_end_year <- copy(data_end)
 
 # Select the flag and value columns to join from the route-level results
-join_cols <- c("origin_country",
+join_cols <- c("origin_country", "destination_country",
                "criterion2", "criterion3", "criterion4", "all_criteria",
                "origin_dest_share_start", "origin_dest_share_end",
                "origin_tc_share_start", "origin_tc_share_end",
@@ -510,7 +568,9 @@ join_cols <- c("origin_country",
                "origin_row_share_start", "origin_row_share_end", "origin_row_growth",
                "tc_row_share_start", "tc_row_share_end", "tc_row_growth",
                "origin_to_tc_val_start", "origin_to_tc_val_end",
-               "tc_to_dest_val_start", "tc_to_dest_val_end")
+               "tc_to_dest_val_start", "tc_to_dest_val_end",
+               "world_to_tc_val_start", "world_to_tc_val_end",
+               "world_to_dest_val_start", "world_to_dest_val_end")
 join_cols <- intersect(join_cols, names(flagged_routes))
 
 route_flags <- flagged_routes[, .SD, .SDcols = c("commodity", "third_country", join_cols)]
