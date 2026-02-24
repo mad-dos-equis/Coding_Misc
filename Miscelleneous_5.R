@@ -195,7 +195,7 @@ cat("\n")
 
 bucket_sensitivity <- cross_join(elasticity_scenarios, phi_scenarios) |>
   mutate(
-    map2_dfr(epsilon, phi, function(eps, ph) {
+    results = map2(epsilon, phi, function(eps, ph) {
       hts10_base |>
         mutate(
           bucket      = case_when(
@@ -212,11 +212,11 @@ bucket_sensitivity <- cross_join(elasticity_scenarios, phi_scenarios) |>
         summarise(
           total_delta_duties = sum(delta_duties),
           below_delta        = sum(delta_duties[bucket == "below"]),
-          above_delta        = sum(delta_duties[bucket == "above"]),
-          .groups = "drop"
+          above_delta        = sum(delta_duties[bucket == "above"])
         )
     })
-  )
+  ) |>
+  unnest(results)
 
 cat("── Bucket Gain Sensitivity (\u03b5 \u00d7 \u03c6) ─────────────────────────────\n")
 print(bucket_sensitivity)
@@ -313,12 +313,9 @@ p_chapter <- decomp_chapter |>
 
 # 9d. Faceted bar: bucket gain sensitivity across φ scenarios
 #     (primary elasticity, varying phi)
-p_bucket_phi <- cross_join(
-    phi_scenarios,
-    tibble(epsilon = EPSILON_PRIMARY)
-  ) |>
+p_bucket_phi <- phi_scenarios |>
   mutate(
-    map_dfr(phi, function(ph) {
+    bucket_data = map(phi, function(ph) {
       hts10_base |>
         mutate(
           bucket      = case_when(
@@ -336,6 +333,7 @@ p_bucket_phi <- cross_join(
         summarise(delta_duties = sum(delta_duties), .groups = "drop")
     })
   ) |>
+  unnest(bucket_data) |>
   ggplot(aes(
     x    = fct_reorder(bucket, delta_duties),
     y    = delta_duties / 1e6,
