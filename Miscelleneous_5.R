@@ -253,13 +253,8 @@ cat("\n")
 # All scenarios use the primary ε and φ. Monthly projection scaled by number
 # of months active in each scenario.
 
-R_primary <- grid |>
-  filter(
-    epsilon == EPSILON_PRIMARY,
-    phi     == PHI_PRIMARY
-  ) |>
-  pull(R_projected)
-
+R_primary       <- project_revenue(EPSILON_PRIMARY, PHI_PRIMARY,
+                                   tau_baseline, TAU_NEW, R_baseline)$R_projected
 delta_R_monthly <- R_primary - R_baseline   # incremental monthly gain
 
 scenario_table <- tibble(
