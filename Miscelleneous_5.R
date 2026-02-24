@@ -45,6 +45,16 @@ elasticity_scenarios <- tribble(
 EPSILON_PRIMARY <- -0.75
 PHI_PRIMARY     <-  1.00
 
+# Section 122 exempt chapters (2-digit HTS)
+# These chapters are treated as having zero marginal rate shock throughout
+# all projections, decompositions, and sensitivity analyses.
+# Adjust as the proclamation text and legal interpretation develops.
+# Current candidates based on standard Section 122 carve-out categories:
+#   27 = Mineral fuels and oils (energy)
+#   30 = Pharmaceutical products
+# Add further chapters as strings, e.g. c("27", "30", "31")
+EXEMPT_CHAPTERS <- c("27", "30")
+
 # ── 1. Load and filter HTS-10 data ───────────────────────────────────────────
 # July 2025 selected as baseline month. Rationale:
 #   - Post-Liberation Day: most trading partners at 10% IEEPA baseline
@@ -72,6 +82,10 @@ hts10_base <- hts10_raw |>
     !is.na(tau_eff),
     import_value >= 0,
     tau_eff      >= 0
+  ) |>
+  mutate(
+    chapter = str_pad(str_sub(hts, 1, 2), 2, pad = "0"),
+    exempt  = chapter %in% EXEMPT_CHAPTERS
   )
 
 # ── 2. Aggregate baseline inputs ──────────────────────────────────────────────
@@ -134,11 +148,12 @@ cat("\n")
 hts10_projected <- hts10_base |>
   mutate(
     bucket = case_when(
+      exempt                           ~ "Exempt \u2014 Section 122 carve-out",
       tau_eff == 0                     ~ "Zero-rated",
       tau_eff >= TAU_NEW               ~ "At/above 15% \u2014 no Section 122 bite",
       tau_eff > 0 & tau_eff < TAU_NEW  ~ "Below 15% \u2014 Section 122 adds margin"
     ),
-    delta_tau         = pmax(TAU_NEW - tau_eff, 0),
+    delta_tau         = if_else(exempt, 0, pmax(TAU_NEW - tau_eff, 0)),
     price_shock       = PHI_PRIMARY * (delta_tau / (1 + tau_eff)),
     import_value_proj = import_value * (1 + EPSILON_PRIMARY * price_shock),
     tau_eff_proj      = tau_eff + delta_tau,
@@ -174,7 +189,6 @@ cat("\n")
 
 decomp_chapter <- hts10_projected |>
   filter(bucket == "Below 15% \u2014 Section 122 adds margin") |>
-  mutate(chapter = str_pad(str_sub(hts, 1, 2), 2, pad = "0")) |>
   group_by(chapter) |>
   summarise(
     n_lines           = n(),
@@ -199,11 +213,12 @@ bucket_sensitivity <- cross_join(elasticity_scenarios, phi_scenarios) |>
       hts10_base |>
         mutate(
           bucket      = case_when(
+            exempt                          ~ "exempt",
             tau_eff == 0                    ~ "zero",
             tau_eff >= TAU_NEW              ~ "above",
             tau_eff > 0 & tau_eff < TAU_NEW ~ "below"
           ),
-          delta_tau         = pmax(TAU_NEW - tau_eff, 0),
+          delta_tau         = if_else(exempt, 0, pmax(TAU_NEW - tau_eff, 0)),
           price_shock       = ph * (delta_tau / (1 + tau_eff)),
           import_value_proj = import_value * (1 + eps * price_shock),
           duties_proj       = import_value_proj * (tau_eff + delta_tau),
@@ -212,7 +227,8 @@ bucket_sensitivity <- cross_join(elasticity_scenarios, phi_scenarios) |>
         summarise(
           total_delta_duties = sum(delta_duties),
           below_delta        = sum(delta_duties[bucket == "below"]),
-          above_delta        = sum(delta_duties[bucket == "above"])
+          above_delta        = sum(delta_duties[bucket == "above"]),
+          exempt_delta       = sum(delta_duties[bucket == "exempt"])
         )
     })
   ) |>
@@ -222,9 +238,68 @@ cat("── Bucket Gain Sensitivity (\u03b5 \u00d7 \u03c6) ───────
 print(bucket_sensitivity)
 cat("\n")
 
-# ── 9. Visualizations ────────────────────────────────────────────────────────
+# ── 9. Illustrative long-run revenue scenarios ────────────────────────────────
+# Section 122 is capped at 150 days. The table below is explicitly illustrative:
+# it projects cumulative revenue under different assumptions about what authority
+# (if any) replaces Section 122 after expiry. These are NOT forecasts; they are
+# sensitivity scenarios for planning purposes only.
+#
+# Regime assumptions:
+#   A. Section 122 lapses after 150 days, no replacement → 0 incremental revenue
+#   B. Section 122 renewed/replaced at equivalent rate for full 10 years
+#   C. Partial replacement: equivalent authority in place for 50% of the decade
+#      (reflecting likely legal/political attrition over time)
+#
+# All scenarios use the primary ε and φ. Monthly projection scaled by number
+# of months active in each scenario.
 
-# 9a. Heatmap: revenue multiple across ε × φ
+R_primary <- grid |>
+  filter(
+    epsilon == EPSILON_PRIMARY,
+    phi     == PHI_PRIMARY
+  ) |>
+  pull(R_projected)
+
+delta_R_monthly <- R_primary - R_baseline   # incremental monthly gain
+
+scenario_table <- tibble(
+  scenario = c(
+    "A. Section 122 lapses (150 days only)",
+    "B. Full replacement — 10 years at equivalent rate",
+    "C. Partial replacement — 50% of decade"
+  ),
+  months_active    = c(5, 120, 60),
+  assumption       = c(
+    "No successor authority; tariff reverts to 232-only baseline after day 150",
+    "Illustrative upper bound: Section 122 renewed or replaced by equivalent authority continuously",
+    "Illustrative midpoint: successor authority faces legal/political attrition, in effect ~half the decade"
+  )
+) |>
+  mutate(
+    cumulative_delta_revenue = delta_R_monthly * months_active,
+    cumulative_total_revenue = R_primary * months_active
+  )
+
+cat("── Illustrative Long-Run Revenue Scenarios (PLANNING ONLY) ───\n")
+cat("Primary parameters: \u03b5 =", EPSILON_PRIMARY, "(Boehm et al. 2023),",
+    "\u03c6 =", PHI_PRIMARY, "(Amiti et al. 2019)\n")
+cat("Monthly incremental gain over baseline: ", dollar(delta_R_monthly), "\n\n")
+print(
+  scenario_table |>
+    select(scenario, months_active, cumulative_delta_revenue,
+           cumulative_total_revenue, assumption) |>
+    mutate(
+      across(c(cumulative_delta_revenue, cumulative_total_revenue), dollar)
+    )
+)
+cat("\nNOTE: Scenarios B and C are purely illustrative. Section 122 expires\n")
+cat("after 150 days absent congressional extension. Any successor authority\n")
+cat("would require independent legal basis (e.g., Section 232 investigations\n")
+cat("currently underway for pharmaceuticals, semiconductors, etc.).\n\n")
+
+# ── 10. Visualizations ───────────────────────────────────────────────────────
+
+# 10a. Heatmap: revenue multiple across ε × φ
 p_heatmap <- grid |>
   mutate(
     epsilon_label = fct_reorder(epsilon_label, epsilon),
@@ -259,7 +334,7 @@ p_heatmap <- grid |>
     legend.position = "right"
   )
 
-# 9b. Bucket decomposition bar chart (primary ε and φ)
+# 10b. Bucket decomposition bar chart (primary ε and φ)
 p_bucket <- decomp_bucket |>
   ggplot(aes(
     x    = fct_reorder(bucket, delta_duties),
@@ -272,7 +347,8 @@ p_bucket <- decomp_bucket |>
   scale_fill_manual(values = c(
     "Below 15% \u2014 Section 122 adds margin" = "#1F4E79",
     "At/above 15% \u2014 no Section 122 bite"  = "gray70",
-    "Zero-rated"                               = "gray90"
+    "Zero-rated"                               = "gray90",
+    "Exempt \u2014 Section 122 carve-out"      = "#D4A017"
   )) +
   scale_y_continuous(labels = label_comma()) +
   labs(
@@ -288,7 +364,7 @@ p_bucket <- decomp_bucket |>
   theme_minimal(base_size = 12) +
   theme(plot.caption = element_text(size = 8, color = "gray40"))
 
-# 9c. Top chapters driving the gain
+# 10c. Top chapters driving the gain
 p_chapter <- decomp_chapter |>
   slice_head(n = 15) |>
   ggplot(aes(
@@ -311,7 +387,7 @@ p_chapter <- decomp_chapter |>
   theme_minimal(base_size = 12) +
   theme(plot.caption = element_text(size = 8, color = "gray40"))
 
-# 9d. Faceted bar: bucket gain sensitivity across φ scenarios
+# 10d. Faceted bar: bucket gain sensitivity across φ scenarios
 #     (primary elasticity, varying phi)
 p_bucket_phi <- phi_scenarios |>
   mutate(
@@ -319,11 +395,12 @@ p_bucket_phi <- phi_scenarios |>
       hts10_base |>
         mutate(
           bucket      = case_when(
+            exempt                          ~ "Exempt",
             tau_eff == 0                    ~ "Zero-rated",
             tau_eff >= TAU_NEW              ~ "At/above 15%",
             tau_eff > 0 & tau_eff < TAU_NEW ~ "Below 15%"
           ),
-          delta_tau         = pmax(TAU_NEW - tau_eff, 0),
+          delta_tau         = if_else(exempt, 0, pmax(TAU_NEW - tau_eff, 0)),
           price_shock       = ph * (delta_tau / (1 + tau_eff)),
           import_value_proj = import_value * (1 + EPSILON_PRIMARY * price_shock),
           duties_proj       = import_value_proj * (tau_eff + delta_tau),
@@ -345,7 +422,8 @@ p_bucket_phi <- phi_scenarios |>
   scale_fill_manual(values = c(
     "Below 15%"    = "#1F4E79",
     "At/above 15%" = "gray70",
-    "Zero-rated"   = "gray90"
+    "Zero-rated"   = "gray90",
+    "Exempt"       = "#D4A017"
   )) +
   scale_y_continuous(labels = label_comma()) +
   labs(
@@ -360,7 +438,7 @@ p_bucket_phi <- phi_scenarios |>
   theme_minimal(base_size = 11) +
   theme(strip.text = element_text(face = "bold"))
 
-# ── 10. Print plots ───────────────────────────────────────────────────────────
+# ── 11. Print plots ───────────────────────────────────────────────────────────
 
 print(p_heatmap)
 print(p_bucket)
