@@ -1,151 +1,198 @@
 # ══════════════════════════════════════════════════════════════════════════════
-# Section 122 Customs Duties Revenue Projection
-# Sources: US Treasury customs duties (MTS); HTS-10 trade-weighted ETR
-# Method: Partial equilibrium projection with 2D sensitivity grid
-#         over import demand elasticity (ε) and pass-through (φ)
-# Baseline: July 2025 (single month)
+# Section 122 Customs Duties Revenue Projection — Extensions
+# ══════════════════════════════════════════════════════════════════════════════
+# Source after running the main projection script. Assumes the following
+# objects exist in the environment:
+#   hts10_base, hts10_projected, grid, decomp_bucket, decomp_chapter,
+#   bucket_sensitivity, scenario_table, revenue_matrix,
+#   elasticity_scenarios, phi_scenarios,
+#   R_baseline, M_baseline, tau_baseline,
+#   TAU_NEW, EPSILON_PRIMARY, PHI_PRIMARY, EXEMPT_CHAPTERS
+#
+# Additions:
+#   A. Baseline summary table
+#   B. Rate effect vs. volume effect (Harberger) decomposition
+#   C. Concentration metrics for revenue gain
+#   D. Extensive-margin scenario for zero-rated lines
+#   E. Foregone revenue from Section 122 exemptions / carve-outs
+#   F. HTS-4 breakdown within top revenue-gaining chapters
+#      (with trade-weighted + simple-average ETR; marginal rate columns)
+#   G. Annualized and 10-year projections with full ε × φ sensitivity
+#   H. Visualizations for new outputs
+#   I. Export: CSV collection + optional multi-sheet xlsx workbook
 # ══════════════════════════════════════════════════════════════════════════════
 
 library(tidyverse)
 library(scales)
 
-# ── 0. Parameters ─────────────────────────────────────────────────────────────
+export_dir <- "output_tables"
+dir.create(export_dir, showWarnings = FALSE, recursive = TRUE)
 
-TAU_NEW <- 0.15   # Section 122 target rate (statutory cap)
+fmt_dollar <- function(x) dollar(x, accuracy = 1)
+fmt_pct    <- function(x) percent(x, accuracy = 0.01)
 
-# Pass-through scenarios
-# Amiti, Redding & Weinstein (2019, JEP):     full pass-through ~ 1.0
-# Intermediate exporter absorption:            partial ~ 0.70
-# Cavallo, Cavallo & Rigobon (2021, AER):      incomplete ~ 0.45
-phi_scenarios <- tribble(
-  ~phi_label,                                               ~phi,
-  "Full pass-through \u2014 Amiti et al. (2019)",           1.00,
-  "Partial pass-through \u2014 exporter absorption",        0.70,
-  "Incomplete pass-through \u2014 Cavallo et al. (2021)",   0.45
+
+# ══════════════════════════════════════════════════════════════════════════════
+# A. Baseline Summary Table
+# ══════════════════════════════════════════════════════════════════════════════
+# One-row context table: anchors every downstream number.
+
+n_exempt_lines <- sum(hts10_base$exempt)
+n_zero_lines   <- sum(hts10_base$tau_eff == 0 & !hts10_base$exempt)
+n_below_lines  <- sum(hts10_base$tau_eff > 0 & hts10_base$tau_eff < TAU_NEW & !hts10_base$exempt)
+n_above_lines  <- sum(hts10_base$tau_eff >= TAU_NEW & !hts10_base$exempt)
+
+baseline_summary <- tibble(
+  baseline_month            = "July 2025",
+  total_hts10_lines         = nrow(hts10_base),
+  n_exempt_lines            = n_exempt_lines,
+  n_zero_rated_lines        = n_zero_lines,
+  n_below_15_lines          = n_below_lines,
+  n_at_above_15_lines       = n_above_lines,
+  total_import_value        = M_baseline,
+  total_duties              = R_baseline,
+  trade_weighted_etr        = tau_baseline,
+  simple_avg_etr            = mean(hts10_base$tau_eff),
+  median_etr                = median(hts10_base$tau_eff),
+  import_value_exempt       = sum(hts10_base$import_value[hts10_base$exempt]),
+  import_value_zero_rated   = sum(hts10_base$import_value[hts10_base$tau_eff == 0 & !hts10_base$exempt]),
+  import_value_below_15     = sum(hts10_base$import_value[hts10_base$tau_eff > 0 & hts10_base$tau_eff < TAU_NEW & !hts10_base$exempt]),
+  import_value_at_above_15  = sum(hts10_base$import_value[hts10_base$tau_eff >= TAU_NEW & !hts10_base$exempt]),
+  exempt_chapters           = paste(EXEMPT_CHAPTERS, collapse = ", "),
+  section_122_target_rate   = TAU_NEW,
+  epsilon_primary           = EPSILON_PRIMARY,
+  phi_primary               = PHI_PRIMARY
 )
 
-# Import demand elasticity scenarios
-# Boehm, Levchenko & Pandalai-Nayar (2023, AER): short-run ~ -0.5 to -1.0
-# Imbs & Mejean (2015, ReStud):                   aggregate ~ -1.25
-# Hooper, Johnson & Marquez (2000, Princeton IES): aggregate ~ -1.5
-# Broda & Weinstein (2006, QJE):                  aggregate proxy ~ -2.0
-elasticity_scenarios <- tribble(
-  ~epsilon_label,                                            ~epsilon,
-  "Naive (\u03b5 = 0)",                                      0.00,
-  "Boehm et al. (2023) \u2014 short-run low",               -0.50,
-  "Boehm et al. (2023) \u2014 short-run high",              -1.00,
-  "Imbs & Mejean (2015)",                                    -1.25,
-  "Hooper, Johnson & Marquez (2000)",                        -1.50,
-  "Broda & Weinstein (2006)",                                -2.00
-)
+cat("══ A. Baseline Summary (July 2025) ═══════════════════════════\n")
+cat("Total HTS-10 lines:       ", comma(nrow(hts10_base)), "\n")
+cat("  Exempt:                 ", comma(n_exempt_lines), "\n")
+cat("  Zero-rated:             ", comma(n_zero_lines), "\n")
+cat("  Below 15%:              ", comma(n_below_lines), "\n")
+cat("  At/above 15%:           ", comma(n_above_lines), "\n")
+cat("Total import value:       ", fmt_dollar(M_baseline), "\n")
+cat("Total duties:             ", fmt_dollar(R_baseline), "\n")
+cat("Trade-weighted ETR:       ", fmt_pct(tau_baseline), "\n")
+cat("Simple-average ETR:       ", fmt_pct(mean(hts10_base$tau_eff)), "\n\n")
 
-# Primary scenarios for HTS-10 decomposition
-# Short-run elasticity (Boehm et al.) is appropriate for 150-day window;
-# full pass-through (Amiti et al.) is the conservative revenue lower bound
-EPSILON_PRIMARY <- -0.75
-PHI_PRIMARY     <-  1.00
 
-# Section 122 exempt chapters (2-digit HTS)
-# These chapters are treated as having zero marginal rate shock throughout
-# all projections, decompositions, and sensitivity analyses.
-# Adjust as the proclamation text and legal interpretation develops.
-# Current candidates based on standard Section 122 carve-out categories:
-#   27 = Mineral fuels and oils (energy)
-#   30 = Pharmaceutical products
-# Add further chapters as strings, e.g. c("27", "30", "31")
-EXEMPT_CHAPTERS <- c("27", "30")
+# ══════════════════════════════════════════════════════════════════════════════
+# B. Rate Effect vs. Volume Effect (Harberger Decomposition)
+# ══════════════════════════════════════════════════════════════════════════════
+# Total ΔR = rate_effect + volume_effect
+#   rate_effect   = (τ_new − τ_old) × M_old       [mechanical gain from higher rate]
+#   volume_effect = τ_new × (M_new − M_old)        [revenue loss from import contraction]
+# These sum exactly to ΔR = τ_new × M_new − τ_old × M_old.
 
-# ── 1. Load and filter HTS-10 data ───────────────────────────────────────────
-# July 2025 selected as baseline month. Rationale:
-#   - Post-Liberation Day: most trading partners at 10% IEEPA baseline
-#   - Post-Geneva (May 14): China at ~30%, avoiding the within-month
-#     145%/30% discontinuity present in May 2025
-#   - 232 structure (50% steel/aluminum since June 3; autos at 25%;
-#     copper and lumber in place) closely matches the regime Section 122
-#     layers on top of today
-#   - No within-month structural breaks
-
-hts10_raw <- read_csv("your_hts10_data.csv")   # replace with your path
-
-hts10_base <- hts10_raw |>
-  rename_with(tolower) |>
-  rename(
-    import_value = customs_value,
-    duties       = calculated_duties,
-    tau_eff      = etr
-  ) |>
-  filter(
-    year == 2025,
-    month == 7,
-    !is.na(import_value),
-    !is.na(duties),
-    !is.na(tau_eff),
-    import_value >= 0,
-    tau_eff      >= 0
-  ) |>
+hts10_harberger <- hts10_projected |>
   mutate(
-    chapter = str_pad(str_sub(hts, 1, 2), 2, pad = "0"),
-    exempt  = chapter %in% EXEMPT_CHAPTERS
+    rate_effect   = delta_tau * import_value,
+    volume_effect = tau_eff_proj * (import_value_proj - import_value),
+    # Verify: rate_effect + volume_effect should equal delta_duties
+    check         = abs((rate_effect + volume_effect) - delta_duties)
   )
 
-# ── 2. Aggregate baseline inputs ──────────────────────────────────────────────
-
-R_baseline   <- sum(hts10_base$duties)
-M_baseline   <- sum(hts10_base$import_value)
-tau_baseline <- R_baseline / M_baseline   # bottom-up trade-weighted ETR
-
-cat("── Baseline Summary (July 2025) ──────────────────────────────\n")
-cat("Total customs duties:        ", dollar(R_baseline),             "\n")
-cat("Total dutiable import value: ", dollar(M_baseline),             "\n")
-cat("Implied trade-weighted ETR:  ", percent(tau_baseline, 0.01),    "\n\n")
-
-# ── 3. Projection function ────────────────────────────────────────────────────
-
-project_revenue <- function(epsilon, phi, tau_old, tau_new, R_old) {
-  M_old       <- R_old / tau_old
-  price_shock <- phi * (tau_new - tau_old) / (1 + tau_old)
-  M_new       <- M_old * (1 + epsilon * price_shock)
-  R_new       <- tau_new * M_new
-  tibble(
-    R_projected      = R_new,
-    delta_R_abs      = R_new - R_old,
-    delta_R_pct      = (R_new / R_old - 1) * 100,
-    revenue_multiple = R_new / R_old,
-    revenue_150day   = R_new * 5
-  )
+# Sanity check
+max_decomp_error <- max(hts10_harberger$check)
+if (max_decomp_error > 1) {
+  warning("Harberger decomposition error exceeds $1: ", fmt_dollar(max_decomp_error))
 }
 
-# ── 4. Headline projection: 2D sensitivity grid (ε × φ) ──────────────────────
+harberger_bucket <- hts10_harberger |>
+  group_by(bucket) |>
+  summarise(
+    rate_effect       = sum(rate_effect),
+    volume_effect     = sum(volume_effect),
+    net_delta_duties  = sum(delta_duties),
+    pct_rate_effect   = sum(rate_effect) / sum(delta_duties),
+    pct_volume_effect = sum(volume_effect) / sum(delta_duties),
+    .groups = "drop"
+  )
 
-grid <- cross_join(elasticity_scenarios, phi_scenarios) |>
-  mutate(project_revenue(epsilon, phi, tau_baseline, TAU_NEW, R_baseline))
+harberger_chapter <- hts10_harberger |>
+  filter(bucket == "Below 15% \u2014 Section 122 adds margin") |>
+  group_by(chapter) |>
+  summarise(
+    rate_effect       = sum(rate_effect),
+    volume_effect     = sum(volume_effect),
+    net_delta_duties  = sum(delta_duties),
+    pct_rate_effect   = rate_effect / net_delta_duties,
+    pct_volume_effect = volume_effect / net_delta_duties,
+    .groups = "drop"
+  ) |>
+  arrange(desc(net_delta_duties))
 
-cat("── 2D Sensitivity Grid: Projected Monthly Revenue ────────────\n")
-print(
-  grid |>
-    select(epsilon_label, phi_label, R_projected, delta_R_abs,
-           delta_R_pct, revenue_multiple) |>
-    mutate(
-      across(c(R_projected, delta_R_abs), dollar),
-      delta_R_pct      = round(delta_R_pct, 1),
-      revenue_multiple = round(revenue_multiple, 3)
-    )
+harberger_total <- hts10_harberger |>
+  summarise(
+    rate_effect      = sum(rate_effect),
+    volume_effect    = sum(volume_effect),
+    net_delta_duties = sum(delta_duties)
+  )
+
+cat("══ B. Harberger Decomposition: Rate vs. Volume Effect ════════\n")
+cat("Primary parameters: ε =", EPSILON_PRIMARY, ", φ =", PHI_PRIMARY, "\n\n")
+cat("Aggregate:\n")
+cat("  Gross rate effect:     ", fmt_dollar(harberger_total$rate_effect),
+    " (", round(harberger_total$rate_effect / harberger_total$net_delta_duties * 100, 1), "%)\n", sep = "")
+cat("  Volume offset:         ", fmt_dollar(harberger_total$volume_effect),
+    " (", round(harberger_total$volume_effect / harberger_total$net_delta_duties * 100, 1), "%)\n", sep = "")
+cat("  Net revenue gain:      ", fmt_dollar(harberger_total$net_delta_duties), "\n\n")
+cat("By bucket:\n")
+print(harberger_bucket)
+cat("\nBy chapter (below 15% bucket, top 15):\n")
+print(harberger_chapter |> slice_head(n = 15))
+cat("\n")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# C. Concentration Metrics
+# ══════════════════════════════════════════════════════════════════════════════
+
+total_gain <- sum(decomp_chapter$delta_duties)
+
+concentration <- decomp_chapter |>
+  mutate(
+    cumulative_gain  = cumsum(delta_duties),
+    cumulative_share = cumulative_gain / total_gain
+  )
+
+top5_share  <- concentration |> slice_head(n = 5)  |> pull(cumulative_share) |> last()
+top10_share <- concentration |> slice_head(n = 10) |> pull(cumulative_share) |> last()
+
+# Herfindahl at chapter level (on delta_duties shares)
+hhi_chapter <- decomp_chapter |>
+  mutate(share = delta_duties / total_gain) |>
+  summarise(hhi = sum(share^2)) |>
+  pull(hhi)
+
+concentration_summary <- tibble(
+  metric                     = c("Top 5 chapters share", "Top 10 chapters share",
+                                  "Chapter-level HHI", "Number of chapters with gain"),
+  value                      = c(top5_share, top10_share, hhi_chapter,
+                                  sum(decomp_chapter$delta_duties > 0)),
+  formatted                  = c(fmt_pct(top5_share), fmt_pct(top10_share),
+                                  round(hhi_chapter, 4),
+                                  sum(decomp_chapter$delta_duties > 0))
 )
-cat("\n")
 
-# Wide revenue matrix: elasticity (rows) × pass-through (cols)
-revenue_matrix <- grid |>
-  select(epsilon_label, phi_label, R_projected) |>
-  mutate(R_projected = dollar(R_projected)) |>
-  pivot_wider(names_from = phi_label, values_from = R_projected)
+cat("══ C. Revenue Gain Concentration ═════════════════════════════\n")
+cat("Top 5 chapters:  ", fmt_pct(top5_share), "of projected gain\n")
+cat("Top 10 chapters: ", fmt_pct(top10_share), "of projected gain\n")
+cat("Chapter-level HHI:", round(hhi_chapter, 4), "\n")
+cat("Chapters with positive gain:", sum(decomp_chapter$delta_duties > 0), "\n\n")
 
-cat("── Revenue Matrix ─────────────────────────────────────────────\n")
-print(revenue_matrix)
-cat("\n")
 
-# ── 5. HTS-10 line-level projection (primary ε and φ) ────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# D. Extensive-Margin Scenario for Zero-Rated Lines
+# ══════════════════════════════════════════════════════════════════════════════
+# The behavioral response to 0% → 15% is plausibly larger than 5% → 15%.
+# Model this with a separate elasticity multiplier for zero-rated lines.
+# Default: 1.5× the primary elasticity for zero-rated products.
+# This is a scenario, not a correction — reported alongside the standard run.
 
-hts10_projected <- hts10_base |>
+ZERO_RATE_ELAST_MULTIPLIER <- 1.5
+
+hts10_extensive <- hts10_base |>
   mutate(
     bucket = case_when(
       exempt                           ~ "Exempt \u2014 Section 122 carve-out",
@@ -153,17 +200,19 @@ hts10_projected <- hts10_base |>
       tau_eff >= TAU_NEW               ~ "At/above 15% \u2014 no Section 122 bite",
       tau_eff > 0 & tau_eff < TAU_NEW  ~ "Below 15% \u2014 Section 122 adds margin"
     ),
+    is_zero_rated     = (tau_eff == 0 & !exempt),
+    epsilon_applied   = if_else(is_zero_rated,
+                                EPSILON_PRIMARY * ZERO_RATE_ELAST_MULTIPLIER,
+                                EPSILON_PRIMARY),
     delta_tau         = if_else(exempt, 0, pmax(TAU_NEW - tau_eff, 0)),
     price_shock       = PHI_PRIMARY * (delta_tau / (1 + tau_eff)),
-    import_value_proj = import_value * (1 + EPSILON_PRIMARY * price_shock),
+    import_value_proj = import_value * (1 + epsilon_applied * price_shock),
     tau_eff_proj      = tau_eff + delta_tau,
     duties_proj       = import_value_proj * tau_eff_proj,
     delta_duties      = duties_proj - duties
   )
 
-# ── 6. Bucket decomposition ───────────────────────────────────────────────────
-
-decomp_bucket <- hts10_projected |>
+extensive_bucket <- hts10_extensive |>
   group_by(bucket) |>
   summarise(
     n_lines           = n(),
@@ -172,270 +221,446 @@ decomp_bucket <- hts10_projected |>
     duties_baseline   = sum(duties),
     duties_projected  = sum(duties_proj),
     delta_duties      = sum(delta_duties),
-    share_import_base = sum(import_value) / M_baseline,
     .groups = "drop"
-  ) |>
-  mutate(
-    total_gain    = sum(delta_duties[delta_duties > 0]),
-    share_of_gain = if_else(delta_duties > 0, delta_duties / total_gain, NA_real_)
-  ) |>
-  select(-total_gain)
+  )
 
-cat("── Bucket Decomposition ──────────────────────────────────────\n")
-print(decomp_bucket)
+extensive_total <- sum(hts10_extensive$duties_proj)
+standard_total  <- sum(hts10_projected$duties_proj)
+
+extensive_comparison <- tibble(
+  scenario                = c("Standard (uniform ε)", "Extensive-margin (1.5× ε for zero-rated)"),
+  epsilon_zero_rated      = c(EPSILON_PRIMARY, EPSILON_PRIMARY * ZERO_RATE_ELAST_MULTIPLIER),
+  epsilon_other           = c(EPSILON_PRIMARY, EPSILON_PRIMARY),
+  monthly_projected       = c(standard_total, extensive_total),
+  monthly_delta           = c(standard_total - R_baseline, extensive_total - R_baseline),
+  pct_change_from_base    = c((standard_total / R_baseline - 1) * 100,
+                               (extensive_total / R_baseline - 1) * 100)
+)
+
+cat("══ D. Extensive-Margin Scenario for Zero-Rated Lines ═════════\n")
+cat("Multiplier for zero-rated ε:", ZERO_RATE_ELAST_MULTIPLIER, "×\n")
+cat("ε (zero-rated):", EPSILON_PRIMARY * ZERO_RATE_ELAST_MULTIPLIER,
+    "  ε (other):", EPSILON_PRIMARY, "\n\n")
+cat("Comparison:\n")
+print(extensive_comparison |>
+        mutate(across(c(monthly_projected, monthly_delta), fmt_dollar),
+               pct_change_from_base = round(pct_change_from_base, 1)))
+cat("\nBucket detail (extensive-margin scenario):\n")
+print(extensive_bucket)
 cat("\n")
 
-# ── 7. Chapter-level breakdown (within "below 15%" bucket) ───────────────────
 
-decomp_chapter <- hts10_projected |>
-  filter(bucket == "Below 15% \u2014 Section 122 adds margin") |>
+# ══════════════════════════════════════════════════════════════════════════════
+# E. Foregone Revenue from Section 122 Exemptions / Carve-Outs
+# ══════════════════════════════════════════════════════════════════════════════
+
+exempt_counterfactual <- hts10_base |>
+  filter(exempt) |>
+  mutate(
+    delta_tau_cf     = pmax(TAU_NEW - tau_eff, 0),
+    price_shock_cf   = PHI_PRIMARY * (delta_tau_cf / (1 + tau_eff)),
+    import_value_cf  = import_value * (1 + EPSILON_PRIMARY * price_shock_cf),
+    tau_eff_cf       = tau_eff + delta_tau_cf,
+    duties_cf        = import_value_cf * tau_eff_cf,
+    foregone_duties  = duties_cf - duties
+  )
+
+foregone_by_chapter <- exempt_counterfactual |>
   group_by(chapter) |>
+  summarise(
+    n_lines             = n(),
+    import_value_base   = sum(import_value),
+    duties_baseline     = sum(duties),
+    duties_counterfact  = sum(duties_cf),
+    foregone_revenue    = sum(foregone_duties),
+    tw_avg_etr          = weighted.mean(tau_eff, import_value),
+    simple_avg_etr      = mean(tau_eff),
+    share_below_15      = sum(import_value[tau_eff < TAU_NEW]) / sum(import_value),
+    .groups = "drop"
+  ) |>
+  arrange(desc(foregone_revenue))
+
+foregone_total <- sum(foregone_by_chapter$foregone_revenue)
+
+cat("══ E. Foregone Revenue from Section 122 Exemptions ═══════════\n")
+cat("Exempt chapters:", paste(EXEMPT_CHAPTERS, collapse = ", "), "\n")
+cat("Monthly foregone revenue:    ", fmt_dollar(foregone_total), "\n")
+cat("Annualized foregone:         ", fmt_dollar(foregone_total * 12), "\n")
+cat("150-day foregone:            ", fmt_dollar(foregone_total * 5), "\n\n")
+print(foregone_by_chapter)
+cat("\n")
+
+# Sensitivity grid for foregone revenue
+foregone_sensitivity <- cross_join(elasticity_scenarios, phi_scenarios) |>
+  mutate(
+    foregone = map2_dbl(epsilon, phi, function(eps, ph) {
+      hts10_base |>
+        filter(exempt) |>
+        mutate(
+          delta_tau_cf    = pmax(TAU_NEW - tau_eff, 0),
+          price_shock_cf  = ph * (delta_tau_cf / (1 + tau_eff)),
+          import_value_cf = import_value * (1 + eps * price_shock_cf),
+          duties_cf       = import_value_cf * (tau_eff + delta_tau_cf),
+          foregone        = duties_cf - duties
+        ) |>
+        pull(foregone) |>
+        sum()
+    }),
+    foregone_annual = foregone * 12,
+    foregone_150day = foregone * 5
+  )
+
+foregone_matrix <- foregone_sensitivity |>
+  select(epsilon_label, phi_label, foregone) |>
+  pivot_wider(names_from = phi_label, values_from = foregone)
+
+cat("Foregone revenue sensitivity (ε × φ), monthly:\n")
+print(foregone_matrix |>
+        mutate(across(-epsilon_label, fmt_dollar)))
+cat("\n")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# F. HTS-4 Breakdown Within Top Revenue-Gaining Chapters
+# ══════════════════════════════════════════════════════════════════════════════
+# Includes: trade-weighted ETR, simple-average ETR, delta_tau (marginal
+# rate increase), and Harberger decomposition at HTS-4 level.
+
+TOP_N_CHAPTERS <- 10
+
+top_chapters <- decomp_chapter |>
+  slice_head(n = TOP_N_CHAPTERS) |>
+  pull(chapter)
+
+hts4_decomp <- hts10_harberger |>
+  filter(
+    bucket == "Below 15% \u2014 Section 122 adds margin",
+    chapter %in% top_chapters
+  ) |>
+  mutate(hts4 = str_sub(hts, 1, 4)) |>
+  group_by(chapter, hts4) |>
   summarise(
     n_lines           = n(),
     import_value_base = sum(import_value),
+    import_value_proj = sum(import_value_proj),
     duties_baseline   = sum(duties),
     duties_projected  = sum(duties_proj),
     delta_duties      = sum(delta_duties),
+    rate_effect       = sum(rate_effect),
+    volume_effect     = sum(volume_effect),
+    tw_avg_etr_pre    = weighted.mean(tau_eff, import_value),
+    tw_avg_etr_post   = weighted.mean(tau_eff_proj, import_value_proj),
+    simple_avg_etr_pre  = mean(tau_eff),
+    simple_avg_etr_post = mean(tau_eff_proj),
+    tw_avg_delta_tau    = weighted.mean(delta_tau, import_value),
+    simple_avg_delta_tau = mean(delta_tau),
     .groups = "drop"
   ) |>
-  mutate(share_of_gain = delta_duties / sum(delta_duties)) |>
-  arrange(desc(delta_duties))
-
-cat("── Top 20 HTS Chapters Driving Revenue Gain ──────────────────\n")
-print(decomp_chapter |> slice_head(n = 20))
-cat("\n")
-
-# ── 8. Bucket decomposition sensitivity over ε × φ ───────────────────────────
-
-bucket_sensitivity <- cross_join(elasticity_scenarios, phi_scenarios) |>
   mutate(
-    results = map2(epsilon, phi, function(eps, ph) {
-      hts10_base |>
-        mutate(
-          bucket      = case_when(
-            exempt                          ~ "exempt",
-            tau_eff == 0                    ~ "zero",
-            tau_eff >= TAU_NEW              ~ "above",
-            tau_eff > 0 & tau_eff < TAU_NEW ~ "below"
-          ),
-          delta_tau         = if_else(exempt, 0, pmax(TAU_NEW - tau_eff, 0)),
-          price_shock       = ph * (delta_tau / (1 + tau_eff)),
-          import_value_proj = import_value * (1 + eps * price_shock),
-          duties_proj       = import_value_proj * (tau_eff + delta_tau),
-          delta_duties      = duties_proj - duties
-        ) |>
-        summarise(
-          total_delta_duties = sum(delta_duties),
-          below_delta        = sum(delta_duties[bucket == "below"]),
-          above_delta        = sum(delta_duties[bucket == "above"]),
-          exempt_delta       = sum(delta_duties[bucket == "exempt"])
-        )
-    })
+    share_of_chapter_gain = delta_duties / sum(delta_duties),
+    pct_volume_offset     = if_else(rate_effect != 0,
+                                     abs(volume_effect) / rate_effect * 100,
+                                     NA_real_)
   ) |>
-  unnest(results)
+  arrange(chapter, desc(delta_duties))
 
-cat("── Bucket Gain Sensitivity (\u03b5 \u00d7 \u03c6) ─────────────────────────────\n")
-print(bucket_sensitivity)
+cat("══ F. HTS-4 Breakdown: Top", TOP_N_CHAPTERS, "Chapters ══════════════════\n")
+cat("Lines where July 2025 ETR < 15% (Section 122 adds margin)\n")
+cat("Includes Harberger decomposition and dual ETR measures\n\n")
+
+for (ch in top_chapters) {
+  ch_data <- hts4_decomp |> filter(chapter == ch) |> slice_head(n = 10)
+  ch_gain <- sum(ch_data$delta_duties)
+  cat("Chapter ", ch, " — Top HTS-4 codes (total chapter gain: ",
+      fmt_dollar(ch_gain), "):\n", sep = "")
+  print(ch_data |>
+          select(hts4, n_lines, import_value_base, delta_duties,
+                 rate_effect, volume_effect,
+                 tw_avg_etr_pre, tw_avg_etr_post, tw_avg_delta_tau))
+  cat("\n")
+}
+
+# Top 30 HTS-4 codes overall
+hts4_top30 <- hts4_decomp |>
+  arrange(desc(delta_duties)) |>
+  slice_head(n = 30) |>
+  mutate(cumulative_share = cumsum(delta_duties) / sum(hts4_decomp$delta_duties))
+
+cat("── Top 30 HTS-4 Codes Overall by Revenue Gain ────────────────\n")
+print(hts4_top30 |>
+        select(chapter, hts4, n_lines, import_value_base, delta_duties,
+               rate_effect, volume_effect,
+               tw_avg_etr_pre, tw_avg_etr_post, cumulative_share))
 cat("\n")
 
-# ── 9. Illustrative long-run revenue scenarios ────────────────────────────────
-# Section 122 is capped at 150 days. The table below is explicitly illustrative:
-# it projects cumulative revenue under different assumptions about what authority
-# (if any) replaces Section 122 after expiry. These are NOT forecasts; they are
-# sensitivity scenarios for planning purposes only.
-#
-# Regime assumptions:
-#   A. Section 122 lapses after 150 days, no replacement → 0 incremental revenue
-#   B. Section 122 renewed/replaced at equivalent rate for full 10 years
-#   C. Partial replacement: equivalent authority in place for 50% of the decade
-#      (reflecting likely legal/political attrition over time)
-#
-# All scenarios use the primary ε and φ. Monthly projection scaled by number
-# of months active in each scenario.
 
-R_primary       <- project_revenue(EPSILON_PRIMARY, PHI_PRIMARY,
-                                   tau_baseline, TAU_NEW, R_baseline)$R_projected
-delta_R_monthly <- R_primary - R_baseline   # incremental monthly gain
+# ══════════════════════════════════════════════════════════════════════════════
+# G. Annualized and 10-Year Projections with Full ε × φ Sensitivity
+# ══════════════════════════════════════════════════════════════════════════════
 
-scenario_table <- tibble(
-  scenario = c(
-    "A. Section 122 lapses (150 days only)",
-    "B. Full replacement — 10 years at equivalent rate",
-    "C. Partial replacement — 50% of decade"
-  ),
-  months_active    = c(5, 120, 60),
-  assumption       = c(
-    "No successor authority; tariff reverts to 232-only baseline after day 150",
-    "Illustrative upper bound: Section 122 renewed or replaced by equivalent authority continuously",
-    "Illustrative midpoint: successor authority faces legal/political attrition, in effect ~half the decade"
-  )
-) |>
-  mutate(
-    cumulative_delta_revenue = delta_R_monthly * months_active,
-    cumulative_total_revenue = R_primary * months_active
-  )
-
-cat("── Illustrative Long-Run Revenue Scenarios (PLANNING ONLY) ───\n")
-cat("Primary parameters: \u03b5 =", EPSILON_PRIMARY, "(Boehm et al. 2023),",
-    "\u03c6 =", PHI_PRIMARY, "(Amiti et al. 2019)\n")
-cat("Monthly incremental gain over baseline: ", dollar(delta_R_monthly), "\n\n")
-print(
-  scenario_table |>
-    select(scenario, months_active, cumulative_delta_revenue,
-           cumulative_total_revenue, assumption) |>
-    mutate(
-      across(c(cumulative_delta_revenue, cumulative_total_revenue), dollar)
-    )
+horizons <- tribble(
+  ~horizon_label,                                         ~months,
+  "150-day (Section 122 statutory window)",                    5,
+  "Annual (12-month projection)",                             12,
+  "Partial replacement (50% of decade)",                      60,
+  "Full replacement (10-year illustrative upper bound)",     120
 )
-cat("\nNOTE: Scenarios B and C are purely illustrative. Section 122 expires\n")
-cat("after 150 days absent congressional extension. Any successor authority\n")
-cat("would require independent legal basis (e.g., Section 232 investigations\n")
-cat("currently underway for pharmaceuticals, semiconductors, etc.).\n\n")
 
-# ── 10. Visualizations ───────────────────────────────────────────────────────
-
-# 10a. Heatmap: revenue multiple across ε × φ
-p_heatmap <- grid |>
+longrun_grid <- cross_join(grid, horizons) |>
   mutate(
-    epsilon_label = fct_reorder(epsilon_label, epsilon),
-    phi_label     = fct_reorder(phi_label, phi)
+    cumulative_projected = R_projected * months,
+    cumulative_baseline  = R_baseline * months,
+    cumulative_delta     = delta_R_abs * months
   ) |>
-  ggplot(aes(x = phi_label, y = epsilon_label, fill = revenue_multiple)) +
-  geom_tile(color = "white", linewidth = 0.8) +
-  geom_text(aes(label = percent(revenue_multiple, accuracy = 0.1)),
-            size = 3.5, color = "white", fontface = "bold") +
-  scale_fill_gradient(
-    low    = "#5B9BD5",
-    high   = "#1F4E79",
-    name   = "R\u2081\u2085 / R\u2081\u2080",
-    labels = percent
-  ) +
+  select(
+    epsilon_label, epsilon,
+    phi_label, phi,
+    horizon_label, months,
+    monthly_projected = R_projected,
+    monthly_delta     = delta_R_abs,
+    cumulative_projected,
+    cumulative_baseline,
+    cumulative_delta
+  )
+
+longrun_summary <- longrun_grid |>
+  group_by(horizon_label, months) |>
+  summarise(
+    min_cumulative_delta = min(cumulative_delta),
+    max_cumulative_delta = max(cumulative_delta),
+    min_cumulative_total = min(cumulative_projected),
+    max_cumulative_total = max(cumulative_projected),
+    .groups = "drop"
+  ) |>
+  arrange(months)
+
+cat("══ G. Long-Run Projections ═══════════════════════════════════\n")
+cat("NOTE: Horizons beyond 150 days are purely illustrative.\n")
+cat("Section 122 expires after 150 days absent congressional action.\n\n")
+cat("Cumulative revenue ranges across all ε × φ combinations:\n")
+print(longrun_summary |>
+        mutate(across(starts_with("min_") | starts_with("max_"), fmt_dollar)))
+cat("\n")
+
+# Wide matrices per horizon
+horizon_matrices <- list()
+for (h in unique(longrun_grid$horizon_label)) {
+  mat <- longrun_grid |>
+    filter(horizon_label == h) |>
+    select(epsilon_label, phi_label, cumulative_projected) |>
+    pivot_wider(names_from = phi_label, values_from = cumulative_projected)
+  horizon_matrices[[h]] <- mat
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# H. Additional Visualizations
+# ══════════════════════════════════════════════════════════════════════════════
+
+# H1. Foregone revenue by exempt chapter
+p_foregone <- foregone_by_chapter |>
+  ggplot(aes(
+    x = fct_reorder(chapter, foregone_revenue),
+    y = foregone_revenue / 1e6
+  )) +
+  geom_col(fill = "#D4A017") +
+  coord_flip() +
+  scale_y_continuous(labels = label_comma()) +
   labs(
-    title    = "Revenue Multiple: 15% Section 122 vs. July 2025 Baseline",
-    subtitle = "Sensitivity to import demand elasticity (\u03b5) and pass-through (\u03c6)",
-    x        = "Pass-Through (\u03c6)",
-    y        = "Import Demand Elasticity (\u03b5)",
+    title    = "Monthly Foregone Revenue from Section 122 Exemptions",
+    subtitle = paste0(
+      "Counterfactual: exempt chapters (",
+      paste(EXEMPT_CHAPTERS, collapse = ", "),
+      ") subjected to 15% floor"
+    ),
+    x       = "HTS Chapter",
+    y       = "Foregone Monthly Duties (USD Millions)",
+    caption = paste0(
+      "\u03b5 = ", EPSILON_PRIMARY, "; \u03c6 = ", PHI_PRIMARY,
+      ". Baseline: July 2025."
+    )
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.caption = element_text(size = 8, color = "gray40"))
+
+# H2. Harberger decomposition — stacked bar by chapter
+harberger_plot_data <- harberger_chapter |>
+  slice_head(n = 15) |>
+  select(chapter, rate_effect, volume_effect) |>
+  pivot_longer(cols = c(rate_effect, volume_effect),
+               names_to = "component", values_to = "value") |>
+  mutate(
+    component = case_when(
+      component == "rate_effect"   ~ "Rate effect (mechanical gain)",
+      component == "volume_effect" ~ "Volume effect (demand offset)"
+    )
+  )
+
+p_harberger <- harberger_plot_data |>
+  ggplot(aes(
+    x    = fct_reorder(chapter, value, .fun = sum),
+    y    = value / 1e6,
+    fill = component
+  )) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c(
+    "Rate effect (mechanical gain)"  = "#1F4E79",
+    "Volume effect (demand offset)"  = "#C0392B"
+  )) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    title    = "Harberger Decomposition: Rate vs. Volume Effect by Chapter",
+    subtitle = "Top 15 chapters in the 'Below 15%' bucket",
+    x        = "HTS Chapter",
+    y        = "Monthly Duty Change (USD Millions)",
+    fill     = NULL,
     caption  = paste0(
-      "Baseline: July 2025. ",
-      "Sources: Amiti et al. (2019, JEP); Cavallo et al. (2021, AER);\n",
-      "Boehm et al. (2023, AER); Hooper, Johnson & Marquez (2000); ",
-      "Imbs & Mejean (2015, ReStud); Broda & Weinstein (2006, QJE)."
+      "\u03b5 = ", EPSILON_PRIMARY, "; \u03c6 = ", PHI_PRIMARY,
+      ". Rate effect = \u0394\u03c4 \u00d7 M_old; ",
+      "Volume effect = \u03c4_new \u00d7 \u0394M. Baseline: July 2025."
     )
   ) +
   theme_minimal(base_size = 12) +
   theme(
-    axis.text.x     = element_text(angle = 15, hjust = 1),
-    plot.caption    = element_text(size = 8, color = "gray40"),
-    legend.position = "right"
+    legend.position = "bottom",
+    plot.caption    = element_text(size = 8, color = "gray40")
   )
 
-# 10b. Bucket decomposition bar chart (primary ε and φ)
-p_bucket <- decomp_bucket |>
+# H3. Extensive margin comparison — paired bar
+p_extensive <- extensive_comparison |>
   ggplot(aes(
-    x    = fct_reorder(bucket, delta_duties),
-    y    = delta_duties / 1e6,
-    fill = bucket
+    x    = fct_rev(scenario),
+    y    = monthly_delta / 1e9,
+    fill = scenario
   )) +
-  geom_col(show.legend = FALSE) +
-  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_col(show.legend = FALSE, width = 0.6) +
   coord_flip() +
   scale_fill_manual(values = c(
-    "Below 15% \u2014 Section 122 adds margin" = "#1F4E79",
-    "At/above 15% \u2014 no Section 122 bite"  = "gray70",
-    "Zero-rated"                               = "gray90",
-    "Exempt \u2014 Section 122 carve-out"      = "#D4A017"
+    "Standard (uniform \u03b5)"                          = "#1F4E79",
+    "Extensive-margin (1.5\u00d7 \u03b5 for zero-rated)" = "#5B9BD5"
   )) +
   scale_y_continuous(labels = label_comma()) +
   labs(
-    title    = "Projected Duty Change by Tariff Bucket",
-    subtitle = "Section 122 at 15% vs. July 2025 effective rates",
-    x        = NULL,
-    y        = "Change in Monthly Duties (USD Millions)",
-    caption  = paste0(
-      "\u03b5 = ", EPSILON_PRIMARY, " (Boehm et al. 2023, short-run midpoint); ",
-      "\u03c6 = ", PHI_PRIMARY, " (Amiti et al. 2019). Baseline: July 2025."
-    )
-  ) +
-  theme_minimal(base_size = 12) +
-  theme(plot.caption = element_text(size = 8, color = "gray40"))
-
-# 10c. Top chapters driving the gain
-p_chapter <- decomp_chapter |>
-  slice_head(n = 15) |>
-  ggplot(aes(
-    x = fct_reorder(chapter, delta_duties),
-    y = delta_duties / 1e6
-  )) +
-  geom_col(fill = "#1F4E79") +
-  coord_flip() +
-  scale_y_continuous(labels = label_comma()) +
-  labs(
-    title    = "Top HTS Chapters Driving Section 122 Revenue Gain",
-    subtitle = "Lines with July 2025 ETR below 15% only",
-    x        = "HTS Chapter",
-    y        = "Projected Duty Gain (USD Millions)",
-    caption  = paste0(
-      "\u03b5 = ", EPSILON_PRIMARY, " (Boehm et al. 2023); ",
-      "\u03c6 = ", PHI_PRIMARY, " (Amiti et al. 2019). Baseline: July 2025."
-    )
-  ) +
-  theme_minimal(base_size = 12) +
-  theme(plot.caption = element_text(size = 8, color = "gray40"))
-
-# 10d. Faceted bar: bucket gain sensitivity across φ scenarios
-#     (primary elasticity, varying phi)
-p_bucket_phi <- phi_scenarios |>
-  mutate(
-    bucket_data = map(phi, function(ph) {
-      hts10_base |>
-        mutate(
-          bucket      = case_when(
-            exempt                          ~ "Exempt",
-            tau_eff == 0                    ~ "Zero-rated",
-            tau_eff >= TAU_NEW              ~ "At/above 15%",
-            tau_eff > 0 & tau_eff < TAU_NEW ~ "Below 15%"
-          ),
-          delta_tau         = if_else(exempt, 0, pmax(TAU_NEW - tau_eff, 0)),
-          price_shock       = ph * (delta_tau / (1 + tau_eff)),
-          import_value_proj = import_value * (1 + EPSILON_PRIMARY * price_shock),
-          duties_proj       = import_value_proj * (tau_eff + delta_tau),
-          delta_duties      = duties_proj - duties
-        ) |>
-        group_by(bucket) |>
-        summarise(delta_duties = sum(delta_duties), .groups = "drop")
-    })
-  ) |>
-  unnest(bucket_data) |>
-  ggplot(aes(
-    x    = fct_reorder(bucket, delta_duties),
-    y    = delta_duties / 1e6,
-    fill = bucket
-  )) +
-  geom_col(show.legend = FALSE) +
-  coord_flip() +
-  facet_wrap(~phi_label, ncol = 1) +
-  scale_fill_manual(values = c(
-    "Below 15%"    = "#1F4E79",
-    "At/above 15%" = "gray70",
-    "Zero-rated"   = "gray90",
-    "Exempt"       = "#D4A017"
-  )) +
-  scale_y_continuous(labels = label_comma()) +
-  labs(
-    title    = "Bucket Revenue Gain by Pass-Through Scenario",
+    title    = "Impact of Extensive-Margin Adjustment on Revenue Projection",
     subtitle = paste0(
-      "\u03b5 = ", EPSILON_PRIMARY,
-      " (Boehm et al. 2023, short-run midpoint). Baseline: July 2025."
+      "Zero-rated lines: \u03b5 = ",
+      EPSILON_PRIMARY * ZERO_RATE_ELAST_MULTIPLIER,
+      " vs. uniform \u03b5 = ", EPSILON_PRIMARY
     ),
     x = NULL,
-    y = "Change in Monthly Duties (USD Millions)"
+    y = "Monthly Incremental Revenue (USD Billions)",
+    caption = paste0(
+      "Zero-rated elasticity multiplier: ", ZERO_RATE_ELAST_MULTIPLIER,
+      "\u00d7. \u03c6 = ", PHI_PRIMARY, ". Baseline: July 2025."
+    )
   ) +
-  theme_minimal(base_size = 11) +
-  theme(strip.text = element_text(face = "bold"))
+  theme_minimal(base_size = 12) +
+  theme(plot.caption = element_text(size = 8, color = "gray40"))
 
-# ── 11. Print plots ───────────────────────────────────────────────────────────
+print(p_foregone)
+print(p_harberger)
+print(p_extensive)
 
-print(p_heatmap)
-print(p_bucket)
-print(p_chapter)
-print(p_bucket_phi)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# I. Export: CSV + Optional Multi-Sheet xlsx
+# ══════════════════════════════════════════════════════════════════════════════
+
+# I1. CSV exports ─────────────────────────────────────────────────────────────
+
+exports <- list(
+  "01_baseline_summary"             = baseline_summary,
+  "02_sensitivity_grid"             = grid |>
+    mutate(R_projected_annual = R_projected * 12,
+           delta_R_abs_annual = delta_R_abs * 12,
+           revenue_10yr       = R_projected * 120),
+  "03_revenue_matrix_wide"          = revenue_matrix |>
+    left_join(elasticity_scenarios |> select(epsilon_label, epsilon),
+              by = "epsilon_label"),
+  "04_bucket_decomposition"         = decomp_bucket,
+  "05_chapter_decomposition"        = decomp_chapter,
+  "06_harberger_by_bucket"          = harberger_bucket,
+  "07_harberger_by_chapter"         = harberger_chapter,
+  "08_concentration_summary"        = concentration_summary,
+  "09_concentration_cumulative"     = concentration,
+  "10_extensive_margin_comparison"  = extensive_comparison,
+  "11_extensive_margin_buckets"     = extensive_bucket,
+  "12_foregone_by_chapter"          = foregone_by_chapter,
+  "13_foregone_sensitivity"         = foregone_sensitivity,
+  "14_foregone_matrix_wide"         = foregone_matrix,
+  "15_bucket_sensitivity"           = bucket_sensitivity,
+  "16_scenario_table"               = scenario_table,
+  "17_hts4_top_chapters"            = hts4_decomp,
+  "18_hts4_top30_overall"           = hts4_top30,
+  "19_longrun_full_grid"            = longrun_grid,
+  "20_longrun_summary"              = longrun_summary
+)
+
+# Write horizon matrices
+for (h in names(horizon_matrices)) {
+  safe_name <- str_replace_all(tolower(h), "[^a-z0-9]+", "_") |>
+    str_remove("_$")
+  key <- paste0("21_matrix_", safe_name)
+  exports[[key]] <- horizon_matrices[[h]]
+}
+
+walk2(names(exports), exports, function(nm, df) {
+  write_csv(df, file.path(export_dir, paste0(nm, ".csv")))
+})
+
+# I2. Multi-sheet xlsx (optional) ─────────────────────────────────────────────
+
+if (requireNamespace("openxlsx", quietly = TRUE)) {
+  library(openxlsx)
+
+  wb <- createWorkbook()
+
+  # Clean sheet names (max 31 chars for Excel)
+  sheet_map <- list(
+    "Baseline Summary"         = baseline_summary,
+    "Sensitivity Grid"         = exports[["02_sensitivity_grid"]],
+    "Revenue Matrix"           = exports[["03_revenue_matrix_wide"]],
+    "Bucket Decomposition"     = decomp_bucket,
+    "Chapter Decomposition"    = decomp_chapter,
+    "Harberger by Bucket"      = harberger_bucket,
+    "Harberger by Chapter"     = harberger_chapter,
+    "Concentration"            = concentration_summary,
+    "Extensive Margin"         = extensive_comparison,
+    "Foregone by Chapter"      = foregone_by_chapter,
+    "Foregone Sensitivity"     = foregone_sensitivity,
+    "Bucket Sensitivity"       = bucket_sensitivity,
+    "Scenario Table"           = scenario_table,
+    "HTS-4 Top Chapters"      = hts4_decomp,
+    "HTS-4 Top 30"             = hts4_top30,
+    "Long-Run Grid"            = longrun_grid,
+    "Long-Run Summary"         = longrun_summary
+  )
+
+  bold_style <- createStyle(textDecoration = "bold", halign = "center")
+
+  for (nm in names(sheet_map)) {
+    df <- sheet_map[[nm]]
+    addWorksheet(wb, nm)
+    writeData(wb, nm, df)
+    setColWidths(wb, nm, cols = seq_len(ncol(df)), widths = "auto")
+    addStyle(wb, nm, style = bold_style,
+             rows = 1, cols = seq_len(ncol(df)), gridExpand = TRUE)
+  }
+
+  xlsx_path <- file.path(export_dir, "section122_projection_tables.xlsx")
+  saveWorkbook(wb, xlsx_path, overwrite = TRUE)
+  cat("Workbook saved:", xlsx_path, "\n\n")
+
+} else {
+  cat("{openxlsx} not installed — CSV exports only.\n")
+  cat("Install with: install.packages('openxlsx')\n\n")
+}
+
+# I3. Manifest ────────────────────────────────────────────────────────────────
+
+cat("══ Exported Tables ═══════════════════════════════════════════\n")
+cat("Directory:", normalizePath(export_dir), "\n")
+list.files(export_dir, pattern = "\\.(csv|xlsx)$") |>
+  walk(~ cat("  ", .x, "\n"))
+cat("\n")
