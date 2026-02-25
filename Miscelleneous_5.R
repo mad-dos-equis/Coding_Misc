@@ -1,65 +1,38 @@
-# ── 6b. Aggregate projected ETR ──────────────────────────────────────────────
-# Trade-weighted ETR under Section 122, using projected import values as weights.
-# This is the effective rate the economy actually faces, not the statutory 15%.
+# ── 6c. Projected ETR sensitivity over ε × φ ────────────────────────────────
 
-M_proj_total   <- sum(hts10_projected$import_value_proj)
-R_proj_total   <- sum(hts10_projected$duties_proj)
-tau_proj_tw    <- R_proj_total / M_proj_total
+etr_sensitivity <- cross_join(elasticity_scenarios, phi_scenarios) |>
+  mutate(
+    etr_result = map2(epsilon, phi, function(eps, ph) {
+      proj <- hts10_base |>
+        mutate(
+          delta_tau         = if_else(exempt, 0, pmax(TAU_NEW - tau_eff, 0)),
+          price_shock       = ph * (delta_tau / (1 + tau_eff)),
+          import_value_proj = import_value * (1 + eps * price_shock),
+          tau_eff_proj      = tau_eff + delta_tau,
+          duties_proj       = import_value_proj * tau_eff_proj
+        )
+      tibble(
+        tw_etr_proj_paasche   = sum(proj$duties_proj) / sum(proj$import_value_proj),
+        tw_etr_proj_laspeyres = sum(proj$tau_eff_proj * proj$import_value) / sum(proj$import_value),
+        R_projected           = sum(proj$duties_proj),
+        M_projected           = sum(proj$import_value_proj)
+      )
+    })
+  ) |>
+  unnest(etr_result)
 
-# Also compute using baseline import weights (Laspeyres-style) for comparison
-R_proj_laspeyres <- sum(hts10_projected$tau_eff_proj * hts10_projected$import_value)
-tau_proj_laspeyres <- R_proj_laspeyres / M_baseline
+etr_matrix_paasche <- etr_sensitivity |>
+  select(epsilon_label, phi_label, tw_etr_proj_paasche) |>
+  pivot_wider(names_from = phi_label, values_from = tw_etr_proj_paasche)
 
-# By-bucket projected ETRs
-etr_by_bucket <- hts10_projected |>
-  group_by(bucket) |>
-  summarise(
-    import_value_base = sum(import_value),
-    import_value_proj = sum(import_value_proj),
-    duties_base       = sum(duties),
-    duties_proj       = sum(duties_proj),
-    tw_etr_base       = sum(duties) / sum(import_value),
-    tw_etr_proj       = sum(duties_proj) / sum(import_value_proj),
-    tw_etr_proj_laspeyres = sum(tau_eff_proj * import_value) / sum(import_value),
-    .groups = "drop"
-  )
+etr_matrix_laspeyres <- etr_sensitivity |>
+  select(epsilon_label, phi_label, tw_etr_proj_laspeyres) |>
+  pivot_wider(names_from = phi_label, values_from = tw_etr_proj_laspeyres)
 
-# Summary table
-etr_summary <- tibble(
-  metric = c(
-    "Baseline trade-weighted ETR",
-    "Projected trade-weighted ETR (Paasche — projected weights)",
-    "Projected trade-weighted ETR (Laspeyres — baseline weights)",
-    "Statutory Section 122 rate",
-    "ETR increase (Paasche)",
-    "ETR increase (Laspeyres)"
-  ),
-  value = c(
-    tau_baseline,
-    tau_proj_tw,
-    tau_proj_laspeyres,
-    TAU_NEW,
-    tau_proj_tw - tau_baseline,
-    tau_proj_laspeyres - tau_baseline
-  ),
-  formatted = c(
-    fmt_pct(tau_baseline),
-    fmt_pct(tau_proj_tw),
-    fmt_pct(tau_proj_laspeyres),
-    fmt_pct(TAU_NEW),
-    fmt_pct(tau_proj_tw - tau_baseline),
-    fmt_pct(tau_proj_laspeyres - tau_baseline)
-  )
-)
-
-cat("══ Aggregate Effective Tariff Rate Comparison ════════════════\n")
-cat("ε =", EPSILON_PRIMARY, ", φ =", PHI_PRIMARY, "\n\n")
-cat("Baseline trade-weighted ETR:       ", fmt_pct(tau_baseline), "\n")
-cat("Projected ETR (Paasche weights):   ", fmt_pct(tau_proj_tw), "\n")
-cat("Projected ETR (Laspeyres weights): ", fmt_pct(tau_proj_laspeyres), "\n")
-cat("Statutory Section 122 rate:        ", fmt_pct(TAU_NEW), "\n")
-cat("ETR increase (Paasche):            ", fmt_pct(tau_proj_tw - tau_baseline), "\n")
-cat("ETR increase (Laspeyres):          ", fmt_pct(tau_proj_laspeyres - tau_baseline), "\n\n")
-cat("By bucket:\n")
-print(etr_by_bucket)
+cat("══ Projected Trade-Weighted ETR Sensitivity ══════════════════\n")
+cat("Baseline ETR:", fmt_pct(tau_baseline), "\n\n")
+cat("Paasche (projected import weights):\n")
+print(etr_matrix_paasche |> mutate(across(-epsilon_label, fmt_pct)))
+cat("\nLaspeyres (baseline import weights):\n")
+print(etr_matrix_laspeyres |> mutate(across(-epsilon_label, fmt_pct)))
 cat("\n")
