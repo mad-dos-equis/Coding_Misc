@@ -337,6 +337,7 @@ cat("\n")
 
 decomp_chapter <- hts10_projected |>
   filter(bucket == "Below 15% \u2014 Section 122 adds margin") |>
+  mutate(import_value_proj = pmax(import_value_proj, 0)) |>
   group_by(chapter) |>
   summarise(
     n_lines             = n(),
@@ -345,7 +346,7 @@ decomp_chapter <- hts10_projected |>
     duties_projected    = sum(duties_proj),
     delta_duties        = sum(delta_duties),
     tw_avg_etr_pre      = weighted.mean(tau_eff, import_value),
-    tw_avg_etr_post     = weighted.mean(tau_eff_proj, import_value_proj),
+    tw_avg_etr_post     = weighted.mean(tau_eff_proj, import_value),
     simple_avg_etr_pre  = mean(tau_eff),
     simple_avg_etr_post = mean(tau_eff_proj),
     tw_avg_delta_tau    = weighted.mean(delta_tau, import_value),
@@ -409,7 +410,10 @@ hts4_decomp <- hts10_harberger |>
     bucket == "Below 15% \u2014 Section 122 adds margin",
     chapter %in% top_chapters
   ) |>
-  mutate(hts4 = str_sub(hts, 1, 4)) |>
+  mutate(
+    hts4              = str_sub(hts, 1, 4),
+    import_value_proj = pmax(import_value_proj, 0)   # clamp to prevent negatives
+  ) |>
   group_by(chapter, hts4) |>
   summarise(
     n_lines              = n(),
@@ -421,7 +425,7 @@ hts4_decomp <- hts10_harberger |>
     rate_effect          = sum(rate_effect),
     volume_effect        = sum(volume_effect),
     tw_avg_etr_pre       = weighted.mean(tau_eff, import_value),
-    tw_avg_etr_post      = weighted.mean(tau_eff_proj, import_value_proj),
+    tw_avg_etr_post      = weighted.mean(tau_eff_proj, import_value),
     simple_avg_etr_pre   = mean(tau_eff),
     simple_avg_etr_post  = mean(tau_eff_proj),
     tw_avg_delta_tau     = weighted.mean(delta_tau, import_value),
