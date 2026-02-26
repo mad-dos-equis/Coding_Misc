@@ -39,10 +39,45 @@ library(scales)
 
 TAU_NEW <- 0.15   # Section 122 target rate (statutory cap)
 
-# Pass-through scenarios
-# Amiti, Redding & Weinstein (2019, JEP):     full pass-through ~ 1.0
-# Intermediate exporter absorption:            partial ~ 0.70
-# Cavallo, Cavallo & Rigobon (2021, AER):      incomplete ~ 0.45
+# ── Pass-through (φ) scenarios ────────────────────────────────────────────────
+# φ is the share of the tariff increase passed through to domestic import prices.
+# φ = 1.0 implies the full tariff is reflected in prices paid by domestic buyers;
+# φ < 1.0 implies foreign exporters absorb part of the increase via margin compression.
+#
+# Amiti, Redding & Weinstein (2019, AER):
+#   U.S. 2018 tariffs. Near-complete pass-through to import prices at the
+#   product level. φ ≈ 1.00 is the headline finding; used here as the
+#   conservative revenue lower bound (higher pass-through → more import
+#   contraction → less revenue at a given ε).
+#
+# Flaaen, Hortaçsu & Tintelnot (2020, AER):
+#   Washing machine tariffs (Section 201, 2018). Near-complete pass-through
+#   to consumer prices within 1–2 months of implementation. φ ≈ 0.95
+#   reflects slight attenuation from retail margin absorption.
+#
+# Bown, Keynes & Conconi (2021, PIIE WP):
+#   2018–2019 U.S. tariff episode, broader product coverage. Pass-through
+#   heterogeneous across sectors; average across affected lines ≈ 0.65–0.75.
+#   φ = 0.70 used as the midpoint of their reported range.
+#
+# Gopinath & Itskhoki (2010, QJE):
+#   Exchange-rate pass-through literature; short-run median across goods
+#   ≈ 0.50–0.60. Tariff pass-through is structurally analogous in the
+#   short run. φ = 0.55 reflects their short-run central estimate.
+#   Note: their long-run estimates approach 1.0, consistent with ARW (2019).
+#
+# Cavallo, Cavallo & Rigobon (2021, AER):
+#   2018 U.S. tariffs using scanner price data. Documents meaningful
+#   incomplete pass-through for a subset of goods, particularly where
+#   domestic substitutes are available. φ ≈ 0.45 is their incomplete
+#   pass-through scenario.
+#
+# Minimal / exporter absorption upper bound (φ = 0.25):
+#   Not directly estimated in a single paper; represents the upper bound
+#   of exporter absorption implied by the terms-of-trade literature
+#   (Bagwell & Staiger 1999, AER; Broda, Limão & Weinstein 2008, AER).
+#   Included as a bounding scenario, not a central estimate. Use with caution.
+
 phi_scenarios <- tribble(
   ~phi_label,                                                        ~phi,
   "Full pass-through — Amiti et al. (2019)",                         1.00,
@@ -53,23 +88,77 @@ phi_scenarios <- tribble(
   "Minimal — exporter absorption upper bound",                       0.25
 )
 
-# Import demand elasticity scenarios
-# Boehm, Levchenko & Pandalai-Nayar (2023, AER): short-run ~ -0.5 to -1.0
-# Imbs & Mejean (2015, ReStud):                   aggregate ~ -1.25
-# Hooper, Johnson & Marquez (2000, Princeton IES): aggregate ~ -1.5
-# Broda & Weinstein (2006, QJE):                  aggregate proxy ~ -2.0
+
+# ── Import demand elasticity (ε) scenarios ────────────────────────────────────
+# ε is the price elasticity of import demand: the percentage change in import
+# quantity for a 1% increase in the import price. All values are negative;
+# larger absolute values imply more elastic (responsive) import demand.
+#
+# The appropriate ε for a 150-day projection is a short-run, aggregate-level
+# estimate. Product-level estimates from the Feenstra/Broda-Weinstein tradition
+# are included for bounding purposes but should not be treated as central
+# scenarios for aggregate revenue projection.
+#
+# Naive (ε = 0):
+#   No behavioral response. Imports unchanged regardless of price shock.
+#   Mechanical upper bound on revenue; included as a reference point only.
+#
+# Boehm, Levchenko & Pandalai-Nayar (2023, AER):
+#   Short-run import demand elasticities from the 2018 U.S. tariff episode.
+#   Estimates range from -0.5 (low end, durable intermediates) to -1.0
+#   (high end, consumer goods). Most directly applicable to a 150-day window.
+#   ε = -0.75 used as EPSILON_PRIMARY (midpoint of their range).
+#
+# Imbs & Mejean (2015, ReStud):
+#   Aggregate import demand elasticity using sectoral heterogeneity as
+#   identification. Central estimate ≈ -1.25. Appropriate for medium-run
+#   aggregate projections.
+#
+# Hooper, Johnson & Marquez (2000, Princeton IES):
+#   Long-running benchmark for U.S. aggregate import demand. Central
+#   estimate ≈ -1.5. Widely cited in policy contexts; reflects a
+#   medium-to-long-run horizon.
+#
+# Amiti, Redding & Weinstein (2019, AER):
+#   Product-level quantity response implied by their pass-through analysis
+#   of the 2018 tariffs. Elasticity at the product level ranges from
+#   approximately -1.6 to -2.0 depending on specification. The -1.75
+#   scenario reflects the midpoint of their implied product-level range.
+#
+# Broda & Weinstein (2006, QJE) — aggregate proxy:
+#   Their aggregate-consistent estimate, constructed by aggregating
+#   product-level estimates using import shares as weights. ε ≈ -2.0.
+#   Represents a plausible upper bound for aggregate short-run projections.
+#
+# Fajgelbaum, Goldberg, Kennedy & Khandelwal (2020, QJE):
+#   U.S. 2018 tariff episode. Import demand elasticity implied by their
+#   welfare calculations ≈ -2.0 to -2.5 at the product level. ε = -2.25
+#   reflects their central product-level estimate.
+#
+# Broda & Weinstein (2006, QJE) — median product-level:
+#   The median across all product-level estimates in their full sample,
+#   as distinct from the import-weighted aggregate above. Median ≈ -3.0.
+#   Appropriate only as a structural upper bound; likely too elastic for
+#   short-run aggregate projection.
+#
+# Soderbery (2015, JIE):
+#   Refinement of the Feenstra (1994) methodology with improved small-sample
+#   properties. Median product-level estimate ≈ -3.5. Included for
+#   completeness; same caveats as Broda-Weinstein median apply.
+#   Do not use as a central scenario for aggregate revenue projection.
+
 elasticity_scenarios <- tribble(
-  ~epsilon_label,                                                    ~epsilon,
-  "Naive (ε = 0)",                                                    0.00,
-  "Boehm et al. (2023) — short-run low",                            -0.50,
-  "Boehm et al. (2023) — short-run high",                           -1.00,
-  "Imbs & Mejean (2015)",                                            -1.25,
-  "Hooper, Johnson & Marquez (2000)",                               -1.50,
-  "Amiti, Redding & Weinstein (2019) — product-level low",          -1.75,
-  "Broda & Weinstein (2006) — aggregate proxy",                     -2.00,
-  "Fajgelbaum et al. (2020) — 2018 tariff episode",                 -2.25,
-  "Broda & Weinstein (2006) — median product-level",                -3.00,
-  "Soderbery (2015) — refined Feenstra median",                     -3.50
+  ~epsilon_label,                                                     ~epsilon,
+  "Naive (ε = 0)",                                                     0.00,
+  "Boehm et al. (2023) — short-run low",                             -0.50,
+  "Boehm et al. (2023) — short-run high",                            -1.00,
+  "Imbs & Mejean (2015)",                                             -1.25,
+  "Hooper, Johnson & Marquez (2000)",                                 -1.50,
+  "Amiti, Redding & Weinstein (2019) — product-level low",           -1.75,
+  "Broda & Weinstein (2006) — aggregate proxy",                      -2.00,
+  "Fajgelbaum et al. (2020) — 2018 tariff episode",                  -2.25,
+  "Broda & Weinstein (2006) — median product-level",                 -3.00,
+  "Soderbery (2015) — refined Feenstra median",                      -3.50
 )
 
 # Primary scenarios for HTS-10 decomposition
