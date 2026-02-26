@@ -44,10 +44,13 @@ TAU_NEW <- 0.15   # Section 122 target rate (statutory cap)
 # Intermediate exporter absorption:            partial ~ 0.70
 # Cavallo, Cavallo & Rigobon (2021, AER):      incomplete ~ 0.45
 phi_scenarios <- tribble(
-  ~phi_label,                                               ~phi,
-  "Full pass-through \u2014 Amiti et al. (2019)",           1.00,
-  "Partial pass-through \u2014 exporter absorption",        0.70,
-  "Incomplete pass-through \u2014 Cavallo et al. (2021)",   0.45
+  ~phi_label,                                                        ~phi,
+  "Full pass-through — Amiti et al. (2019)",                         1.00,
+  "Full pass-through — Flaaen, Hortaçsu & Tintelnot (2020)",        0.95,
+  "Partial — Bown et al. (2021), 2018 tariff average",              0.70,
+  "Partial — Gopinath & Itskhoki (2010), short-run median",         0.55,
+  "Incomplete — Cavallo, Cavallo & Rigobon (2021)",                  0.45,
+  "Minimal — exporter absorption upper bound",                       0.25
 )
 
 # Import demand elasticity scenarios
@@ -56,13 +59,17 @@ phi_scenarios <- tribble(
 # Hooper, Johnson & Marquez (2000, Princeton IES): aggregate ~ -1.5
 # Broda & Weinstein (2006, QJE):                  aggregate proxy ~ -2.0
 elasticity_scenarios <- tribble(
-  ~epsilon_label,                                            ~epsilon,
-  "Naive (\u03b5 = 0)",                                      0.00,
-  "Boehm et al. (2023) \u2014 short-run low",               -0.50,
-  "Boehm et al. (2023) \u2014 short-run high",              -1.00,
-  "Imbs & Mejean (2015)",                                    -1.25,
-  "Hooper, Johnson & Marquez (2000)",                        -1.50,
-  "Broda & Weinstein (2006)",                                -2.00
+  ~epsilon_label,                                                    ~epsilon,
+  "Naive (ε = 0)",                                                    0.00,
+  "Boehm et al. (2023) — short-run low",                            -0.50,
+  "Boehm et al. (2023) — short-run high",                           -1.00,
+  "Imbs & Mejean (2015)",                                            -1.25,
+  "Hooper, Johnson & Marquez (2000)",                               -1.50,
+  "Amiti, Redding & Weinstein (2019) — product-level low",          -1.75,
+  "Broda & Weinstein (2006) — aggregate proxy",                     -2.00,
+  "Fajgelbaum et al. (2020) — 2018 tariff episode",                 -2.25,
+  "Broda & Weinstein (2006) — median product-level",                -3.00,
+  "Soderbery (2015) — refined Feenstra median",                     -3.50
 )
 
 # Primary scenarios for HTS-10 decomposition
