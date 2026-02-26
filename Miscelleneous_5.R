@@ -16,6 +16,7 @@
 #    6. HTS-10 line-level projection (primary ε and φ)
 #   6b. Aggregate projected ETR (primary ε and φ)
 #   6c. Projected ETR sensitivity over ε × φ
+#   6d. ETR for Section 122-affected lines only
 #    7. Harberger decomposition: rate effect vs. volume effect
 #    8. Bucket decomposition
 #    9. Concentration metrics
@@ -425,6 +426,164 @@ cat("\nLaspeyres (baseline import weights):\n")
 cat("  Mechanical ETR assuming no change in import quantities.\n")
 cat("  Constant across \u03b5 and \u03c6 because \u03b4\u03c4 is independent of both.\n")
 print(etr_matrix_laspeyres |> mutate(across(-epsilon_label, fmt_pct)))
+cat("\n")
+
+
+# ── 6d. ETR for Section 122-affected lines only ─────────────────────────────
+#
+# WHY THIS MATTERS
+# ────────────────
+# Sections 6b and 6c compute the aggregate ETR across *all* goods, including
+# lines that Section 122 doesn't touch (exempt chapters and lines already at
+# or above 15%). Those unaffected lines add noise when trying to assess what
+# Section 122 itself actually does.
+#
+# This section isolates the lines where Section 122 has bite — the "zero-rated"
+# and "below 15%" buckets where δτ > 0 and the line is not exempt. These are
+# the goods whose rates are actually being raised to the 15% floor. Computing
+# the ETR on just this subset gives the cleanest comparison to the statutory
+# rate:
+#
+#   - The LASPEYRES ETR for this subset will sit at or very near 15%, since
+#     every affected line is being raised to exactly 15%. (Minor deviations
+#     can occur from rounding or lines with compound rates.)
+#
+#   - The PAASCHE ETR will come in *below* 15% at nontrivial elasticities.
+#     Why? Lines with the biggest rate shocks (e.g., zero-rated goods going
+#     from 0% to 15%) contract the most in import volume, shrinking their
+#     weight relative to lines with smaller shocks (e.g., 12% going to 15%).
+#     Since the rate is the same (15%) on all affected lines but volume shifts
+#     away from high-shock lines, the weighted average stays at 15% — but the
+#     revenue collected on the *reduced* import base is less than the Laspeyres
+#     would imply.
+#
+# The gap between Laspeyres and Paasche on this subset is a direct,
+# uncontaminated measure of how much demand response erodes the effective
+# rate on goods Section 122 is designed to hit. This is the behavioral
+# discount that should be applied when projecting incremental revenue from
+# the policy.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Filter to Section 122-affected lines only
+hts10_s122_affected <- hts10_projected |>
+  filter(delta_tau > 0, !exempt)
+
+# Primary scenario ETRs
+M_s122_base       <- sum(hts10_s122_affected$import_value)
+M_s122_proj       <- sum(hts10_s122_affected$import_value_proj)
+R_s122_base       <- sum(hts10_s122_affected$duties)
+R_s122_proj       <- sum(hts10_s122_affected$duties_proj)
+
+tau_s122_base           <- R_s122_base / M_s122_base
+tau_s122_paasche        <- R_s122_proj / M_s122_proj
+tau_s122_laspeyres      <- sum(hts10_s122_affected$tau_eff_proj *
+                               hts10_s122_affected$import_value) / M_s122_base
+tau_s122_behavioral_gap <- tau_s122_laspeyres - tau_s122_paasche
+
+# Summary table
+etr_s122_summary <- tibble(
+  metric = c(
+    "Baseline ETR (Section 122-affected lines only)",
+    "Projected ETR \u2014 Laspeyres (statutory benchmark)",
+    "Projected ETR \u2014 Paasche (after demand adjustment)",
+    "Statutory Section 122 rate",
+    "ETR increase (Paasche)",
+    "ETR increase (Laspeyres)",
+    "Behavioral erosion (Laspeyres \u2212 Paasche)",
+    "Paasche ETR as share of statutory rate",
+    "N affected HTS-10 lines",
+    "Affected import value (baseline)",
+    "Affected import value (projected)"
+  ),
+  value = c(
+    tau_s122_base,
+    tau_s122_laspeyres,
+    tau_s122_paasche,
+    TAU_NEW,
+    tau_s122_paasche - tau_s122_base,
+    tau_s122_laspeyres - tau_s122_base,
+    tau_s122_behavioral_gap,
+    tau_s122_paasche / TAU_NEW,
+    nrow(hts10_s122_affected),
+    M_s122_base,
+    M_s122_proj
+  ),
+  formatted = c(
+    fmt_pct(tau_s122_base),
+    fmt_pct(tau_s122_laspeyres),
+    fmt_pct(tau_s122_paasche),
+    fmt_pct(TAU_NEW),
+    fmt_pct(tau_s122_paasche - tau_s122_base),
+    fmt_pct(tau_s122_laspeyres - tau_s122_base),
+    fmt_pct(tau_s122_behavioral_gap),
+    fmt_pct(tau_s122_paasche / TAU_NEW),
+    comma(nrow(hts10_s122_affected)),
+    fmt_dollar(M_s122_base),
+    fmt_dollar(M_s122_proj)
+  )
+)
+
+cat("══ ETR for Section 122-Affected Lines Only ═══════════════════\n")
+cat("\u03b5 =", EPSILON_PRIMARY, ", \u03c6 =", PHI_PRIMARY, "\n\n")
+cat("This isolates lines where Section 122 actually raises the rate\n")
+cat("(\u03b4\u03c4 > 0, non-exempt). The Laspeyres ETR benchmarks against the\n")
+cat("statutory 15%; the Paasche shows what importers actually face\n")
+cat("after adjusting their purchasing behavior.\n\n")
+cat("N affected lines:                   ", comma(nrow(hts10_s122_affected)), "\n")
+cat("Affected import value (baseline):   ", fmt_dollar(M_s122_base), "\n")
+cat("Affected import value (projected):  ", fmt_dollar(M_s122_proj), "\n")
+cat("Import contraction:                 ", fmt_pct((M_s122_proj / M_s122_base) - 1), "\n\n")
+cat("Baseline ETR (affected lines):      ", fmt_pct(tau_s122_base), "\n")
+cat("Laspeyres ETR (statutory benchmark):", fmt_pct(tau_s122_laspeyres), "\n")
+cat("Paasche ETR (after demand response):", fmt_pct(tau_s122_paasche), "\n")
+cat("Statutory Section 122 rate:         ", fmt_pct(TAU_NEW), "\n")
+cat("Behavioral erosion of ETR:          ", fmt_pct(tau_s122_behavioral_gap), "\n")
+cat("  \u2192 Demand contraction on high-shock lines reduces the effective\n")
+cat("    rate by this amount relative to the statutory benchmark.\n\n")
+
+# Sensitivity across ε × φ for affected lines only
+etr_s122_sensitivity <- cross_join(elasticity_scenarios, phi_scenarios) |>
+  mutate(
+    etr_result = map2(epsilon, phi, function(eps, ph) {
+      proj <- hts10_base |>
+        mutate(
+          delta_tau         = if_else(exempt, 0, pmax(TAU_NEW - tau_eff, 0)),
+          price_shock       = ph * (delta_tau / (1 + tau_eff)),
+          import_value_proj = import_value * (1 + eps * price_shock),
+          tau_eff_proj      = tau_eff + delta_tau,
+          duties_proj       = import_value_proj * tau_eff_proj
+        ) |>
+        filter(delta_tau > 0, !exempt)
+
+      tibble(
+        tw_etr_s122_paasche   = sum(proj$duties_proj) / sum(proj$import_value_proj),
+        tw_etr_s122_laspeyres = sum(proj$tau_eff_proj * proj$import_value) / sum(proj$import_value),
+        R_s122_projected      = sum(proj$duties_proj),
+        M_s122_projected      = sum(proj$import_value_proj),
+        M_s122_baseline       = sum(proj$import_value),
+        import_contraction    = (sum(proj$import_value_proj) / sum(proj$import_value)) - 1,
+        behavioral_gap        = (sum(proj$tau_eff_proj * proj$import_value) / sum(proj$import_value)) -
+                                (sum(proj$duties_proj) / sum(proj$import_value_proj))
+      )
+    })
+  ) |>
+  unnest(etr_result)
+
+# Wide matrices
+etr_s122_matrix_paasche <- etr_s122_sensitivity |>
+  select(epsilon_label, phi_label, tw_etr_s122_paasche) |>
+  pivot_wider(names_from = phi_label, values_from = tw_etr_s122_paasche)
+
+etr_s122_matrix_gap <- etr_s122_sensitivity |>
+  select(epsilon_label, phi_label, behavioral_gap) |>
+  pivot_wider(names_from = phi_label, values_from = behavioral_gap)
+
+cat("Paasche ETR sensitivity (Section 122-affected lines only):\n")
+cat("  Statutory benchmark: 15.00%. Values below 15% reflect behavioral erosion.\n")
+print(etr_s122_matrix_paasche |> mutate(across(-epsilon_label, fmt_pct)))
+cat("\nBehavioral gap (Laspeyres \u2212 Paasche) sensitivity:\n")
+cat("  How many percentage points of the statutory rate demand response erodes.\n")
+print(etr_s122_matrix_gap |> mutate(across(-epsilon_label, fmt_pct)))
 cat("\n")
 
 
@@ -1256,11 +1415,15 @@ for (h in names(horizon_matrices)) {
 }
 
 # ETR tables (numbered 22–26)
-exports[["22_etr_summary"]]           <- etr_summary
-exports[["23_etr_by_bucket"]]         <- etr_by_bucket
-exports[["24_etr_sensitivity"]]       <- etr_sensitivity
-exports[["25_etr_matrix_paasche"]]    <- etr_matrix_paasche
-exports[["26_etr_matrix_laspeyres"]]  <- etr_matrix_laspeyres
+exports[["22_etr_summary"]]              <- etr_summary
+exports[["23_etr_by_bucket"]]            <- etr_by_bucket
+exports[["24_etr_sensitivity"]]          <- etr_sensitivity
+exports[["25_etr_matrix_paasche"]]       <- etr_matrix_paasche
+exports[["26_etr_matrix_laspeyres"]]     <- etr_matrix_laspeyres
+exports[["27_etr_s122_summary"]]         <- etr_s122_summary
+exports[["28_etr_s122_sensitivity"]]     <- etr_s122_sensitivity
+exports[["29_etr_s122_matrix_paasche"]]  <- etr_s122_matrix_paasche
+exports[["30_etr_s122_matrix_gap"]]      <- etr_s122_matrix_gap
 
 walk2(names(exports), exports, function(nm, df) {
   write_csv(df, file.path(EXPORT_DIR, paste0(nm, ".csv")))
@@ -1285,6 +1448,8 @@ if (requireNamespace("openxlsx", quietly = TRUE)) {
     "ETR Summary"           = etr_summary,
     "ETR by Bucket"         = etr_by_bucket,
     "ETR Sensitivity"       = etr_sensitivity,
+    "ETR S122 Summary"      = etr_s122_summary,
+    "ETR S122 Sensitivity"  = etr_s122_sensitivity,
     "Extensive Margin"      = extensive_comparison,
     "Foregone by Chapter"   = foregone_by_chapter,
     "Foregone Sensitivity"  = foregone_sensitivity,
