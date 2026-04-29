@@ -6,7 +6,10 @@
 #'   regulation_firm_counts_long.csv
 #'     One row per (regulation_name, naics_code, naics_depth, nace_code).
 #'     Columns:
-#'       regulation_name, regulation_name_raw,
+#'       regulation_name,             -- standardized short ID (DMA, GDPR, ...)
+#'                                    --   from EU_Regulation_Standard column
+#'       regulation_name_canonical,   -- canonical_regulation_name (audit)
+#'       regulation_name_raw,         -- raw regulation_name (audit)
 #'       naics_code, naics_depth, naics_title,
 #'       nace_code,   -- FATS NACE cell, or sentinel:
 #'                    --   "B-S_X_O_S94" for horizontal rows
@@ -175,13 +178,13 @@ pipeline_config <- list(
   naics_struct_file    = file.path(project_dir, "2-6_digit_2022_Codes.xlsx"),
   crosswalk_file       = file.path(project_dir, "eu_reg_naics_crosswalk_v2_1_1.xlsx"),
   output_csv           = file.path(project_dir, "regulation_firm_counts_long.csv"),
-  
+
   fats_indicator       = "ENT_NR",
   fats_c_ctrl          = "US",
   fats_geo             = "EU27_2020",
   horizontal_nace_code = "B-S_X_O_S94",
   anchor_year          = 2022L,
-  
+
   bea_vintage_year     = 2022L
 )
 
@@ -392,16 +395,16 @@ pull_fats <- function(config) {
   time_col <- intersect(c("TIME_PERIOD","time"), names(raw))[1]
   setnames(raw, time_col, "year")
   raw[, year := as.integer(year)]
-  
+
   filtered <- raw[indic_sbs == config$fats_indicator &
                     c_ctrl    == config$fats_c_ctrl &
                     geo       == config$fats_geo &
                     year      == config$anchor_year]
-  
+
   eu27 <- filtered[, .(nace_code = as.character(nace_r2),
                        nace_total_firms = values,
                        flag = flags)]
-  
+
   hz_row <- eu27[nace_code == config$horizontal_nace_code]
   if (nrow(hz_row) == 0) {
     stop(sprintf("Horizontal aggregate %s not found for %d",
@@ -412,11 +415,11 @@ pull_fats <- function(config) {
   message(sprintf("  Horizontal aggregate (%s): %s firms",
                   config$horizontal_nace_code,
                   format(horizontal_total, big.mark = ",")))
-  
+
   nace_codes <- sort(unique(as.character(raw$nace_r2)))
   message(sprintf("  Unique NACE codes: %d | filtered rows for %d: %d",
                   length(nace_codes), config$anchor_year, nrow(eu27)))
-  
+
   list(eu27 = eu27, nace_codes = nace_codes,
        horizontal_total = horizontal_total,
        horizontal_flag  = horizontal_flag)
@@ -465,7 +468,7 @@ build_bea_allocated <- function(config) {
   message("\n=== STEP 2: BEA GAP-FILL ===")
   a3 <- parse_bea_a3(config$bea_a1_a4_file)
   a4 <- parse_bea_a4(config$bea_a1_a4_file)
-  
+
   eu27_row  <- a3[grepl("European Union \\(27\\)", country_label)]
   world_row <- a3[country_label == "All countries"]
   if (nrow(eu27_row) != 1 || nrow(world_row) != 1) {
@@ -475,7 +478,7 @@ build_bea_allocated <- function(config) {
   message(sprintf("  EU27/World MOFA share: %.3f (EU27=%s, World=%s)",
                   eu27_share, format(eu27_row$count, big.mark = ","),
                   format(world_row$count, big.mark = ",")))
-  
+
   # Join gap_naics_map to A.4 buckets
   gap <- copy(gap_naics_map)
   gap[, bucket_world := NA_integer_]
@@ -491,7 +494,7 @@ build_bea_allocated <- function(config) {
   }
   gap[, bucket_eu27 := round(bucket_world * eu27_share)]
   gap[, eu27_share_applied := eu27_share]
-  
+
   # Slot weighting -- the BEA half of the two parallel weighting systems
   # described in the architectural block at top of file. A BEA bucket is
   # divided into "4-digit-equivalent slots":
@@ -504,7 +507,7 @@ build_bea_allocated <- function(config) {
   # allocated_firms = bucket_eu27 * weight
   three <- gap[crosswalk_depth == "3-digit"]
   four  <- gap[crosswalk_depth == "4-digit"]
-  
+
   if (nrow(three) > 0) {
     three[, n_children := vapply(seq_len(.N), function(i) {
       sum(four$matched_label == matched_label[i] &
@@ -517,20 +520,20 @@ build_bea_allocated <- function(config) {
     four[, covers_n_slots := 1L]
   }
   bea <- rbind(three, four, use.names = TRUE)
-  
+
   # Bucket denominator = (# 4-digit rows) + (# 3-digit rows w/ no children)
   bea[, bucket_total_slots := {
     n4   <- sum(crosswalk_depth == "4-digit")
     n3nc <- sum(crosswalk_depth == "3-digit" & n_children == 0L)
     n4 + n3nc
   }, by = matched_label]
-  
+
   bea[, weight := covers_n_slots / bucket_total_slots]
   bea[, allocated_firms := bucket_eu27 * weight]
-  
+
   message(sprintf("  Gap-fill rows: %d across %d BEA buckets",
                   nrow(bea), uniqueN(bea$matched_label)))
-  
+
   bea[, .(naics_code, naics_depth = crosswalk_depth,
           naics_title = naics_description,
           nace_code = paste0("BEA:", matched_label),
@@ -553,7 +556,7 @@ load_naics_isic <- function(path) {
   part_isic  <- grep("Part.*ISIC",  names(raw), value = TRUE, ignore.case = TRUE)[1]
   part_naics <- grep("Part.*NAICS", names(raw), value = TRUE, ignore.case = TRUE)[1]
   is_us_census <- !is.na(part_isic) && !is.na(part_naics)
-  
+
   naics_col <- find_col(raw,
                         c("NAICS.*[Cc]ode","^Code.*NAICS","NAICS\\s*US","NAICS US","NAICS 2022"),
                         "Expected a NAICS code column.",
@@ -562,11 +565,11 @@ load_naics_isic <- function(path) {
                         c("ISIC.*[Cc]ode","^Code.*ISIC","^ISIC\\s*Rev","^ISIC\\s*4"),
                         "Expected an ISIC code column.",
                         exclude = c("Part","Title","note"))
-  
+
   naics_chr <- if (is.numeric(raw[[naics_col]])) {
     as.character(as.integer(raw[[naics_col]]))
   } else as.character(raw[[naics_col]])
-  
+
   out <- data.table(naics_raw = naics_chr,
                     isic_raw  = as.character(raw[[isic_col]]))
   if (is_us_census) {
@@ -577,7 +580,7 @@ load_naics_isic <- function(path) {
   } else {
     out[, c("naics_partial","isic_partial") := list(FALSE, FALSE)]
   }
-  
+
   out <- out[grepl("^[0-9]{6}$", gsub("\\*","", trimws(naics_raw)))]
   out <- out[!is.na(naics_raw) & !is.na(isic_raw) &
                naics_raw != "" & isic_raw != "" &
@@ -600,16 +603,16 @@ load_naics_structure <- function(path) {
                         exclude = c("Part","Title"))
   title_col <- find_col(raw, c("NAICS.*Title","Title","Description","[Cc]lass title"),
                         "Expected a NAICS title column.")
-  
+
   codes <- raw[[code_col]]
   if (is.numeric(codes)) codes <- as.character(as.integer(codes))
   codes <- trimws(as.character(codes))
   titles <- as.character(raw[[title_col]])
-  
+
   valid <- grepl("^[0-9]{2,6}$", codes) & !is.na(titles) & titles != ""
   all <- unique(data.table(code = codes[valid], title = titles[valid]), by = "code")
   all[, digits := nchar(code)]
-  
+
   list(
     six = all[digits == 6L, .(naics_2022 = code,
                               naics_3digit = substr(code, 1, 3),
@@ -628,35 +631,35 @@ build_concordance_long <- function(config, fats_nace_codes) {
   message("\n=== STEP 3: CONCORDANCE ===")
   ni <- load_naics_isic(config$naics_isic_file)
   ns <- load_naics_structure(config$naics_struct_file)
-  
+
   # 6-digit -> NACE division, with partial-match flag and parent codes
   six <- merge(ni, ns$six, by = "naics_2022", all.x = TRUE)
   six <- six[!is.na(naics_3digit)]
   message(sprintf("  6-digit NAICS pairs in concordance: %d", nrow(six)))
-  
+
   # FATS NACE codes -> divisions
   fats_div <- expand_fats_to_divisions(fats_nace_codes)
   message(sprintf("  FATS NACE cells mappable: %d", uniqueN(fats_div$fats_code)))
-  
+
   # For each FATS NACE cell x division, attach all 6-digit NAICS classes,
   # then count classes per (FATS cell, NAICS parent) at both 3- and 4-digit.
   rolled <- merge(fats_div, six, by = "nace_division", allow.cartesian = TRUE)
-  
+
   agg_3 <- rolled[, .(n_naics_6dig = uniqueN(naics_2022),
                       any_partial  = any(is_partial)),
                   by = .(fats_code, naics_3digit)]
   agg_3[, naics_depth := "3-digit"]
   setnames(agg_3, "naics_3digit", "naics_code")
-  
+
   agg_4 <- rolled[, .(n_naics_6dig = uniqueN(naics_2022),
                       any_partial  = any(is_partial)),
                   by = .(fats_code, naics_4digit)]
   agg_4[, naics_depth := "4-digit"]
   setnames(agg_4, "naics_4digit", "naics_code")
-  
+
   long <- rbind(agg_3, agg_4, use.names = TRUE)
   setnames(long, "fats_code", "nace_code")
-  
+
   # FATS weight: equal-split-by-6-digit-count. For each NACE cell, count
   # how many 6-digit NAICS classes roll up to each NAICS parent (3- or
   # 4-digit), then weight = that count / total 6-digit classes in the
@@ -667,14 +670,14 @@ build_concordance_long <- function(config, fats_nace_codes) {
   long[, total_6dig_in_nace_cell := sum(n_naics_6dig),
        by = .(nace_code, naics_depth)]
   long[, weight := n_naics_6dig / total_6dig_in_nace_cell]
-  
+
   # Attach NAICS titles
   titles_all <- rbind(
     ns$titles_3[, .(naics_code, naics_depth = "3-digit", naics_title)],
     ns$titles_4[, .(naics_code, naics_depth = "4-digit", naics_title)]
   )
   long <- merge(long, titles_all, by = c("naics_code","naics_depth"), all.x = TRUE)
-  
+
   long[, .(naics_code, naics_depth, naics_title, nace_code,
            weight, n_naics_6dig, any_partial)]
 }
@@ -689,7 +692,7 @@ build_concordance_long <- function(config, fats_nace_codes) {
 
 build_firm_rows_long <- function(config, fats, bea_long, concord_long) {
   message("\n=== STEP 4: BUILD UNIFIED FIRM-ROWS TABLE ===")
-  
+
   # --- FATS rows ---
   # Join the concordance to FATS firm counts on the NACE cell.
   fats_join <- merge(concord_long, fats$eu27,
@@ -707,20 +710,20 @@ build_firm_rows_long <- function(config, fats, bea_long, concord_long) {
     eu27_share_applied = NA_real_,
     gap_reason = NA_character_
   )]
-  
+
   # --- DROP FATS rows for NAICS in gap_naics_map (BEA is authoritative there) ---
   gap_keys <- gap_naics_map[, .(naics_code, naics_depth = crosswalk_depth)]
   before <- nrow(fats_rows)
   fats_rows <- fats_rows[!gap_keys, on = .(naics_code, naics_depth)]
   message(sprintf("  FATS rows after dropping BEA-gap NAICS: %d (dropped %d)",
                   nrow(fats_rows), before - nrow(fats_rows)))
-  
+
   # --- BEA rows ---
   # bea_long already has the right schema; just add the missing flags.
   bea_rows <- copy(bea_long)
   bea_rows[, any_partial := FALSE]
   bea_rows[, any_suppressed := FALSE]
-  
+
   # --- Horizontal aggregate ---
   horiz_row <- data.table(
     naics_code = "ALL",
@@ -737,7 +740,7 @@ build_firm_rows_long <- function(config, fats, bea_long, concord_long) {
     eu27_share_applied = NA_real_,
     gap_reason = NA_character_
   )
-  
+
   out <- rbind(fats_rows, bea_rows, horiz_row, use.names = TRUE, fill = TRUE)
   message(sprintf("  Combined firm-rows table: %d rows (FATS=%d, BEA=%d, horizontal=%d)",
                   nrow(out), nrow(fats_rows), nrow(bea_rows), 1L))
@@ -755,14 +758,26 @@ resolve_crosswalk <- function(crosswalk) {
   required <- c("regulation_name","naics_3digit","naics_4digit","assigned_depth")
   miss <- setdiff(required, names(cw))
   if (length(miss) > 0) stop("Crosswalk missing columns: ", paste(miss, collapse = ", "))
-  
-  if (!"canonical_regulation_name" %in% names(cw)) {
-    warning("Crosswalk has no 'canonical_regulation_name'; using 'regulation_name'.")
-    cw[, canonical_regulation_name := regulation_name]
+
+  # Primary grouping key: eu_regulation_standard (a short stable ID like "DMA",
+  # "GDPR"). Falls back to canonical_regulation_name, then regulation_name, if
+  # the standard ID column is absent or partially populated.
+  if (!"eu_regulation_standard" %in% names(cw)) {
+    warning("Crosswalk has no 'EU_Regulation_Standard'; falling back to ",
+            "canonical_regulation_name (or regulation_name if absent) as the ",
+            "primary grouping key.")
+    cw[, eu_regulation_standard := NA_character_]
   }
+  if (!"canonical_regulation_name" %in% names(cw)) {
+    cw[, canonical_regulation_name := NA_character_]
+  }
+
+  # Fill missing values up the chain: standard ID -> canonical name -> raw name
   cw[is.na(canonical_regulation_name),
      canonical_regulation_name := regulation_name]
-  
+  cw[is.na(eu_regulation_standard),
+     eu_regulation_standard := canonical_regulation_name]
+
   cw[, assigned_depth_int := suppressWarnings(as.integer(assigned_depth))]
   cw[, naics_4digit_chr := fifelse(
     is.na(naics_4digit), NA_character_,
@@ -777,16 +792,21 @@ resolve_crosswalk <- function(crosswalk) {
     !is.na(assigned_depth_int) & assigned_depth_int == 4L, "4-digit",
     default = "3-digit"
   )]
-  
+
   cw_long <- cw[!is.na(naics_code) & naics_code != "" &
-                  !is.na(canonical_regulation_name),
-                .(regulation_name = canonical_regulation_name,
-                  regulation_name_raw = as.character(regulation_name),
+                  !is.na(eu_regulation_standard),
+                .(regulation_name           = eu_regulation_standard,
+                  regulation_name_canonical = as.character(canonical_regulation_name),
+                  regulation_name_raw       = as.character(regulation_name),
                   naics_code, naics_depth)]
-  
-  # Collapse raw names per canonical (reg, code, depth) so audit info survives
-  # without inflating row counts.
-  cw_long[, .(regulation_name_raw =
+
+  # Collapse canonical and raw names per standard ID + (code, depth) so audit
+  # info survives without inflating row counts. Different rows of the same
+  # standard ID may have different canonical / raw names (the whole reason
+  # the standard ID exists), so we collapse with " | ".
+  cw_long[, .(regulation_name_canonical =
+                paste(sort(unique(regulation_name_canonical)), collapse = " | "),
+              regulation_name_raw =
                 paste(sort(unique(regulation_name_raw)), collapse = " | ")),
           by = .(regulation_name, naics_code, naics_depth)]
 }
@@ -798,7 +818,7 @@ join_crosswalk_to_firm_rows <- function(cw_long, firm_rows_long) {
   joined <- merge(cw_long, firm_rows_long,
                   by = c("naics_code","naics_depth"),
                   all.x = TRUE, allow.cartesian = TRUE)
-  
+
   # Build per-row notes from gap_reason + suppression flags. Branches for
   # dropped gap_reasons (fats_scope_excluded_section_a, fats_suppressed_n77,
   # fats_suppressed_q87_q88) removed along with their gap_naics_map blocks.
@@ -806,15 +826,15 @@ join_crosswalk_to_firm_rows <- function(cw_long, firm_rows_long) {
   joined[!is.na(gap_reason),
          notes := fcase(
            gap_reason == "fats_depth_limited_within_section_d",
-           "FATS publishes NACE D at section level only; BEA Utilities bucket used (overstates electricity-only).",
+             "FATS publishes NACE D at section level only; BEA Utilities bucket used (overstates electricity-only).",
            gap_reason == "fats_depth_limited_within_h49",
-           "FATS H49 covers all land transport; BEA Transport bucket used (overstates pipelines only).",
+             "FATS H49 covers all land transport; BEA Transport bucket used (overstates pipelines only).",
            gap_reason == "fats_suppressed_section_k",
-           "FATS EU27 K aggregate suppressed (IE/LU concentration); BEA gap-fill applied.",
+             "FATS EU27 K aggregate suppressed (IE/LU concentration); BEA gap-fill applied.",
            gap_reason == "fats_suppressed_c26",
-           "FATS EU27 C26 suppressed; BEA Computers/electronic-products bucket used.",
+             "FATS EU27 C26 suppressed; BEA Computers/electronic-products bucket used.",
            gap_reason == "fats_suppressed_h50",
-           "FATS EU27 H50 suppressed; BEA Transport bucket used (overstates water transport).",
+             "FATS EU27 H50 suppressed; BEA Transport bucket used (overstates water transport).",
            default = ""
          )]
   joined[any_suppressed == TRUE & source == "FATS",
@@ -824,7 +844,7 @@ join_crosswalk_to_firm_rows <- function(cw_long, firm_rows_long) {
            paste(notes,
                  "FATS cell flagged 'C' (suppressed); EU27 aggregate undercounts IE/LU.")
          )]
-  
+
   # Diagnose unmatched
   unmatched <- joined[is.na(allocated_firms),
                       .(regulation_name, naics_code, naics_depth)]
@@ -840,8 +860,8 @@ join_crosswalk_to_firm_rows <- function(cw_long, firm_rows_long) {
                       summ$n[i], summ$regs[i]))
     }
   }
-  
-  out_cols <- c("regulation_name","regulation_name_raw",
+
+  out_cols <- c("regulation_name","regulation_name_canonical","regulation_name_raw",
                 "naics_code","naics_depth","naics_title",
                 "nace_code","source","allocated_firms","weight",
                 "nace_total_firms","any_partial","any_suppressed",
@@ -893,27 +913,27 @@ main <- function(config = pipeline_config) {
   message("===================================================")
   message(sprintf("PROJECT DIR: %s", config$project_dir))
   message("===================================================")
-  
+
   fats         <- pull_fats(config)
   bea_long     <- build_bea_allocated(config)
   concord_long <- build_concordance_long(config, fats$nace_codes)
   firm_rows    <- build_firm_rows_long(config, fats, bea_long, concord_long)
-  
+
   message("\nLoading crosswalk...")
   crosswalk <- as.data.table(read_xlsx(config$crosswalk_file, sheet = "Crosswalk"))
   cw_long   <- resolve_crosswalk(crosswalk)
   message(sprintf("  %d crosswalk rows resolved across %d canonical regulations",
                   nrow(cw_long), uniqueN(cw_long$regulation_name)))
-  
+
   long <- join_crosswalk_to_firm_rows(cw_long, firm_rows)
-  
+
   fwrite(long, config$output_csv)
   message(sprintf("\nWrote %s (%d rows)", config$output_csv, nrow(long)))
-  
+
   message("\n===================================================")
   message("PIPELINE COMPLETE")
   message("===================================================")
-  
+
   invisible(long)
 }
 
