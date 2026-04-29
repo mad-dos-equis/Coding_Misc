@@ -6,10 +6,9 @@
 #'   regulation_firm_counts_long.csv
 #'     One row per (regulation_name, naics_code, naics_depth, nace_code).
 #'     Columns:
-#'       regulation_name,             -- standardized short ID (DMA, GDPR, ...)
-#'                                    --   from EU_Regulation_Standard column
-#'       regulation_name_canonical,   -- canonical_regulation_name (audit)
-#'       regulation_name_raw,         -- raw regulation_name (audit)
+#'       regulation_name,        -- standardized short ID (DMA, GDPR, ...)
+#'                               --   from EU_Regulation_Standard column
+#'       regulation_name_full,   -- descriptive name from EU_Regulation (audit)
 #'       naics_code, naics_depth, naics_title,
 #'       nace_code,   -- FATS NACE cell, or sentinel:
 #'                    --   "B-S_X_O_S94" for horizontal rows
@@ -755,28 +754,20 @@ build_firm_rows_long <- function(config, fats, bea_long, concord_long) {
 resolve_crosswalk <- function(crosswalk) {
   cw <- copy(crosswalk)
   setnames(cw, names(cw), tolower(names(cw)))
-  required <- c("regulation_name","naics_3digit","naics_4digit","assigned_depth")
+  required <- c("eu_regulation","naics_3digit","naics_4digit","assigned_depth")
   miss <- setdiff(required, names(cw))
   if (length(miss) > 0) stop("Crosswalk missing columns: ", paste(miss, collapse = ", "))
 
-  # Primary grouping key: eu_regulation_standard (a short stable ID like "DMA",
-  # "GDPR"). Falls back to canonical_regulation_name, then regulation_name, if
-  # the standard ID column is absent or partially populated.
+  # Primary grouping key: eu_regulation_standard (short stable ID like "DMA",
+  # "GDPR"). Falls back to eu_regulation (the descriptive name) if the
+  # standard ID column is absent or has NA values.
   if (!"eu_regulation_standard" %in% names(cw)) {
     warning("Crosswalk has no 'EU_Regulation_Standard'; falling back to ",
-            "canonical_regulation_name (or regulation_name if absent) as the ",
-            "primary grouping key.")
+            "EU_Regulation as the primary grouping key.")
     cw[, eu_regulation_standard := NA_character_]
   }
-  if (!"canonical_regulation_name" %in% names(cw)) {
-    cw[, canonical_regulation_name := NA_character_]
-  }
-
-  # Fill missing values up the chain: standard ID -> canonical name -> raw name
-  cw[is.na(canonical_regulation_name),
-     canonical_regulation_name := regulation_name]
   cw[is.na(eu_regulation_standard),
-     eu_regulation_standard := canonical_regulation_name]
+     eu_regulation_standard := eu_regulation]
 
   cw[, assigned_depth_int := suppressWarnings(as.integer(assigned_depth))]
   cw[, naics_4digit_chr := fifelse(
@@ -795,19 +786,16 @@ resolve_crosswalk <- function(crosswalk) {
 
   cw_long <- cw[!is.na(naics_code) & naics_code != "" &
                   !is.na(eu_regulation_standard),
-                .(regulation_name           = eu_regulation_standard,
-                  regulation_name_canonical = as.character(canonical_regulation_name),
-                  regulation_name_raw       = as.character(regulation_name),
+                .(regulation_name      = eu_regulation_standard,
+                  regulation_name_full = as.character(eu_regulation),
                   naics_code, naics_depth)]
 
-  # Collapse canonical and raw names per standard ID + (code, depth) so audit
-  # info survives without inflating row counts. Different rows of the same
-  # standard ID may have different canonical / raw names (the whole reason
-  # the standard ID exists), so we collapse with " | ".
-  cw_long[, .(regulation_name_canonical =
-                paste(sort(unique(regulation_name_canonical)), collapse = " | "),
-              regulation_name_raw =
-                paste(sort(unique(regulation_name_raw)), collapse = " | ")),
+  # Collapse descriptive names per standard ID + (code, depth) so audit info
+  # survives without inflating row counts. Different rows of the same
+  # standard ID may have slightly different EU_Regulation values (the whole
+  # reason the standard ID exists), so we collapse with " | ".
+  cw_long[, .(regulation_name_full =
+                paste(sort(unique(regulation_name_full)), collapse = " | ")),
           by = .(regulation_name, naics_code, naics_depth)]
 }
 
@@ -861,7 +849,7 @@ join_crosswalk_to_firm_rows <- function(cw_long, firm_rows_long) {
     }
   }
 
-  out_cols <- c("regulation_name","regulation_name_canonical","regulation_name_raw",
+  out_cols <- c("regulation_name","regulation_name_full",
                 "naics_code","naics_depth","naics_title",
                 "nace_code","source","allocated_firms","weight",
                 "nace_total_firms","any_partial","any_suppressed",
@@ -922,7 +910,7 @@ main <- function(config = pipeline_config) {
   message("\nLoading crosswalk...")
   crosswalk <- as.data.table(read_xlsx(config$crosswalk_file, sheet = "Crosswalk"))
   cw_long   <- resolve_crosswalk(crosswalk)
-  message(sprintf("  %d crosswalk rows resolved across %d canonical regulations",
+  message(sprintf("  %d crosswalk rows resolved across %d standardized regulations",
                   nrow(cw_long), uniqueN(cw_long$regulation_name)))
 
   long <- join_crosswalk_to_firm_rows(cw_long, firm_rows)
