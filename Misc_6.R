@@ -1,136 +1,78 @@
-# ============================================================================
-# Example: how to call the company-name fuzzy matching pipeline on your data
-# ----------------------------------------------------------------------------
-# Replace the data-loading section with your own data-frame loads.
-# Everything else can stay the same.
-# ============================================================================
-
-library(data.table)
-library(readxl)
-
-# 1. Source the library (adjust path as needed)
-source("company_name_fuzzy_match.R")
 
 
-# 2. Load YOUR two data frames here.
-#    Replace these lines with however you read your real data.
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggExtra)
 
-left_df  <- fread("path/to/small_frame.csv")
-right_df <- as.data.table(read_xlsx("path/to/large_frame.xlsx"))
-
-
-# 3. Run the pipeline.
-
-result <- run_fuzzy_match_pipeline(
-  left_df  = left_df,
-  right_df = right_df,
-  left_name_col  = "company",       # <-- name column in left_df
-  right_name_col = "company",       # <-- name column in right_df
-
-  # Optional: existing ID columns. If NULL, row index is used.
-  left_id_col    = NULL,
-  right_id_col   = NULL,
-
-  # Subsample left for the parameter-selection grid search. Doesn't affect
-  # the final tiered match (which always runs on the full left side).
-  # 500-2000 is usually plenty.
-  grid_sample_size = 1000,
-
-  # Left rows per chunk for matching, to avoid memory blowups. The default
-  # of 2000 works for ~100k right rows on most machines. If you see
-  # "cannot allocate vector of size N Gb" warnings, reduce this to 500-1000.
-  # Smaller chunks = slower but uses less memory.
-  chunk_size = 2000L,
-
-  # Tier strictness multipliers applied to the winning max_dist.
-  # Default is strict (0.5x) and moderate (1.0x) only — no loose tier.
-  # The loose tier is omitted by default because in asymmetric-subset
-  # matching (e.g. only some left rows have a true right-side match),
-  # loose thresholds manufacture false positives by matching unmatchable
-  # left rows to whichever right row happens to be nearest.
-  tier_multipliers = c(strict = 0.5, moderate = 1.0),
-
-  # Metric for selecting the winning (method, max_dist) configuration.
-  # "silver_f1" (default) balances precision and recall.
-  # "silver_recall" is preferable when the silver set is small or when
-  # left and right have asymmetric coverage (e.g., right is a strict subset
-  # of the universe), because silver-precision becomes noisy on small
-  # silver subsets.
-  selection_metric = "silver_recall",
-
-  verbose = TRUE
-)
+sod_2018 <- read.csv("C:/Users/maxxj/OneDrive/Desktop/Projects/trade-elasticities/Elasticities_Soderbery2018.csv")
+sod_2018 <- sod_2018 %>%
+  mutate(hs4 = str_pad(hs4, 4, side = "left", pad = "0"),
+         sod_e_d = -sigma,
+         sod_e_s = 1/omega)
 
 
-# 4. Inspect the results.
+ccodes <- read.csv("C:/Users/maxxj/OneDrive/Desktop/Projects/trade-elasticities/BACI_HS92_V202601/country_codes_V202601.csv") %>%
+  dplyr::select(country_code, country_iso3) %>%
+  mutate(country_code = as.character(country_code))
 
-# Matches with tier, method, distance, and gap diagnostics.
-# Important columns added to the matched output:
-#   match_dist   = distance of the chosen match
-#   runner_up    = distance of the second-best candidate (NA if only one)
-#   gap          = runner_up - match_dist  (larger = more decisive)
-#   n_candidates = how many candidates were within max_dist
-#   tier         = "strict", "moderate", or "unmatched"
-print(head(result$matches, 20))
+df_v1 <- readRDS("C:/Users/maxxj/OneDrive/Desktop/Projects/trade-elasticities/trade_elast_baci_hs92_v202601_hs4/baci_hs92_v202601_elast_country_hs4_fixed_sigma.rds")
 
-# Configuration the pipeline picked
-print(result$config)
-
-# Full grid evaluation (sortable by silver_f1 or silver_recall)
-print(result$grid)
-
-# Silver-standard pairs the pipeline bootstrapped
-print(head(result$silver))
-
-# Audit sample, stratified by distance bucket AND gap status:
-#   gap_status = "low_gap"  : best match has near-tied competitors (suspect)
-#                "solo"     : only one candidate (decisive)
-#                "decisive" : best match is clearly closer than runner-up
-# Audit sample is biased toward low_gap matches in higher buckets,
-# since that's where false positives concentrate.
-print(result$audit)
+df_v1 <- df_v1 %>%
+  left_join(ccodes, by = c("importer" = "country_code")) %>%
+  rename(importer_iso3 = country_iso3) %>%
+  left_join(ccodes, by = c("exporter" = "country_code")) %>%
+  rename(exporter_iso3 = country_iso3) %>%
+  left_join(sod_2018 %>%
+              dplyr::select(iiso, eiso, hs4, sod_e_d, sod_e_s),
+            by = c("importer_iso3" = "iiso",
+                   "exporter_iso3" = "eiso",
+                   "good" = "hs4")) %>%
+  mutate(cook_e_d = -sigma,
+         cook_e_s = 1 / gamma,
+         e_d_diff = sod_e_d - cook_e_d,
+         e_s_diff = sod_e_s - cook_e_s)
 
 
-# 5. Get a tidy enriched copy of the original left data frame.
-# Every original left row is preserved, augmented with match metadata.
-# Rows that weren't in result$matches (dropped for empty normalized keys)
-# are recovered here and flagged with match_tier = "dropped_empty_key".
 
-enriched_left <- enrich_left(
-  result         = result,
-  left_df        = left_df,
-  left_id_col    = NULL,             # same value you passed to the pipeline
-  right_name_col = "company"         # the right-side name column (for match_right_name)
-)
+# Reshape from wide to long format
+df_sigma_long <- df_v1 %>%
+  filter(convergence == 0, cook_e_d >= -30, sod_e_d >= -30) %>%
+  pivot_longer(cols = c(cook_e_d, sod_e_d),
+               names_to = "measure",
+               values_to = "value")
 
-# Columns added by enrich_left():
-#   matched          - logical, TRUE if a match was found
-#   match_tier       - "strict", "moderate", "unmatched", "dropped_empty_key"
-#   match_confidence - "high", "medium", "low", or NA (derived from tier + gap)
-#   match_method     - which stringdist method
-#   match_dist       - distance of the chosen match
-#   match_gap        - gap to runner-up (NA if solo)
-#   match_n_cands    - candidates within threshold
-#   match_right_id   - matched row's right_id (NA if unmatched)
-#   match_right_name - matched company name from right (NA if unmatched)
-
-print(head(enriched_left, 20))
-
-cat("\nMatch summary:\n")
-print(enriched_left[, .N, by = .(match_tier, match_confidence)])
+df_gamma_long <- df_v1 %>%
+  filter(convergence == 0, cook_e_s <= 20, sod_e_s <= 20) %>%
+  pivot_longer(cols = c(cook_e_s, sod_e_s),
+               names_to = "measure",
+               values_to = "value")
 
 
-# 6. Inspecting suspect matches in production output.
-# Even after picking a tier threshold, you can flag low-confidence matches
-# using the gap column. These are the matches most likely to be wrong:
+ggplot(df_sigma_long, aes(x = value, fill = measure)) +
+  geom_histogram(alpha = 0.4, 
+                 position = "identity",
+                 binwidth = 0.1) +
+  scale_fill_brewer(palette = "Set1") +
+  labs(
+    title = "Import Demand Elasticity",
+    x = "Value (-sigma)",
+    y = "Count"
+  ) +
+  theme_minimal()
 
-suspect <- enriched_left[matched & !is.na(match_gap) & match_gap < 0.02]
-cat("\nMatches with very small gap to runner-up:", nrow(suspect), "\n")
-cat("(These are good candidates for manual review.)\n")
-print(head(suspect, 20))
+
+ggplot(df_gamma_long, aes(x = value, fill = measure)) +
+  geom_histogram(alpha = 0.4, 
+                 position = "identity",
+                 binwidth = 0.1) +
+  scale_fill_brewer(palette = "Set1") +
+  labs(
+    title = "Export Supply Elasticity",
+    x = "Value (1/gamma)",
+    y = "Count"
+  ) +
+  theme_minimal()
 
 
-# 7. Optional: save outputs
-# fwrite(enriched_left,   "enriched_left.csv")
-# fwrite(result$audit,    "audit_sample.csv")
-# fwrite(result$grid,     "grid_evaluation.csv")
