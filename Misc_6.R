@@ -18,8 +18,15 @@
 #'                    --   | "structural_zero" (NACE Section O exclusion)
 #'       allocated_firms,         -- per-row firm-count assignment
 #'       allocated_turnover_meur, -- per-row net turnover assignment (million EUR)
-#'                                --   NA for BEA gap-fill rows (no revenue
-#'                                --   gap-fill implemented)
+#'                                --   Populated for FATS rows wherever Eurostat
+#'                                --   publishes NETTUR_MEUR for the NACE cell.
+#'                                --   Populated for BEA_gap_fill rows wherever
+#'                                --   BEA publishes worldwide sales for the
+#'                                --   bucket (Computers/electronic, Finance
+#'                                --   except depository, Transportation -- but
+#'                                --   NOT Depository banking, Insurance, or
+#'                                --   Utilities, all of which BEA suppresses).
+#'                                --   EU27 estimated via count-based share.
 #'       weight,                  -- the share of the NACE/bucket total assigned to this NAICS
 #'       nace_total_firms,        -- the underlying NACE/bucket firm-count total
 #'       nace_total_turnover_meur,-- the underlying NACE turnover total (million EUR)
@@ -524,12 +531,18 @@ parse_bea_a4 <- function(path) {
   raw <- as.data.table(read_excel(path, sheet = "Table III. A 4",
                                   col_names = FALSE, .name_repair = "minimal"))
   setnames(raw, paste0("V", seq_along(raw)))
+  # Column layout (1-indexed): V1=industry label, V2=affiliate count,
+  # V3-V5=balance-sheet/capex (skip), V6=Sales, V7-V11=other (skip).
+  # See Table III.A.4 header rows in usdia*-Part-III-A1-A4.xls.
   rows <- raw[!is.na(V1) & !is.na(V2),
               .(industry_label = trimws(as.character(V1)),
-                count_raw = as.character(V2))]
+                count_raw = as.character(V2),
+                sales_raw = as.character(V6))]
   rows <- rows[!grepl("^\\([0-9]+\\)$", count_raw)]
   rows <- rows[!grepl("^NOTE", industry_label)]
   rows[, count := suppressWarnings(as.integer(count_raw))]
+  # Sales suppression: BEA flags suppressed cells with "(D)". These become NA.
+  rows[, sales := suppressWarnings(as.numeric(sales_raw))]
   rows
 }
 
@@ -558,21 +571,49 @@ build_bea_allocated <- function(config) {
                   eu27_share, format(eu27_row$count, big.mark = ","),
                   format(world_row$count, big.mark = ",")))
 
-  # Join gap_naics_map to A.4 buckets
+  # Join gap_naics_map to A.4 buckets. For each bucket, pull both the
+  # affiliate count (always published) and the sales value (may be
+  # suppressed -- BEA flags suppressed cells "(D)" which become NA).
   gap <- copy(gap_naics_map)
-  gap[, bucket_world := NA_integer_]
-  gap[, matched_label := NA_character_]
+  gap[, bucket_world         := NA_integer_]
+  gap[, bucket_world_sales   := NA_real_]
+  gap[, matched_label        := NA_character_]
   for (i in seq_len(nrow(gap))) {
     needle <- gap$a4_industry_label[i]
     m <- a4[industry_label == needle]
     if (nrow(m) == 0) m <- a4[grepl(needle, industry_label, ignore.case = TRUE)]
     if (nrow(m) >= 1) {
-      gap$bucket_world[i]  <- m$count[1]
-      gap$matched_label[i] <- m$industry_label[1]
+      gap$bucket_world[i]       <- m$count[1]
+      gap$bucket_world_sales[i] <- m$sales[1]
+      gap$matched_label[i]      <- m$industry_label[1]
     }
   }
   gap[, bucket_eu27 := round(bucket_world * eu27_share)]
+  # EU27 sales estimate: apply the count-based EU27/World share to the
+  # bucket's worldwide sales. NA bucket sales (BEA "(D)" suppression)
+  # propagate to NA EU27 sales -- no gap-fill possible for those rows.
+  # Using the count-based share as a proxy for the sales share is a known
+  # approximation: EU27 affiliates tend to be larger than the worldwide
+  # MOFA average (more advanced-services concentration), so the true
+  # EU27/World sales share is typically somewhat higher than the count
+  # share. This understates EU27 sales by perhaps 10-25% for sectors
+  # where the size skew is largest. Documented in row-level notes.
+  gap[, bucket_eu27_sales := bucket_world_sales * eu27_share]
   gap[, eu27_share_applied := eu27_share]
+
+  # Report sales coverage at the bucket level
+  buckets_summary <- unique(gap[, .(matched_label, bucket_world_sales)])
+  n_buckets_with_sales <- sum(!is.na(buckets_summary$bucket_world_sales))
+  message(sprintf("  Sales coverage: %d/%d BEA buckets have non-suppressed worldwide sales",
+                  n_buckets_with_sales, nrow(buckets_summary)))
+  for (i in seq_len(nrow(buckets_summary))) {
+    bl <- buckets_summary$matched_label[i]
+    bs <- buckets_summary$bucket_world_sales[i]
+    msg <- if (is.na(bs)) sprintf("    %s: SUPPRESSED", bl)
+           else sprintf("    %s: $%s million world sales",
+                        bl, format(bs, big.mark = ",", scientific = FALSE))
+    message(msg)
+  }
 
   # Slot weighting -- the BEA half of the two parallel weighting systems
   # described in the architectural block at top of file. A BEA bucket is
@@ -584,6 +625,8 @@ build_bea_allocated <- function(config) {
   #   - A 3-digit code with no children in the same bucket is 1 slot.
   # weight = covers_n_slots / bucket_total_slots
   # allocated_firms = bucket_eu27 * weight
+  # allocated_turnover_meur = bucket_eu27_sales * weight * usd_to_eur
+  # (NA propagates if bucket_eu27_sales is NA from suppression)
   three <- gap[crosswalk_depth == "3-digit"]
   four  <- gap[crosswalk_depth == "4-digit"]
 
@@ -610,18 +653,51 @@ build_bea_allocated <- function(config) {
   bea[, weight := covers_n_slots / bucket_total_slots]
   bea[, allocated_firms := bucket_eu27 * weight]
 
-  message(sprintf("  Gap-fill rows: %d across %d BEA buckets",
-                  nrow(bea), uniqueN(bea$matched_label)))
+  # USD to EUR conversion for sales. Using approximate annual average rate;
+  # update for vintage as needed. 2022 average: ~0.95 USD/EUR (1 USD ≈ 0.95 EUR).
+  # 2023 average: ~0.92 USD/EUR. For mismatched-vintage runs (FATS 2023 +
+  # BEA 2022r), use the BEA-vintage rate since the sales values are USD 2022.
+  usd_to_eur_2022 <- 0.95
+  bea[, allocated_turnover_meur := bucket_eu27_sales * weight * usd_to_eur_2022]
+  bea[, nace_total_turnover_meur := bucket_eu27_sales * usd_to_eur_2022]
+
+  # Concept-mismatch note for finance/insurance rows (BEA "sales" for
+  # financial affiliates includes investment income and BEA's imputations
+  # for implicit banking services and insurance premium supplements;
+  # not strictly identical to FATS NETTUR_MEUR).
+  bea[, bea_sales_note := fcase(
+    grepl("[Ff]inance|[Ii]nsurance|[Dd]epository|[Bb]anking", a4_industry_label),
+      paste("BEA 'sales' for finance affiliates includes investment income",
+            "with BEA imputations for implicit banking services and insurance",
+            "premium supplements; conceptually similar to FATS NETTUR but not",
+            "identical. EU27 sales estimated via count-based share, which",
+            "may understate large-affiliate-skewed sectors."),
+    is.na(bucket_world_sales),
+      paste("BEA worldwide sales for this bucket are suppressed (D);",
+            "no revenue gap-fill possible. Firm count is still populated."),
+    default =
+      paste("Sales gap-filled via BEA Table III.A.4 worldwide sales x",
+            "EU27/World count-based share. May understate EU27 sales for",
+            "sectors where EU27 affiliates skew larger than worldwide average.")
+  )]
+
+  message(sprintf("  Gap-fill rows: %d across %d BEA buckets (%d rows with non-NA sales)",
+                  nrow(bea), uniqueN(bea$matched_label),
+                  sum(!is.na(bea$allocated_turnover_meur))))
 
   bea[, .(naics_code, naics_depth = crosswalk_depth,
           naics_title = naics_description,
           nace_code = paste0("BEA:", matched_label),
           source = "BEA_gap_fill",
-          weight, nace_total_firms = bucket_eu27,
+          weight,
+          nace_total_firms = bucket_eu27,
           allocated_firms,
+          nace_total_turnover_meur,
+          allocated_turnover_meur,
           bea_source_label = matched_label,
           eu27_share_applied,
-          gap_reason)]
+          gap_reason,
+          bea_sales_note)]
 }
 
 # ============================================================================
@@ -821,15 +897,25 @@ build_firm_rows_long <- function(config, fats, bea_long, concord_long) {
                   nrow(fats_rows), before - nrow(fats_rows)))
 
   # --- BEA rows ---
-  # bea_long already has the right schema; just add the missing flags and
-  # NA placeholders for non-firm indicators (BEA revenue gap-fill not yet
-  # implemented).
+  # bea_long now provides BOTH affiliate-count gap-fill AND sales (turnover)
+  # gap-fill columns. Sales values may be NA for buckets where BEA suppressed
+  # worldwide sales with "(D)" -- those rows keep NA turnover but populated
+  # firm counts. We preserve whatever bea_long provides for any extra
+  # indicators it knows about; only fill NA placeholders for indicators it
+  # doesn't carry (future-proofing if config adds e.g. value-added indicator
+  # before BEA supports it).
   bea_rows <- copy(bea_long)
   bea_rows[, any_partial := FALSE]
   bea_rows[, any_suppressed := FALSE]
   for (ind in extra_indicators) {
-    bea_rows[, (paste0("nace_total_", ind)) := NA_real_]
-    bea_rows[, (paste0("allocated_",  ind)) := NA_real_]
+    nace_col  <- paste0("nace_total_", ind)
+    alloc_col <- paste0("allocated_",  ind)
+    if (!(nace_col %in% names(bea_rows))) {
+      bea_rows[, (nace_col) := NA_real_]
+    }
+    if (!(alloc_col %in% names(bea_rows))) {
+      bea_rows[, (alloc_col) := NA_real_]
+    }
   }
 
   # --- Horizontal aggregate ---
@@ -990,6 +1076,16 @@ join_crosswalk_to_firm_rows <- function(cw_long, firm_rows_long) {
            paste(notes,
                  "FATS cell flagged 'C' (suppressed); EU27 aggregate undercounts IE/LU.")
          )]
+  # Append BEA sales/concept-mismatch note for BEA gap-fill rows (the note
+  # was attached per-row in build_bea_allocated based on bucket type and
+  # suppression state).
+  if ("bea_sales_note" %in% names(joined)) {
+    joined[source == "BEA_gap_fill" & !is.na(bea_sales_note),
+           notes := fifelse(
+             notes == "", bea_sales_note,
+             paste(notes, bea_sales_note)
+           )]
+  }
   joined[source == "structural_zero",
          notes := paste0("NAICS ", naics_code, " is in NACE Section O (public ",
                          "administration). FATS does not cover this section; ",
