@@ -45,6 +45,34 @@
 # remains and is the right reading of the data rather than a methodological
 # artifact.
 #
+# Source data are POOLED (whole-market), not pure in-person:
+# A subtle but important note on the channel architecture. None of the
+# three source studies estimated channel-specific elasticities. Each
+# reports a single elasticity per category, estimated on a sample that
+# pooled in-person and online purchases together. We treat each source
+# elasticity as an in-person estimate (the column 'source_pooled' in the
+# group-level table) for the purpose of applying the Harris-Lagoudakis
+# (2023) online multiplier, but this is a defensible approximation
+# rather than a literal truth.
+# The approximation works because all three studies are dominated by
+# in-person purchases:
+#   - OA (1998-2010 CEX diary): online FAH was ~0-2% of the sample
+#   - Zhen (2006 Nielsen Homescan): online FAH was <1% of the sample
+#   - Luke (2009-2018 Circana): online FAH grew from ~0% to ~3% across
+#     the sample, with a time-weighted average of perhaps 1-2%
+# A pure in-person elasticity would be slightly more elastic than the
+# pooled estimate because the pooled estimate already contains a small
+# contribution from less-elastic online purchases. The unblending
+# adjustment is:
+#   eps_inperson = eps_pooled / ((1 - omega_sample) + omega_sample * mu)
+# For Luke (the most affected source) with omega_sample = 0.02 and
+# mu = 0.5, this implies eps_inperson is about 1% more elastic than
+# eps_pooled. For OA and Zhen the correction is even smaller. We do
+# not apply this correction in the script because it falls well within
+# the rounding tolerance of the headline number; the column labeled
+# 'source_pooled' should be read as "essentially in-person, with at
+# most a ~1% understatement of true in-person elasticity."
+#
 # -----------------------------------------------------------------------------
 # Data sources
 # -----------------------------------------------------------------------------
@@ -97,7 +125,7 @@ suppressPackageStartupMessages({
 
 # Source [1]: Okrent & Alston (2012) Table 4 — Marshallian own-price
 oa_elasticities <- tribble(
-  ~group,                  ~oa_elast_instore, ~oa_se,
+  ~group,                  ~oa_elast_source, ~oa_se,
   "cereals_and_bakery",    -0.58,              0.25,
   "meat_and_eggs",         -0.31,              0.17,
   "dairy",                 -0.05,              0.09,
@@ -259,7 +287,7 @@ build_master <- function(alpha_scanner = ALPHA_SCANNER_DEFAULT) {
       hybrid_elast = case_when(
         hybrid_source == "zhen" ~ zhen_elast_adjusted,
         hybrid_source == "luke" ~ luke_elast_adjusted,
-        hybrid_source == "oa"   ~ oa_elast_instore
+        hybrid_source == "oa"   ~ oa_elast_source
       ),
       hybrid_se = case_when(
         hybrid_source == "zhen" ~ zhen_elast_se,
@@ -278,42 +306,42 @@ compute_all_aggregates <- function(omega_online    = OMEGA_ONLINE_DEFAULT,
                                    coverage_w_zhen = 0.50,
                                    n_mc            = 50000,
                                    seed            = 20260521) {
-
+  
   df <- build_master(alpha_scanner = alpha_scanner)
-
+  
   # Channel-blending multiplier (applied uniformly within each source)
   blend_mult <- omega_online * mu_online + (1 - omega_online)
-
+  
   # Point estimates
   headline <- df %>%
     summarise(
-      eps_oa_instore       = sum(share_fah * oa_elast_instore),
-      eps_zhen_instore     = sum(share_fah * zhen_elast_adjusted),
-      eps_hybrid_instore   = sum(share_fah * hybrid_elast),
-      eps_oa_blended       = eps_oa_instore     * blend_mult,
-      eps_zhen_blended     = eps_zhen_instore   * blend_mult,
-      eps_hybrid_blended   = eps_hybrid_instore * blend_mult,
-      eps_covwt_blended    = coverage_w_zhen * eps_zhen_blended +
-                             (1 - coverage_w_zhen) * eps_oa_blended
+      eps_oa_source_pooled       = sum(share_fah * oa_elast_source),
+      eps_zhen_source_pooled     = sum(share_fah * zhen_elast_adjusted),
+      eps_hybrid_source_pooled   = sum(share_fah * hybrid_elast),
+      eps_oa_headline_blended       = eps_oa_source_pooled     * blend_mult,
+      eps_zhen_headline_blended     = eps_zhen_source_pooled   * blend_mult,
+      eps_hybrid_headline_blended   = eps_hybrid_source_pooled * blend_mult,
+      eps_covwt_headline_blended    = coverage_w_zhen * eps_zhen_headline_blended +
+        (1 - coverage_w_zhen) * eps_oa_headline_blended
     )
-
+  
   # Monte Carlo CIs propagating each source's SEs through blending and weighting
   if (!is.null(seed)) set.seed(seed)
   n_groups <- nrow(df)
-
+  
   draws_oa     <- replicate(n_mc,
-    sum(df$share_fah * rnorm(n_groups, df$oa_elast_instore, df$oa_se))) * blend_mult
+                            sum(df$share_fah * rnorm(n_groups, df$oa_elast_source, df$oa_se))) * blend_mult
   draws_zhen   <- replicate(n_mc,
-    sum(df$share_fah * (rnorm(n_groups, df$zhen_elast_raw, df$zhen_elast_se) +
-                        alpha_scanner))) * blend_mult
+                            sum(df$share_fah * (rnorm(n_groups, df$zhen_elast_raw, df$zhen_elast_se) +
+                                                  alpha_scanner))) * blend_mult
   draws_hybrid <- replicate(n_mc,
-    sum(df$share_fah * rnorm(n_groups, df$hybrid_elast, df$hybrid_se))) * blend_mult
+                            sum(df$share_fah * rnorm(n_groups, df$hybrid_elast, df$hybrid_se))) * blend_mult
   draws_covwt  <- coverage_w_zhen * draws_zhen + (1 - coverage_w_zhen) * draws_oa
-
+  
   ci <- tibble(
     estimator = c("oa", "zhen", "hybrid", "coverage_weighted"),
-    point     = c(headline$eps_oa_blended, headline$eps_zhen_blended,
-                  headline$eps_hybrid_blended, headline$eps_covwt_blended),
+    point     = c(headline$eps_oa_headline_blended, headline$eps_zhen_headline_blended,
+                  headline$eps_hybrid_headline_blended, headline$eps_covwt_headline_blended),
     mc_mean   = c(mean(draws_oa), mean(draws_zhen),
                   mean(draws_hybrid), mean(draws_covwt)),
     mc_sd     = c(sd(draws_oa), sd(draws_zhen),
@@ -323,7 +351,7 @@ compute_all_aggregates <- function(omega_online    = OMEGA_ONLINE_DEFAULT,
     ci_up_95  = c(quantile(draws_oa, 0.975), quantile(draws_zhen, 0.975),
                   quantile(draws_hybrid, 0.975), quantile(draws_covwt, 0.975))
   )
-
+  
   list(table = df, headline = headline, ci = ci,
        draws = list(oa = draws_oa, zhen = draws_zhen,
                     hybrid = draws_hybrid, covwt = draws_covwt))
@@ -337,43 +365,45 @@ res <- compute_all_aggregates()
 cat("\n=== Group-level inputs (with Jeon adjustment alpha = 0.219) ===\n")
 cat(sprintf("Channel blend applied: mu_online=%.2f, omega_online=%.2f\n",
             MU_ONLINE_DEFAULT, OMEGA_ONLINE_DEFAULT))
-cat("hybrid_instore = source elasticity treated as in-store baseline\n")
-cat("hybrid_online  = mu_online * hybrid_instore (derived, not measured)\n")
-cat("hybrid_blended = omega_online * online + (1-omega_online) * instore\n\n")
+cat("source_pooled    = source elasticity as published (whole-market;\n")
+cat("                   dominated by in-person purchases — see header)\n")
+cat("derived_online   = mu_online * source_pooled (derived, not measured)\n")
+cat("headline_blended = omega_online * derived_online +\n")
+cat("                   (1 - omega_online) * source_pooled\n\n")
 print(res$table %>%
         mutate(
-          hybrid_instore = hybrid_elast,
-          hybrid_online  = MU_ONLINE_DEFAULT * hybrid_elast,
-          hybrid_blended = OMEGA_ONLINE_DEFAULT * hybrid_online +
-                           (1 - OMEGA_ONLINE_DEFAULT) * hybrid_instore
+          source_pooled    = hybrid_elast,
+          derived_online   = MU_ONLINE_DEFAULT * hybrid_elast,
+          headline_blended = OMEGA_ONLINE_DEFAULT * derived_online +
+            (1 - OMEGA_ONLINE_DEFAULT) * source_pooled
         ) %>%
         select(group, share_fah, hybrid_source,
-               hybrid_instore, hybrid_online, hybrid_blended, hybrid_se) %>%
+               source_pooled, derived_online, headline_blended, hybrid_se) %>%
         mutate(across(where(is.numeric), ~ round(.x, 3))))
 
 cat(sprintf("\n=== Headline by channel (alpha=%.3f) ===\n",
             ALPHA_SCANNER_DEFAULT))
-cat("in_store    = no channel blending (omega=0)\n")
-cat(sprintf("online      = mu_online (%.2f) applied to in_store\n",
+cat("source_pooled    = no channel blending (omega=0); essentially in-person\n")
+cat(sprintf("derived_online   = mu_online (%.2f) applied to source_pooled\n",
             MU_ONLINE_DEFAULT))
-cat(sprintf("blended_%.0fpct = headline (current defaults)\n\n",
-            OMEGA_ONLINE_DEFAULT * 100))
+cat(sprintf("headline_blended = omega_online (%.2f) blend of the two\n\n",
+            OMEGA_ONLINE_DEFAULT))
 headline_by_channel <- tibble(
-  estimator    = c("oa", "zhen", "hybrid", "covwt"),
-  in_store     = c(res$headline$eps_oa_instore,
-                   res$headline$eps_zhen_instore,
-                   res$headline$eps_hybrid_instore,
-                   0.5 * res$headline$eps_zhen_instore +
-                     0.5 * res$headline$eps_oa_instore),
-  online       = MU_ONLINE_DEFAULT * c(res$headline$eps_oa_instore,
-                                       res$headline$eps_zhen_instore,
-                                       res$headline$eps_hybrid_instore,
-                                       0.5 * res$headline$eps_zhen_instore +
-                                         0.5 * res$headline$eps_oa_instore),
-  blended      = c(res$headline$eps_oa_blended,
-                   res$headline$eps_zhen_blended,
-                   res$headline$eps_hybrid_blended,
-                   res$headline$eps_covwt_blended)
+  estimator        = c("oa", "zhen", "hybrid", "covwt"),
+  source_pooled    = c(res$headline$eps_oa_source_pooled,
+                       res$headline$eps_zhen_source_pooled,
+                       res$headline$eps_hybrid_source_pooled,
+                       0.5 * res$headline$eps_zhen_source_pooled +
+                         0.5 * res$headline$eps_oa_source_pooled),
+  derived_online   = MU_ONLINE_DEFAULT * c(res$headline$eps_oa_source_pooled,
+                                           res$headline$eps_zhen_source_pooled,
+                                           res$headline$eps_hybrid_source_pooled,
+                                           0.5 * res$headline$eps_zhen_source_pooled +
+                                             0.5 * res$headline$eps_oa_source_pooled),
+  headline_blended = c(res$headline$eps_oa_headline_blended,
+                       res$headline$eps_zhen_headline_blended,
+                       res$headline$eps_hybrid_headline_blended,
+                       res$headline$eps_covwt_headline_blended)
 )
 print(headline_by_channel %>% mutate(across(where(is.numeric), ~ round(.x, 3))))
 
@@ -394,7 +424,7 @@ sens <- expand_grid(omega_online = omega_grid, mu_online = mu_grid) %>%
                                              mu_online    = ..2,
                                              n_mc         = 1,
                                              seed         = NULL)$headline),
-    eps_hybrid = map_dbl(headline, "eps_hybrid_blended")
+    eps_hybrid = map_dbl(headline, "eps_hybrid_headline_blended")
   ) %>%
   select(-headline)
 
@@ -414,10 +444,10 @@ alpha_sens <- tibble(alpha_scanner = alpha_grid) %>%
     headline = map(alpha_scanner,
                    ~ compute_all_aggregates(alpha_scanner = .,
                                             n_mc = 1, seed = NULL)$headline),
-    eps_zhen_blended     = map_dbl(headline, "eps_zhen_blended"),
-    eps_hybrid_blended   = map_dbl(headline, "eps_hybrid_blended"),
-    eps_covwt_blended    = map_dbl(headline, "eps_covwt_blended"),
-    eps_oa_blended       = map_dbl(headline, "eps_oa_blended")
+    eps_zhen_headline_blended     = map_dbl(headline, "eps_zhen_headline_blended"),
+    eps_hybrid_headline_blended   = map_dbl(headline, "eps_hybrid_headline_blended"),
+    eps_covwt_headline_blended    = map_dbl(headline, "eps_covwt_headline_blended"),
+    eps_oa_headline_blended       = map_dbl(headline, "eps_oa_headline_blended")
   ) %>%
   select(-headline)
 
