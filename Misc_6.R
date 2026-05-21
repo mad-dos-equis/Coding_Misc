@@ -1,5 +1,5 @@
 # =============================================================================
-# grocery_elasticity_hybrid_v2.R
+# grocery_elasticity_hybrid.R
 #
 # Channel-augmented spending-weighted FAH own-price elasticity using a
 # category-by-category hybrid of Okrent & Alston (2012), Zhen et al. (2014),
@@ -278,12 +278,12 @@ compute_all_aggregates <- function(omega_online    = OMEGA_ONLINE_DEFAULT,
                                    coverage_w_zhen = 0.50,
                                    n_mc            = 50000,
                                    seed            = 20260521) {
-  
+
   df <- build_master(alpha_scanner = alpha_scanner)
-  
+
   # Channel-blending multiplier (applied uniformly within each source)
   blend_mult <- omega_online * mu_online + (1 - omega_online)
-  
+
   # Point estimates
   headline <- df %>%
     summarise(
@@ -294,22 +294,22 @@ compute_all_aggregates <- function(omega_online    = OMEGA_ONLINE_DEFAULT,
       eps_zhen_blended     = eps_zhen_instore   * blend_mult,
       eps_hybrid_blended   = eps_hybrid_instore * blend_mult,
       eps_covwt_blended    = coverage_w_zhen * eps_zhen_blended +
-        (1 - coverage_w_zhen) * eps_oa_blended
+                             (1 - coverage_w_zhen) * eps_oa_blended
     )
-  
+
   # Monte Carlo CIs propagating each source's SEs through blending and weighting
   if (!is.null(seed)) set.seed(seed)
   n_groups <- nrow(df)
-  
+
   draws_oa     <- replicate(n_mc,
-                            sum(df$share_fah * rnorm(n_groups, df$oa_elast_instore, df$oa_se))) * blend_mult
+    sum(df$share_fah * rnorm(n_groups, df$oa_elast_instore, df$oa_se))) * blend_mult
   draws_zhen   <- replicate(n_mc,
-                            sum(df$share_fah * (rnorm(n_groups, df$zhen_elast_raw, df$zhen_elast_se) +
-                                                  alpha_scanner))) * blend_mult
+    sum(df$share_fah * (rnorm(n_groups, df$zhen_elast_raw, df$zhen_elast_se) +
+                        alpha_scanner))) * blend_mult
   draws_hybrid <- replicate(n_mc,
-                            sum(df$share_fah * rnorm(n_groups, df$hybrid_elast, df$hybrid_se))) * blend_mult
+    sum(df$share_fah * rnorm(n_groups, df$hybrid_elast, df$hybrid_se))) * blend_mult
   draws_covwt  <- coverage_w_zhen * draws_zhen + (1 - coverage_w_zhen) * draws_oa
-  
+
   ci <- tibble(
     estimator = c("oa", "zhen", "hybrid", "coverage_weighted"),
     point     = c(headline$eps_oa_blended, headline$eps_zhen_blended,
@@ -323,7 +323,7 @@ compute_all_aggregates <- function(omega_online    = OMEGA_ONLINE_DEFAULT,
     ci_up_95  = c(quantile(draws_oa, 0.975), quantile(draws_zhen, 0.975),
                   quantile(draws_hybrid, 0.975), quantile(draws_covwt, 0.975))
   )
-  
+
   list(table = df, headline = headline, ci = ci,
        draws = list(oa = draws_oa, zhen = draws_zhen,
                     hybrid = draws_hybrid, covwt = draws_covwt))
@@ -334,13 +334,50 @@ compute_all_aggregates <- function(omega_online    = OMEGA_ONLINE_DEFAULT,
 # -----------------------------------------------------------------------------
 res <- compute_all_aggregates()
 
-cat("\n=== Group-level inputs (with Jeon adjustment alpha = 0.219) ===\n\n")
+cat("\n=== Group-level inputs (with Jeon adjustment alpha = 0.219) ===\n")
+cat(sprintf("Channel blend applied: mu_online=%.2f, omega_online=%.2f\n",
+            MU_ONLINE_DEFAULT, OMEGA_ONLINE_DEFAULT))
+cat("hybrid_instore = source elasticity treated as in-store baseline\n")
+cat("hybrid_online  = mu_online * hybrid_instore (derived, not measured)\n")
+cat("hybrid_blended = omega_online * online + (1-omega_online) * instore\n\n")
 print(res$table %>%
-        select(group, share_fah, oa_elast_instore, zhen_elast_adjusted,
-               luke_elast_adjusted, hybrid_source, hybrid_elast, hybrid_se) %>%
+        mutate(
+          hybrid_instore = hybrid_elast,
+          hybrid_online  = MU_ONLINE_DEFAULT * hybrid_elast,
+          hybrid_blended = OMEGA_ONLINE_DEFAULT * hybrid_online +
+                           (1 - OMEGA_ONLINE_DEFAULT) * hybrid_instore
+        ) %>%
+        select(group, share_fah, hybrid_source,
+               hybrid_instore, hybrid_online, hybrid_blended, hybrid_se) %>%
         mutate(across(where(is.numeric), ~ round(.x, 3))))
 
-cat(sprintf("\n=== Headline numbers (omega=%.2f, mu=%.2f, alpha=%.3f) ===\n",
+cat(sprintf("\n=== Headline by channel (alpha=%.3f) ===\n",
+            ALPHA_SCANNER_DEFAULT))
+cat("in_store    = no channel blending (omega=0)\n")
+cat(sprintf("online      = mu_online (%.2f) applied to in_store\n",
+            MU_ONLINE_DEFAULT))
+cat(sprintf("blended_%.0fpct = headline (current defaults)\n\n",
+            OMEGA_ONLINE_DEFAULT * 100))
+headline_by_channel <- tibble(
+  estimator    = c("oa", "zhen", "hybrid", "covwt"),
+  in_store     = c(res$headline$eps_oa_instore,
+                   res$headline$eps_zhen_instore,
+                   res$headline$eps_hybrid_instore,
+                   0.5 * res$headline$eps_zhen_instore +
+                     0.5 * res$headline$eps_oa_instore),
+  online       = MU_ONLINE_DEFAULT * c(res$headline$eps_oa_instore,
+                                       res$headline$eps_zhen_instore,
+                                       res$headline$eps_hybrid_instore,
+                                       0.5 * res$headline$eps_zhen_instore +
+                                         0.5 * res$headline$eps_oa_instore),
+  blended      = c(res$headline$eps_oa_blended,
+                   res$headline$eps_zhen_blended,
+                   res$headline$eps_hybrid_blended,
+                   res$headline$eps_covwt_blended)
+)
+print(headline_by_channel %>% mutate(across(where(is.numeric), ~ round(.x, 3))))
+
+cat(sprintf("\n=== Headline blended numbers with 95%% CIs (omega=%.2f, mu=%.2f, alpha=%.3f) ===\n",
             OMEGA_ONLINE_DEFAULT, MU_ONLINE_DEFAULT, ALPHA_SCANNER_DEFAULT))
 print(res$ci %>% mutate(across(where(is.numeric), ~ round(.x, 3))))
 
