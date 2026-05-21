@@ -1,1251 +1,405 @@
-#' EU Regulatory Compliance Cost Pipeline -- LONG-FORM REWRITE
-#' ==========================================================================
-#'
-#' Produces ONE deliverable:
-#'
-#'   regulation_firm_counts_long.csv
-#'     One row per (regulation_name, naics_code, naics_depth, nace_code).
-#'     Columns:
-#'       regulation_name,        -- standardized short ID (DMA, GDPR, ...)
-#'                               --   from EU_Regulation_Standard column
-#'       regulation_name_full,   -- descriptive name from EU_Regulation (audit)
-#'       naics_code, naics_depth, naics_title,
-#'       nace_code,   -- FATS NACE cell, or sentinel:
-#'                    --   "B-S_X_O_S94" for horizontal rows
-#'                    --   "BEA:<bucket label>" for BEA gap-fill rows
-#'                    --   "NACE_Section_O_excluded" for structural-zero rows
-#'       source,      -- "FATS" | "BEA_gap_fill" | "FATS_horizontal_aggregate"
-#'                    --   | "structural_zero" (NACE Section O exclusion)
-#'       allocated_firms,         -- per-row firm-count assignment
-#'       allocated_turnover_meur, -- per-row net turnover assignment (million EUR)
-#'                                --   Populated for FATS rows wherever Eurostat
-#'                                --   publishes NETTUR_MEUR for the NACE cell.
-#'                                --   Populated for BEA_gap_fill rows wherever
-#'                                --   BEA publishes worldwide sales for the
-#'                                --   bucket (Computers/electronic, Finance
-#'                                --   except depository, Transportation -- but
-#'                                --   NOT Depository banking, Insurance, or
-#'                                --   Utilities, all of which BEA suppresses).
-#'                                --   EU27 estimated via count-based share.
-#'       weight,                  -- the share of the NACE/bucket total assigned to this NAICS
-#'       nace_total_firms,        -- the underlying NACE/bucket firm-count total
-#'       nace_total_turnover_meur,-- the underlying NACE turnover total (million EUR)
-#'       any_partial,             -- TRUE if concordance partial-match flagged
-#'       any_suppressed,          -- TRUE if FATS flag == "C" for any pulled indicator
-#'       bea_source_label,        -- BEA bucket name (BEA rows only)
-#'       eu27_share_applied,      -- BEA worldwide->EU27 share (BEA rows only)
-#'       notes
-#'
-#' Per-row firm-count assignment is correct under the same methodology as the
-#' previous v2.2 pipeline:
-#'   - FATS rows:       allocated_firms = nace_total * (n_naics_6dig / total_6dig_in_nace_cell)
-#'   - BEA rows:        allocated_firms = bucket_eu27 * (covers_n_slots / bucket_total_slots)
-#'   - Horizontal rows: allocated_firms = B-S_X_O_S94 total
-#'
-#' To roll up to NAICS-level: sum allocated_firms by (naics_code, naics_depth)
-#'                            within source = "FATS"; BEA and horizontal already
-#'                            have one row per (reg, naics).
-#' To roll up to regulation-level with horizontal override:
-#'   sectoral_only = sum(allocated_firms) where source != "FATS_horizontal_aggregate"
-#'   us_firms_total = horizontal value if any horizontal row exists, else sectoral_only
-#' (See compute_regulation_summary() at the bottom for a one-shot helper.)
-#'
-#' INPUTS expected in project_dir:
-#'   usdia2022r-Part-III-A1-A4.xls
-#'   ISIC_Rev_4_to_2022_NAICS.xlsx
-#'   2-6_digit_2022_Codes.xlsx
-#'   eu_reg_naics_crosswalk_v2_1_1.xlsx
-#'
-#' Run:    source("eu_reg_pipeline_long.R")
-#' ----------------------------------------------------------------------------
-
-# ============================================================================
-# DATA SOURCES AND THE NAICS / ISIC / NACE CHAIN
-# ============================================================================
+# =============================================================================
+# grocery_elasticity_hybrid_v2.R
 #
-# The regulation crosswalk scopes regulations to NAICS 2022 codes (US). Firm
-# counts come from two complementary sources, neither of which is published
-# at NAICS:
+# Channel-augmented spending-weighted FAH own-price elasticity using a
+# category-by-category hybrid of Okrent & Alston (2012), Zhen et al. (2014),
+# and Luke, Tonsor & Schroeder (2025) for meat.
 #
-#   FATS (Eurostat fats_activ): publishes counts at NACE Rev. 2 cells.
-#     US-UCI enterprises resident in EU27. No size threshold.
-#   BEA USDIA (Tables III.A.3 / III.A.4): publishes counts at BEA's own
-#     proprietary industry buckets that resemble NAICS 2-3 digit groupings
-#     but are not actually NAICS. Majority-owned foreign affiliates with
-#     assets/sales/income > $25M.
+# Marshallian vs. Hicksian note: OA reports uncompensated (Marshallian);
+# Zhen reports median Marshallian; Luke reports Hicksian (compensated).
+# In practice the distinction is what's held fixed when the price changes:
+#   - Marshallian (uncompensated): nominal income (or total expenditure) is
+#     held fixed. The estimate captures both the substitution response and
+#     the real-income hit of the price change. This is the right concept
+#     for most policy questions because consumers don't get compensated
+#     when prices rise; their real purchasing power simply falls.
+#   - Hicksian (compensated): utility is held fixed. Pure substitution
+#     effect only — the consumer is imagined to be given (or taken) just
+#     enough income to keep them on the same indifference curve. Useful
+#     for welfare calculations but not for "how much less will people
+#     actually buy if prices rise?"
+# The Slutsky equation links them: eps_M = eps_H - w_i * eta_i, where
+# w_i is the good's budget share and eta_i is its expenditure (income)
+# elasticity. The subtraction captures the income effect — for a normal
+# good (eta > 0), Marshallian is more elastic than Hicksian because the
+# price hike also makes the consumer poorer in real terms, further
+# reducing quantity demanded. We convert Luke's Hicksian estimates to
+# Marshallian via Slutsky using Luke's reported expenditure elasticities,
+# so all three sources are on the same uncompensated (Marshallian) footing.
 #
-# The two sources reach NAICS via DIFFERENT mechanisms:
+# Why the headline is more elastic than diary-only estimates suggest:
+# This is a feature of the data, not a bug. A well-documented finding in
+# the food-demand literature (formalized by Jeon et al. 2024 and replicated
+# by Luke, Tonsor & Schroeder 2026) is that scanner-data own-price
+# elasticities are systematically more elastic than diary-data or
+# publicly-available-data elasticities for the same categories. Plausible
+# mechanisms include: scanner data accurately measure sale-driven quantity
+# spikes that diary data smooth over; scanner data capture brand-switching
+# within categories that diary data miss; and scanner prices are quantity-
+# weighted, mechanically lining up price drops with purchase surges.
+# Because the hybrid headline draws on scanner data for four of six FAH
+# groups (cereals/bakery, dairy, beverages, other FAH) and Luke scanner
+# data for the meat group, it inherits this scanner-elastic bias. We
+# apply the Jeon et al. correction of +0.219 to all scanner-based inputs
+# to partially offset this bias, but a residual gap to diary-only estimates
+# remains and is the right reading of the data rather than a methodological
+# artifact.
 #
-#   FATS path (algorithmic, via ISIC):
-#       NAICS 6-digit ──(US Census ISIC↔NAICS file)──▶ ISIC 4-digit
-#       ISIC 4-digit  ──(2-digit divisions identical by construction)──▶ NACE division
+# -----------------------------------------------------------------------------
+# Data sources
+# -----------------------------------------------------------------------------
 #
-#     The second hop works without a crosswalk file because NACE Rev. 2
-#     was constructed to share its first two digits with ISIC Rev. 4.
-#     `substr(isic_code, 1, 2)` IS the NACE division. If a future NACE
-#     revision diverges from ISIC at the 2-digit level this would silently
-#     break -- check before upgrading classification vintages.
+# [1] Okrent & Alston (2012). USDA-ERS ERR-139.
+#     https://www.ers.usda.gov/publications/pub-details?pubid=45003
 #
-#   BEA path (hand-curated, no crosswalk):
-#       gap_naics_map directly maps each gap-filled NAICS code to a BEA
-#       Table III.A.4 bucket label. There is no algorithmic mapping; the
-#       map encodes professional judgment about which bucket best
-#       approximates each NAICS code (e.g., the deliberate three-way
-#       finance split: banks vs. non-bank finance vs. insurance).
+# [2] Zhen, C., E.A. Finkelstein, J.M. Nonnemaker, S.A. Karns & J.E. Todd
+#     (2014). AJAE 96(1): 1-25.
+#     https://doi.org/10.1093/ajae/aat049
+#     Open mirror: https://bpb-us-e1.wpmucdn.com/sites.psu.edu/dist/c/13885/files/2014/07/
+#         Zhen2014_Predicting-the-effects-of-sugar-sweetened-beverage-taxes-on-food-and-beverage-demand-in-a-large-demand-system.pdf
+#     Standard errors derived as |elast| / |t-stat| from Table 2.
 #
-# COMPLEMENTARITY (NOT ADDITIVITY)
+# [3] Luke, J.R., G.T. Tonsor & T.C. Schroeder (2026). "U.S. Meat Demand
+#     Elasticity Estimates: Using Publicly Available Data versus Scanner
+#     Data." Agricultural and Resource Economics Review 55(1): 104-123.
+#     https://doi.org/10.1017/age.2025.10020 (open access, CC-BY)
+#     Table 2 (Rotterdam coefficients) and Table 3 (Hicksian elasticities).
+#     Used for the meat_and_eggs group in the hybrid.
 #
-# For each NAICS code, exactly ONE of FATS or BEA is authoritative. They are
-# alternative measurements of the same population, not separate populations.
-# The script enforces this by joining FATS to the concordance, then DROPPING
-# every (naics_code, naics_depth) row that appears in gap_naics_map and
-# replacing it with the BEA gap-fill row. Never sum FATS and BEA for the
-# same code.
+# [4] Jeon, Y., H. Hoang, W. Thompson & D. Abler (2024). AEPP 46(2): 760-780.
+#     https://onlinelibrary.wiley.com/doi/10.1002/aepp.13414
+#     Per Luke, Tonsor & Schroeder (2026), Jeon et al. propose a correction
+#     factor of -0.219 to align non-scanner-based own-price elasticities to
+#     scanner-based ones. Equivalently, ADD +0.219 to a scanner-based
+#     estimate to align it to a non-scanner-based estimate (less elastic).
+#     We use alpha_scanner = +0.219 as default. Set to 0.0 to disable.
 #
-# (For reference: at the horizontal-aggregate level FATS reports ~2.2x BEA,
-# because FATS has no size threshold and uses ultimate controlling unit
-# whereas BEA has a $25M threshold and uses direct US parent. The gap is
-# mostly small firms below BEA's threshold.)
+# [5] Harris-Lagoudakis, K. (2023). IJIO 87: 102918.
+#     https://www.sciencedirect.com/science/article/abs/pii/S0167718722000935
+#     mu_online ~ 0.5 (own-price elasticities ~2x larger in-store than online).
 #
-# TWO PARALLEL-BUT-DISTINCT WEIGHTING SYSTEMS
+# [6] USDA-ERS Food Expenditure Series (2024).
+#     https://www.ers.usda.gov/data-products/food-expenditure-series
+#     Online share of FAH ~ 9.2% in 2024.
 #
-# Both sources use a `weight` column to allocate the source-cell total
-# across the NAICS codes it covers, but the denominators are different
-# concepts:
-#
-#   FATS (equal-split-by-6-digit-count, in build_concordance_long):
-#       weight = n_naics_6dig / total_6dig_in_nace_cell
-#       "Of the 6-digit NAICS classes mapping to this NACE cell, what
-#        fraction are children of this NAICS parent?"
-#       Assumes each 6-digit class contributes equally to its NACE parent.
-#
-#   BEA (slot-based, in build_bea_allocated):
-#       weight = covers_n_slots / bucket_total_slots
-#       "Of the NAICS codes the crosswalk treats as scoping this BEA
-#        bucket, how many slots does this code cover?"
-#       A 4-digit code is 1 slot. A 3-digit code with 4-digit children in
-#        the same bucket is a roll-up that covers n_children slots but
-#        does not add to the denominator.
-#
-# Both compose linearly: allocated_firms = source_cell_total × weight.
-# The meaning of `weight` in the output table depends on `source`.
-#
-# WHY GAP_NAICS_MAP NAICS CODES GET DROPPED FROM FATS
-#
-# Two reasons (encoded in gap_reason):
-#
-#   Scope-excluded -- FATS doesn't publish the relevant NACE cell at all
-#     or only at section-level granularity:
-#       NAICS 111/112/113 + 4-digit children: no Section A (agriculture)
-#       NAICS 2211: only NACE D as a whole, no division for electric
-#       NAICS 486: only NACE H49 for all land transport, no pipeline split
-#     Any FATS rows landing on these NAICS via the concordance are
-#     partial-overlap noise, not real signal.
-#
-#   Suppressed -- FATS publishes the NACE cell but the EU27 aggregate is
-#     flagged "C" because IE/LU concentrations would identify individual
-#     firms. Affects K (finance), C26 (computer/electronic mfg), H50
-#     (water transport), N77 (rental/leasing), Q87_Q88 (health/social).
-#     BEA doesn't have the same disclosure problem because its buckets
-#     are too coarse to identify individual firms.
-#
-# THE HORIZONTAL AGGREGATE (B-S_X_O_S94)
-#
-# A third path that uses neither the concordance nor gap_naics_map. FATS
-# publishes one cell containing the total business economy, defined as
-# "NACE sections B through S, excluding section O (public admin) and
-# division 94 (membership organizations)" -- that's what B-S_X_O_S94
-# encodes. ~27,000 US-UCI firms in EU27 for 2022. Used directly for
-# regulations with horizontal scope (GDPR, AI Act limited-risk tier),
-# where there's no NAICS-level allocation to do.
-#
-# WHY FATS PUBLISHES AT MULTIPLE GRANULARITIES
-#
-# FATS publishes whichever NACE cell -- single section letter, 2-digit
-# division, or multi-division bundle (e.g., C10-C12) -- has enough firms
-# to escape disclosure suppression while still being sectorally
-# meaningful. Different sectors get different granularities depending on
-# how concentrated US-UCI activity is. expand_fats_to_divisions() is the
-# function that resolves whatever FATS published into a list of 2-digit
-# divisions so the concordance can be applied uniformly.
-#
-# ============================================================================
+# =============================================================================
 
 suppressPackageStartupMessages({
-  library(data.table)
-  library(eurostat)
-  library(readxl)
+  library(dplyr)
+  library(tibble)
+  library(tidyr)
+  library(purrr)
 })
 
-# ============================================================================
-# CONFIG
-# ============================================================================
+# -----------------------------------------------------------------------------
+# 1. INPUTS
+# -----------------------------------------------------------------------------
 
-project_dir <- "C:/Users/maxxj/OneDrive/Desktop/Misc/EU_regs"
-
-pipeline_config <- list(
-  project_dir          = project_dir,
-  bea_a1_a4_file       = file.path(project_dir, "usdia2022r-Part-III-A1-A4.xls"),
-  naics_isic_file      = file.path(project_dir, "ISIC_Rev_4_to_2022_NAICS.xlsx"),
-  naics_struct_file    = file.path(project_dir, "2-6_digit_2022_Codes.xlsx"),
-  crosswalk_file       = file.path(project_dir, "eu_reg_naics_crosswalk_v2_1_1.xlsx"),
-  output_csv           = file.path(project_dir, "regulation_firm_counts_long.csv"),
-
-  # FATS indicators to pull. Each entry maps a Eurostat indic_sbs code to the
-  # column name used internally. Both the per-NACE total and the allocated
-  # per-NAICS value propagate through the pipeline in parallel.
-  fats_indicators      = list(
-    ENT_NR      = "firms",          # Number of enterprises
-    NETTUR_MEUR = "turnover_meur"   # Net turnover (million euros)
-  ),
-  fats_c_ctrl          = "US",
-  fats_geo             = "EU27_2020",
-  horizontal_nace_code = "B-S_X_O_S94",
-  anchor_year          = 2022L,
-
-  bea_vintage_year     = 2022L
+# Source [1]: Okrent & Alston (2012) Table 4 — Marshallian own-price
+oa_elasticities <- tribble(
+  ~group,                  ~oa_elast_instore, ~oa_se,
+  "cereals_and_bakery",    -0.58,              0.25,
+  "meat_and_eggs",         -0.31,              0.17,
+  "dairy",                 -0.05,              0.09,
+  "fruits_and_vegetables", -0.79,              0.19,
+  "nonalcoholic_beverages",-0.65,              0.39,
+  "other_fah",             -0.98,              0.30
 )
 
-# ============================================================================
-# STATIC LOOKUPS
-# ============================================================================
-
-# NACE Rev. 2: section letter -> 2-digit divisions it contains
-nace_section_to_divisions <- list(
-  A = sprintf("%02d", 1:3),  B = sprintf("%02d", 5:9),
-  C = sprintf("%02d", 10:33), D = "35",
-  E = sprintf("%02d", 36:39), F = sprintf("%02d", 41:43),
-  G = sprintf("%02d", 45:47), H = sprintf("%02d", 49:53),
-  I = sprintf("%02d", 55:56), J = sprintf("%02d", 58:63),
-  K = sprintf("%02d", 64:66), L = "68",
-  M = sprintf("%02d", 69:75), N = sprintf("%02d", 77:82),
-  O = "84", P = "85",
-  Q = sprintf("%02d", 86:88), R = sprintf("%02d", 90:93),
-  S = sprintf("%02d", 94:96), T = sprintf("%02d", 97:98), U = "99"
+# Source [1]: Okrent & Alston (2012) Table 1 first-stage budget shares
+oa_shares <- tribble(
+  ~group,                   ~share_pct_total_budget,
+  "cereals_and_bakery",      1.66,
+  "meat_and_eggs",           2.88,
+  "dairy",                   1.21,
+  "fruits_and_vegetables",   1.69,
+  "nonalcoholic_beverages",  0.75,
+  "other_fah",               2.76
 )
 
-# FATS-published bundle codes -> component 2-digit divisions.
-# FATS publishes whichever cell granularity escapes disclosure suppression
-# while remaining sectorally meaningful. A given sector may be published as
-# a section letter (whole "C"), a single division ("C26"), or a multi-
-# division bundle like these. expand_fats_to_divisions() resolves any of
-# these into a uniform list of 2-digit divisions for the concordance.
-fats_bundle_expansions <- list(
-  "C10-C12" = c("10","11","12"), "C13-C15" = c("13","14","15"),
-  "C16-C18" = c("16","17","18"), "C22_C23" = c("22","23"),
-  "C24_C25" = c("24","25"),       "C29_C30" = c("29","30"),
-  "C31_C32" = c("31","32"),       "H52_H53" = c("52","53"),
-  "J59_J60" = c("59","60"),       "J62_J63" = c("62","63"),
-  "M69-M71" = c("69","70","71"),  "M73-M75" = c("73","74","75"),
-  "N78-N82" = c("78","79","80","81","82"),
-  "Q87_Q88" = c("87","88"),       "S95_S96" = c("95","96")
+# Source [2]: Zhen et al. (2014) Table 2 — own-price elasticities, t-stats
+# SE derived as |elast|/|t|. These are statistical SEs from a model fit
+# on ~110K quarterly household observations; very small by construction.
+zhen_categories <- tribble(
+  ~zhen_cat,              ~exp_low, ~exp_high, ~elast,    ~t_stat,   ~oa_group,
+  "regular_csd",           6.33,    5.53,    -1.035,    -103.2,   "nonalcoholic_beverages",
+  "sports_energy_drinks",  1.39,    2.08,    -2.363,    -106.9,   "nonalcoholic_beverages",
+  "whole_milk",            2.39,    1.70,    -0.900,     -23.9,   "dairy",
+  "reduced_fat_milk",      5.76,    6.64,    -1.199,    -129.5,   "dairy",
+  "whole_grain_bread",     0.89,    1.26,    -1.196,     -95.0,   "cereals_and_bakery",
+  "white_bread",           5.23,    5.72,    -0.666,    -103.2,   "cereals_and_bakery",
+  "cheese",                7.19,    8.83,    -0.567,     -64.9,   "dairy",
+  "juice_100pct",          4.09,    5.01,    -1.566,     -78.2,   "nonalcoholic_beverages",
+  "juice_drinks",          3.12,    3.26,    -1.192,     -99.0,   "nonalcoholic_beverages",
+  "peanut_butter",         0.79,    0.83,    -1.466,     -90.5,   "other_fah",
+  "cereals",               6.38,    7.18,    -0.814,     -65.0,   "cereals_and_bakery",
+  "yogurt",                1.85,    2.64,    -2.043,    -119.4,   "dairy",
+  "diet_csd",              3.55,    4.85,    -0.959,     -74.3,   "nonalcoholic_beverages",
+  "bottled_water",         2.13,    2.90,    -1.703,     -97.7,   "nonalcoholic_beverages",
+  "canned_dried_fruits",   2.32,    2.58,    -1.222,    -116.2,   "fruits_and_vegetables",
+  "canned_vegetables",     4.52,    4.91,    -1.516,    -138.9,   "fruits_and_vegetables",
+  "frozen_dinners",       11.67,   12.68,    -0.765,     -61.4,   "other_fah",
+  "canned_soup",           2.49,    3.18,    -2.472,    -253.8,   "other_fah",
+  "candy",                 6.19,    7.00,    -1.485,    -108.4,   "other_fah",
+  "ice_cream",             3.24,    3.35,    -1.115,    -160.3,   "dairy",
+  "cakes_cookies",         7.45,    8.06,    -1.697,    -122.2,   "cereals_and_bakery",
+  "lunch_meat",            3.69,    3.89,    -1.216,    -139.5,   "meat_and_eggs",   # excluded from hybrid
+  "snacks",                7.02,    8.52,    -1.266,     -80.7,   "other_fah"
+) %>%
+  mutate(elast_se = abs(elast / t_stat))
+
+# Source [3]: Luke, Tonsor & Schroeder (2026) — beef, chicken, pork
+# Table 3 reports Hicksian elasticities; Table 1 reports expenditure shares
+# and expenditure elasticities. We convert to Marshallian via Slutsky.
+# SE on Hicksian = SE(c_ii)/w_i from Table 2 coefficients.
+luke_meat <- tribble(
+  ~meat,    ~hicksian_elast, ~hicksian_se, ~exp_share, ~exp_elast,
+  "beef",   -0.498,           0.157,        0.498,      0.934,
+  "chicken",-1.113,           0.394,        0.249,      1.001,
+  "pork",   -2.016,           0.071,        0.253,      1.120
+) %>%
+  mutate(
+    # Slutsky conversion to Marshallian for comparability with Zhen and OA
+    marshallian_elast = hicksian_elast - exp_share * exp_elast,
+    # SE on Marshallian ≈ SE on Hicksian (the w*eta term is a deterministic
+    # adjustment using point estimates; ignoring covariance is a small-sample
+    # approximation)
+    marshallian_se    = hicksian_se,
+    # Within-meat-group expenditure share (renormalize among the 3 meats)
+    within_meat_share = exp_share / sum(exp_share)
+  )
+
+# Tunable parameters
+MU_ONLINE_DEFAULT      <- 0.50     # Source [5]
+OMEGA_ONLINE_DEFAULT   <- 0.10     # Source [6]
+ALPHA_SCANNER_DEFAULT  <- 0.219    # Source [4] via Luke et al. citation
+# W_LOW and W_HIGH are the population weights used to collapse Zhen's
+# low-income and high-income per-capita expenditure columns into a single
+# average expenditure per category. Zhen stratifies at 185% of the Federal
+# Poverty Level (FPL) — the standard threshold for SNAP and several other
+# means-tested programs — and reports per-capita per-quarter expenditures
+# separately for households below and above this cutoff. Based on the 2006
+# Current Population Survey (the survey year matching Zhen's Nielsen
+# Homescan sample), approximately 35% of U.S. households fell below 185%
+# FPL and 65% above. We use those shares as a fixed weighting; the
+# headline FAH elasticity is insensitive to reasonable perturbations
+# (e.g., 0.30/0.70 or 0.40/0.60) because the within-category low/high
+# expenditure differences are modest.
+W_LOW                  <- 0.35     # Pop share below 185% FPL, 2006 CPS
+W_HIGH                 <- 0.65     # Pop share at or above 185% FPL, 2006 CPS
+
+# Group-level coverage classification for the HYBRID rule
+coverage_classification <- tribble(
+  ~group,                   ~hybrid_source,
+  "cereals_and_bakery",     "zhen",
+  "meat_and_eggs",          "luke",     # replaced (was "oa")
+  "dairy",                  "zhen",
+  "fruits_and_vegetables",  "oa",
+  "nonalcoholic_beverages", "zhen",
+  "other_fah",              "zhen"
 )
 
-# FATS aggregate codes (excluded from concordance):
-#   B-S_X_O_S94: total business economy (NACE sections B-S, excl. O public
-#                admin and division 94 membership organizations) -- used
-#                directly as the horizontal aggregate for regulations with
-#                horizontal scope. NOT distributed to NAICS via concordance.
-#   G-S_X_O_S94: same but starting at section G (excludes industry).
-fats_aggregate_codes <- c("B-S_X_O_S94", "G-S_X_O_S94")
-
-# gap_naics_map: the hand-curated parallel mapping system that bypasses the
-# NAICS/ISIC/NACE chain entirely. Each row pairs a NAICS code with a BEA
-# Table III.A.4 bucket label that the script will use as that NAICS code's
-# firm-count source instead of FATS. There is no algorithmic crosswalk
-# between NAICS and BEA buckets -- this table IS the mapping.
-#
-# See the architectural block at top of file for why this exists. Two row
-# categories, distinguished by gap_reason:
-#   "fats_scope_excluded_*" -- FATS doesn't publish the relevant NACE cell
-#       at usable granularity (Section A entirely absent; D, H49 only at
-#       coarse aggregates).
-#   "fats_suppressed_*"     -- FATS publishes the cell but the EU27 value
-#       is flagged "C" (confidential) due to IE/LU concentration.
-#
-# Notable design choice: section K (finance) gets a deliberate three-way
-# split into separate BEA buckets (depository / non-depository / insurance)
-# rather than a single "Finance" bucket, because DORA, MiCA, and insurance-
-# specific regs scope these very differently and a single bucket would
-# erase those distinctions.
-#
-# Schema: naics_code (3- or 4-digit), crosswalk_depth, naics_description,
-#         a4_industry_label (verbatim from BEA Table III.A.4), gap_reason.
-# See v2.2 docstring in original pipeline for the full categorization rationale.
-# NOTE on scoping: This map has been trimmed to the 14-regulation digital
-# scope (GDPR, DMA, DSA, AI Act, NIS2, ePrivacy, CDSM, Data Act, Political
-# Ads, EMFA, CSRD, CSDDD, DORA, CRA -- plus four more being added via
-# crosswalk extension). Three full buckets were dropped because no target
-# regulation scopes any of their NAICS codes: Agriculture/Forestry/Fishing
-# (17 codes), Real estate and rental/leasing (6 codes), Health care and
-# social assistance (9 codes). Within each KEPT bucket, ALL members are
-# retained even if some are not invoked by target regs -- this preserves
-# the slot denominator (bucket_total_slots), which represents the BEA
-# bucket's full sectoral landscape, not the regulatory landscape. Trimming
-# within a bucket would inflate per-NAICS allocations for the codes that
-# remain.
-#
-gap_naics_map <- rbindlist(list(
-  # Utilities (NACE D depth-limited): NAICS 2211 used by NIS2 (energy).
-  # Registered at 4-digit depth to match the crosswalk's (naics_3digit=221,
-  # naics_4digit=2211, assigned_depth=4) scoping of NIS2 to electric power
-  # specifically, leaving water (2213) and gas (2212) outside this bucket.
-  data.table(
-    naics_code = "2211",
-    crosswalk_depth = "4-digit",
-    naics_description = "Electric power generation, transmission, distribution",
-    a4_industry_label = "Utilities",
-    gap_reason = "fats_depth_limited_within_section_d"
-  ),
-  # Transportation (NACE H49 depth-limited + H50 suppressed): bucket spans
-  # 486 (pipelines) and 483/4831/4832 (water transport). NIS2 scopes 486
-  # and 483.
-  data.table(
-    naics_code = c("486","483","4831","4832"),
-    crosswalk_depth = c("3-digit","3-digit","4-digit","4-digit"),
-    naics_description = c("Pipeline transportation",
-                          "Water transportation",
-                          "Deep sea, coastal, and Great Lakes water transportation",
-                          "Inland water transportation"),
-    a4_industry_label = "Transportation and warehousing",
-    gap_reason = c("fats_depth_limited_within_h49",
-                   "fats_suppressed_h50",
-                   "fats_suppressed_h50",
-                   "fats_suppressed_h50")
-  ),
-  # Finance section K (suppressed): used by DORA, NIS2.
-  # Three-way split into separate BEA buckets preserved.
-  data.table(
-    naics_code = c("522","523","524","525"),
-    crosswalk_depth = "3-digit",
-    naics_description = c("Credit intermediation and related activities",
-                          "Securities, commodity contracts, financial investments",
-                          "Insurance carriers and related activities",
-                          "Funds, trusts, and other financial vehicles"),
-    a4_industry_label = c("Finance, except depository institutions",
-                          "Finance, except depository institutions",
-                          "Insurance carriers and related activities",
-                          "Finance, except depository institutions"),
-    gap_reason = "fats_suppressed_section_k"
-  ),
-  data.table(
-    naics_code = c("5221","5222","5223","5231","5232","5239","5241","5242"),
-    crosswalk_depth = "4-digit",
-    naics_description = c("Depository credit intermediation (banks)",
-                          "Nondepository credit intermediation",
-                          "Activities related to credit intermediation",
-                          "Securities and commodity contracts intermediation",
-                          "Securities and commodity exchanges",
-                          "Other financial investment activities",
-                          "Insurance carriers",
-                          "Insurance agencies, brokerages, and related activities"),
-    a4_industry_label = c("Depository credit intermediation (banking)",
-                          "Finance, except depository institutions",
-                          "Finance, except depository institutions",
-                          "Finance, except depository institutions",
-                          "Finance, except depository institutions",
-                          "Finance, except depository institutions",
-                          "Insurance carriers and related activities",
-                          "Insurance carriers and related activities"),
-    gap_reason = "fats_suppressed_section_k"
-  ),
-  # Computer/electronic mfg (NACE C26 suppressed): used by CRA for
-  # connected products.
-  data.table(
-    naics_code = c("3341","3342","3343","3344","3345","3346"),
-    crosswalk_depth = "4-digit",
-    naics_description = c("Computer and peripheral equipment manufacturing",
-                          "Communications equipment manufacturing",
-                          "Audio and video equipment manufacturing",
-                          "Semiconductor and other electronic component manufacturing",
-                          "Navigational, measuring, electromedical, and control instruments manufacturing",
-                          "Manufacturing and reproducing magnetic and optical media"),
-    a4_industry_label = "Computers and electronic products",
-    gap_reason = "fats_suppressed_c26"
-  )
-))
-
-# ============================================================================
-# HELPERS
-# ============================================================================
-
-find_col <- function(dt, patterns, fallback_msg, exclude = NULL) {
-  cols <- names(dt)
-  for (pat in patterns) {
-    hit <- grep(pat, cols, ignore.case = TRUE, value = TRUE)
-    if (!is.null(exclude)) for (e in exclude) hit <- hit[!grepl(e, hit, ignore.case = TRUE)]
-    if (length(hit) >= 1) return(hit[1])
-  }
-  stop(sprintf("Could not find column matching any of: %s\n  Available: %s\n  %s",
-               paste(patterns, collapse = ", "),
-               paste(cols, collapse = ", "), fallback_msg))
-}
-
-# Expand a FATS NACE code (section letter, division like "C26", or bundle
-# like "C10-C12") into its component 2-digit NACE divisions.
-expand_fats_to_divisions <- function(fats_codes) {
-  out <- list()
-  for (fc in fats_codes) {
-    if (fc %in% fats_aggregate_codes) next
-    if (fc %in% names(fats_bundle_expansions)) {
-      divs <- fats_bundle_expansions[[fc]]
-    } else if (nchar(fc) == 1 && fc %in% names(nace_section_to_divisions)) {
-      divs <- nace_section_to_divisions[[fc]]
-    } else if (grepl("^[A-Z][0-9]{2}$", fc)) {
-      divs <- substr(fc, 2, 3)
-    } else {
-      warning(sprintf("FATS code '%s' did not match any expansion rule", fc))
-      next
-    }
-    out[[length(out) + 1]] <- data.table(fats_code = fc, nace_division = divs)
-  }
-  rbindlist(out)
-}
-
-# ============================================================================
-# STEP 1: PULL FATS
-# ============================================================================
-# Returns a data.table at (nace_r2) granularity for US-UCI EU27 affiliates,
-# with one column per configured indicator (firms, turnover_meur, ...) plus
-# a parallel set of flag columns (firms_flag, turnover_meur_flag, ...).
-# Also returns the full unique nace_r2 list (for the concordance) and the
-# horizontal aggregate values for each indicator.
-
-pull_fats <- function(config) {
-  message("\n=== STEP 1: FATS PULL ===")
-  raw <- as.data.table(get_eurostat("fats_activ", time_format = "num",
-                                    keepFlags = TRUE))
-  time_col <- intersect(c("TIME_PERIOD","time"), names(raw))[1]
-  setnames(raw, time_col, "year")
-  raw[, year := as.integer(year)]
-
-  indicator_codes <- names(config$fats_indicators)
-  indicator_names <- unlist(config$fats_indicators)
-
-  filtered <- raw[indic_sbs %in% indicator_codes &
-                    c_ctrl    == config$fats_c_ctrl &
-                    geo       == config$fats_geo &
-                    year      == config$anchor_year]
-
-  if (nrow(filtered) == 0) {
-    stop(sprintf("No FATS rows for %s, %s, %s, %d",
-                 paste(indicator_codes, collapse = "/"),
-                 config$fats_c_ctrl, config$fats_geo, config$anchor_year))
-  }
-
-  # Pivot wide: one row per NACE, one column pair (value + flag) per indicator
-  long <- filtered[, .(nace_code = as.character(nace_r2),
-                       indic_sbs, value = values, flag = flags)]
-
-  # Rename indicator codes to friendly names per config
-  long[, indicator := indicator_names[match(indic_sbs, indicator_codes)]]
-
-  value_wide <- dcast(long, nace_code ~ indicator, value.var = "value")
-  flag_wide  <- dcast(long, nace_code ~ indicator, value.var = "flag")
-  setnames(flag_wide, setdiff(names(flag_wide), "nace_code"),
-           paste0(setdiff(names(flag_wide), "nace_code"), "_flag"))
-  eu27 <- merge(value_wide, flag_wide, by = "nace_code")
-
-  # Rename the "firms" column to nace_total_firms for downstream consistency
-  if ("firms" %in% names(eu27)) {
-    setnames(eu27, c("firms","firms_flag"),
-             c("nace_total_firms","nace_total_firms_flag"))
-  }
-  # Rename other indicator columns with the nace_total_ prefix
-  for (ind_name in setdiff(indicator_names, "firms")) {
-    setnames(eu27,
-             c(ind_name, paste0(ind_name, "_flag")),
-             c(paste0("nace_total_", ind_name),
-               paste0("nace_total_", ind_name, "_flag")))
-  }
-
-  # Horizontal aggregate row
-  hz_row <- eu27[nace_code == config$horizontal_nace_code]
-  if (nrow(hz_row) == 0) {
-    stop(sprintf("Horizontal aggregate %s not found for %d",
-                 config$horizontal_nace_code, config$anchor_year))
-  }
-  horizontal_firms      <- hz_row$nace_total_firms[1]
-  horizontal_firms_flag <- hz_row$nace_total_firms_flag[1]
-  message(sprintf("  Horizontal aggregate (%s): %s firms",
-                  config$horizontal_nace_code,
-                  format(horizontal_firms, big.mark = ",")))
-
-  # Report horizontal totals for non-firm indicators if available
-  horizontal_extras <- list()
-  for (ind_name in setdiff(indicator_names, "firms")) {
-    col <- paste0("nace_total_", ind_name)
-    flag_col <- paste0(col, "_flag")
-    val <- hz_row[[col]][1]
-    flg <- hz_row[[flag_col]][1]
-    horizontal_extras[[ind_name]] <- list(value = val, flag = flg)
-    if (!is.na(val)) {
-      message(sprintf("  Horizontal aggregate (%s): %s %s",
-                      config$horizontal_nace_code,
-                      format(val, big.mark = ",", scientific = FALSE),
-                      ind_name))
-    } else {
-      message(sprintf("  Horizontal aggregate (%s): %s NOT PUBLISHED (flag=%s)",
-                      config$horizontal_nace_code, ind_name,
-                      ifelse(is.na(flg), "NA", flg)))
-    }
-  }
-
-  nace_codes <- sort(unique(as.character(raw$nace_r2)))
-  message(sprintf("  Unique NACE codes: %d | filtered rows for %d: %d",
-                  length(nace_codes), config$anchor_year, nrow(eu27)))
-
-  # Coverage summary for non-firm indicators
-  for (ind_name in setdiff(indicator_names, "firms")) {
-    col <- paste0("nace_total_", ind_name)
-    n_pub <- sum(!is.na(eu27[[col]]))
-    message(sprintf("  Coverage: %d/%d NACE cells have non-NA %s",
-                    n_pub, nrow(eu27), ind_name))
-  }
-
-  list(eu27 = eu27,
-       nace_codes = nace_codes,
-       horizontal_firms = horizontal_firms,
-       horizontal_firms_flag = horizontal_firms_flag,
-       horizontal_extras = horizontal_extras,
-       indicator_names = indicator_names)
-}
-
-# ============================================================================
-# STEP 2: PARSE BEA + COMPUTE GAP-FILL EU27 ESTIMATES
-# ============================================================================
-
-parse_bea_a3 <- function(path) {
-  raw <- as.data.table(read_excel(path, sheet = "Table III. A 3",
-                                  col_names = FALSE, .name_repair = "minimal"))
-  setnames(raw, paste0("V", seq_along(raw)))
-  rows <- raw[!is.na(V1) & !is.na(V2),
-              .(country_label = trimws(as.character(V1)),
-                count_raw = as.character(V2))]
-  rows <- rows[!grepl("^\\([0-9]+\\)$", count_raw)]
-  rows[, count := suppressWarnings(as.integer(count_raw))]
-  rows
-}
-
-parse_bea_a4 <- function(path) {
-  raw <- as.data.table(read_excel(path, sheet = "Table III. A 4",
-                                  col_names = FALSE, .name_repair = "minimal"))
-  setnames(raw, paste0("V", seq_along(raw)))
-  # Column layout (1-indexed): V1=industry label, V2=affiliate count,
-  # V3-V5=balance-sheet/capex (skip), V6=Sales, V7-V11=other (skip).
-  # See Table III.A.4 header rows in usdia*-Part-III-A1-A4.xls.
-  rows <- raw[!is.na(V1) & !is.na(V2),
-              .(industry_label = trimws(as.character(V1)),
-                count_raw = as.character(V2),
-                sales_raw = as.character(V6))]
-  rows <- rows[!grepl("^\\([0-9]+\\)$", count_raw)]
-  rows <- rows[!grepl("^NOTE", industry_label)]
-  rows[, count := suppressWarnings(as.integer(count_raw))]
-  # Sales suppression: BEA flags suppressed cells with "(D)". These become NA.
-  rows[, sales := suppressWarnings(as.numeric(sales_raw))]
-  rows
-}
-
-# Compute slot-weighted EU27 firm allocations per (naics_code, depth) row in
-# gap_naics_map, joining the BEA bucket totals.
-#
-# Slot logic (preserves the v2.1 Fix 2(b) methodology):
-#   - 4-digit code: 1 slot.
-#   - 3-digit code with 4-digit children in the same bucket: covers n_children
-#     slots (a roll-up), but does NOT add new slots to the bucket denominator.
-#   - 3-digit code with no children in the same bucket: 1 slot.
-#   weight = covers_n_slots / bucket_total_slots
-#   allocated = bucket_eu27 * weight
-build_bea_allocated <- function(config) {
-  message("\n=== STEP 2: BEA GAP-FILL ===")
-  a3 <- parse_bea_a3(config$bea_a1_a4_file)
-  a4 <- parse_bea_a4(config$bea_a1_a4_file)
-
-  eu27_row  <- a3[grepl("European Union \\(27\\)", country_label)]
-  world_row <- a3[country_label == "All countries"]
-  if (nrow(eu27_row) != 1 || nrow(world_row) != 1) {
-    stop("Could not locate EU27 addendum or 'All countries' row in BEA Table A.3")
-  }
-  eu27_share <- eu27_row$count / world_row$count
-  message(sprintf("  EU27/World MOFA share: %.3f (EU27=%s, World=%s)",
-                  eu27_share, format(eu27_row$count, big.mark = ","),
-                  format(world_row$count, big.mark = ",")))
-
-  # Join gap_naics_map to A.4 buckets. For each bucket, pull both the
-  # affiliate count (always published) and the sales value (may be
-  # suppressed -- BEA flags suppressed cells "(D)" which become NA).
-  gap <- copy(gap_naics_map)
-  gap[, bucket_world         := NA_integer_]
-  gap[, bucket_world_sales   := NA_real_]
-  gap[, matched_label        := NA_character_]
-  for (i in seq_len(nrow(gap))) {
-    needle <- gap$a4_industry_label[i]
-    m <- a4[industry_label == needle]
-    if (nrow(m) == 0) m <- a4[grepl(needle, industry_label, ignore.case = TRUE)]
-    if (nrow(m) >= 1) {
-      gap$bucket_world[i]       <- m$count[1]
-      gap$bucket_world_sales[i] <- m$sales[1]
-      gap$matched_label[i]      <- m$industry_label[1]
-    }
-  }
-  gap[, bucket_eu27 := round(bucket_world * eu27_share)]
-  # EU27 sales estimate: apply the count-based EU27/World share to the
-  # bucket's worldwide sales. NA bucket sales (BEA "(D)" suppression)
-  # propagate to NA EU27 sales -- no gap-fill possible for those rows.
-  # Using the count-based share as a proxy for the sales share is a known
-  # approximation: EU27 affiliates tend to be larger than the worldwide
-  # MOFA average (more advanced-services concentration), so the true
-  # EU27/World sales share is typically somewhat higher than the count
-  # share. This understates EU27 sales by perhaps 10-25% for sectors
-  # where the size skew is largest. Documented in row-level notes.
-  gap[, bucket_eu27_sales := bucket_world_sales * eu27_share]
-  gap[, eu27_share_applied := eu27_share]
-
-  # Report sales coverage at the bucket level
-  buckets_summary <- unique(gap[, .(matched_label, bucket_world_sales)])
-  n_buckets_with_sales <- sum(!is.na(buckets_summary$bucket_world_sales))
-  message(sprintf("  Sales coverage: %d/%d BEA buckets have non-suppressed worldwide sales",
-                  n_buckets_with_sales, nrow(buckets_summary)))
-  for (i in seq_len(nrow(buckets_summary))) {
-    bl <- buckets_summary$matched_label[i]
-    bs <- buckets_summary$bucket_world_sales[i]
-    msg <- if (is.na(bs)) sprintf("    %s: SUPPRESSED", bl)
-           else sprintf("    %s: $%s million world sales",
-                        bl, format(bs, big.mark = ",", scientific = FALSE))
-    message(msg)
-  }
-
-  # Slot weighting -- the BEA half of the two parallel weighting systems
-  # described in the architectural block at top of file. A BEA bucket is
-  # divided into "4-digit-equivalent slots":
-  #   - A 4-digit code is 1 slot.
-  #   - A 3-digit code with 4-digit children in the same bucket is a
-  #     roll-up; it covers n_children slots when invoked but does NOT
-  #     add to the bucket denominator.
-  #   - A 3-digit code with no children in the same bucket is 1 slot.
-  # weight = covers_n_slots / bucket_total_slots
-  # allocated_firms = bucket_eu27 * weight
-  # allocated_turnover_meur = bucket_eu27_sales * weight * usd_to_eur
-  # (NA propagates if bucket_eu27_sales is NA from suppression)
-  three <- gap[crosswalk_depth == "3-digit"]
-  four  <- gap[crosswalk_depth == "4-digit"]
-
-  if (nrow(three) > 0) {
-    three[, n_children := vapply(seq_len(.N), function(i) {
-      sum(four$matched_label == matched_label[i] &
-            startsWith(four$naics_code, naics_code[i]))
-    }, integer(1))]
-    three[, covers_n_slots := fifelse(n_children == 0L, 1L, n_children)]
-  }
-  if (nrow(four) > 0) {
-    four[, n_children := 1L]
-    four[, covers_n_slots := 1L]
-  }
-  bea <- rbind(three, four, use.names = TRUE)
-
-  # Bucket denominator = (# 4-digit rows) + (# 3-digit rows w/ no children)
-  bea[, bucket_total_slots := {
-    n4   <- sum(crosswalk_depth == "4-digit")
-    n3nc <- sum(crosswalk_depth == "3-digit" & n_children == 0L)
-    n4 + n3nc
-  }, by = matched_label]
-
-  bea[, weight := covers_n_slots / bucket_total_slots]
-  bea[, allocated_firms := bucket_eu27 * weight]
-
-  # USD to EUR conversion for sales. Using approximate annual average rate;
-  # update for vintage as needed. 2022 average: ~0.95 USD/EUR (1 USD ≈ 0.95 EUR).
-  # 2023 average: ~0.92 USD/EUR. For mismatched-vintage runs (FATS 2023 +
-  # BEA 2022r), use the BEA-vintage rate since the sales values are USD 2022.
-  usd_to_eur_2022 <- 0.95
-  bea[, allocated_turnover_meur := bucket_eu27_sales * weight * usd_to_eur_2022]
-  bea[, nace_total_turnover_meur := bucket_eu27_sales * usd_to_eur_2022]
-
-  # Concept-mismatch note for finance/insurance rows (BEA "sales" for
-  # financial affiliates includes investment income and BEA's imputations
-  # for implicit banking services and insurance premium supplements;
-  # not strictly identical to FATS NETTUR_MEUR).
-  bea[, bea_sales_note := fcase(
-    grepl("[Ff]inance|[Ii]nsurance|[Dd]epository|[Bb]anking", a4_industry_label),
-      paste("BEA 'sales' for finance affiliates includes investment income",
-            "with BEA imputations for implicit banking services and insurance",
-            "premium supplements; conceptually similar to FATS NETTUR but not",
-            "identical. EU27 sales estimated via count-based share, which",
-            "may understate large-affiliate-skewed sectors."),
-    is.na(bucket_world_sales),
-      paste("BEA worldwide sales for this bucket are suppressed (D);",
-            "no revenue gap-fill possible. Firm count is still populated."),
-    default =
-      paste("Sales gap-filled via BEA Table III.A.4 worldwide sales x",
-            "EU27/World count-based share. May understate EU27 sales for",
-            "sectors where EU27 affiliates skew larger than worldwide average.")
-  )]
-
-  message(sprintf("  Gap-fill rows: %d across %d BEA buckets (%d rows with non-NA sales)",
-                  nrow(bea), uniqueN(bea$matched_label),
-                  sum(!is.na(bea$allocated_turnover_meur))))
-
-  bea[, .(naics_code, naics_depth = crosswalk_depth,
-          naics_title = naics_description,
-          nace_code = paste0("BEA:", matched_label),
-          source = "BEA_gap_fill",
-          weight,
-          nace_total_firms = bucket_eu27,
-          allocated_firms,
-          nace_total_turnover_meur,
-          allocated_turnover_meur,
-          bea_source_label = matched_label,
-          eu27_share_applied,
-          gap_reason,
-          bea_sales_note)]
-}
-
-# ============================================================================
-# STEP 3: NAICS-NACE CONCORDANCE (long, no rollup)
-# ============================================================================
-# Output: one row per (nace_code, naics_code, naics_depth) carrying the
-# weight = n_naics_6dig / total_6dig_in_nace_cell, plus partial-match flag.
-
-load_naics_isic <- function(path) {
-  raw <- as.data.table(read_xlsx(path))
-  part_isic  <- grep("Part.*ISIC",  names(raw), value = TRUE, ignore.case = TRUE)[1]
-  part_naics <- grep("Part.*NAICS", names(raw), value = TRUE, ignore.case = TRUE)[1]
-  is_us_census <- !is.na(part_isic) && !is.na(part_naics)
-
-  naics_col <- find_col(raw,
-                        c("NAICS.*[Cc]ode","^Code.*NAICS","NAICS\\s*US","NAICS US","NAICS 2022"),
-                        "Expected a NAICS code column.",
-                        exclude = c("Part","Title","note"))
-  isic_col  <- find_col(raw,
-                        c("ISIC.*[Cc]ode","^Code.*ISIC","^ISIC\\s*Rev","^ISIC\\s*4"),
-                        "Expected an ISIC code column.",
-                        exclude = c("Part","Title","note"))
-
-  naics_chr <- if (is.numeric(raw[[naics_col]])) {
-    as.character(as.integer(raw[[naics_col]]))
-  } else as.character(raw[[naics_col]])
-
-  out <- data.table(naics_raw = naics_chr,
-                    isic_raw  = as.character(raw[[isic_col]]))
-  if (is_us_census) {
-    out[, naics_partial := !is.na(raw[[part_naics]]) &
-          trimws(as.character(raw[[part_naics]])) == "*"]
-    out[, isic_partial  := !is.na(raw[[part_isic]]) &
-          trimws(as.character(raw[[part_isic]])) == "*"]
-  } else {
-    out[, c("naics_partial","isic_partial") := list(FALSE, FALSE)]
-  }
-
-  out <- out[grepl("^[0-9]{6}$", gsub("\\*","", trimws(naics_raw)))]
-  out <- out[!is.na(naics_raw) & !is.na(isic_raw) &
-               naics_raw != "" & isic_raw != "" &
-               naics_raw != "0" & isic_raw != "0"]
-  out[, naics_2022 := trimws(gsub("\\*", "", naics_raw))]
-  out[, isic4      := trimws(gsub("\\*", "", isic_raw))]
-  out[, isic_numeric := sprintf("%04d", as.integer(gsub("[^0-9]","", isic4)))]
-  # ISIC -> NACE: NACE Rev. 2 was constructed to share its first two digits
-  # with ISIC Rev. 4, so substr(., 1, 2) IS the NACE division. No third
-  # crosswalk file needed. See the architectural block at top of file.
-  out[, nace_division := substr(isic_numeric, 1, 2)]
-  out[, is_partial := naics_partial | isic_partial]
-  out[, .(naics_2022, nace_division, is_partial)]
-}
-
-load_naics_structure <- function(path) {
-  raw <- as.data.table(read_xlsx(path))
-  code_col  <- find_col(raw, c("NAICS.*[Cc]ode","^Code.*NAICS","NAICS\\s*US.*Code","^Code"),
-                        "Expected a NAICS code column.",
-                        exclude = c("Part","Title"))
-  title_col <- find_col(raw, c("NAICS.*Title","Title","Description","[Cc]lass title"),
-                        "Expected a NAICS title column.")
-
-  codes <- raw[[code_col]]
-  if (is.numeric(codes)) codes <- as.character(as.integer(codes))
-  codes <- trimws(as.character(codes))
-  titles <- as.character(raw[[title_col]])
-
-  valid <- grepl("^[0-9]{2,6}$", codes) & !is.na(titles) & titles != ""
-  all <- unique(data.table(code = codes[valid], title = titles[valid]), by = "code")
-  all[, digits := nchar(code)]
-
-  list(
-    six = all[digits == 6L, .(naics_2022 = code,
-                              naics_3digit = substr(code, 1, 3),
-                              naics_4digit = substr(code, 1, 4))],
-    titles_3 = all[digits == 3L, .(naics_code = code, naics_title = title)],
-    titles_4 = all[digits == 4L, .(naics_code = code, naics_title = title)]
-  )
-}
-
-# Build the (nace_code, naics_code, naics_depth) long table with weights.
-# Row meaning: this NAICS gets `weight` of whatever firm count is published
-# at this NACE cell, where weight = (# of 6-digit NAICS classes mapping to
-# both this NACE division and this NAICS parent) / (total # of 6-digit
-# classes mapping to this NACE cell).
-build_concordance_long <- function(config, fats_nace_codes) {
-  message("\n=== STEP 3: CONCORDANCE ===")
-  ni <- load_naics_isic(config$naics_isic_file)
-  ns <- load_naics_structure(config$naics_struct_file)
-
-  # 6-digit -> NACE division, with partial-match flag and parent codes
-  six <- merge(ni, ns$six, by = "naics_2022", all.x = TRUE)
-  six <- six[!is.na(naics_3digit)]
-  message(sprintf("  6-digit NAICS pairs in concordance: %d", nrow(six)))
-
-  # FATS NACE codes -> divisions
-  fats_div <- expand_fats_to_divisions(fats_nace_codes)
-  message(sprintf("  FATS NACE cells mappable: %d", uniqueN(fats_div$fats_code)))
-
-  # For each FATS NACE cell x division, attach all 6-digit NAICS classes,
-  # then count classes per (FATS cell, NAICS parent) at both 3- and 4-digit.
-  rolled <- merge(fats_div, six, by = "nace_division", allow.cartesian = TRUE)
-
-  agg_3 <- rolled[, .(n_naics_6dig = uniqueN(naics_2022),
-                      any_partial  = any(is_partial)),
-                  by = .(fats_code, naics_3digit)]
-  agg_3[, naics_depth := "3-digit"]
-  setnames(agg_3, "naics_3digit", "naics_code")
-
-  agg_4 <- rolled[, .(n_naics_6dig = uniqueN(naics_2022),
-                      any_partial  = any(is_partial)),
-                  by = .(fats_code, naics_4digit)]
-  agg_4[, naics_depth := "4-digit"]
-  setnames(agg_4, "naics_4digit", "naics_code")
-
-  long <- rbind(agg_3, agg_4, use.names = TRUE)
-  setnames(long, "fats_code", "nace_code")
-
-  # FATS weight: equal-split-by-6-digit-count. For each NACE cell, count
-  # how many 6-digit NAICS classes roll up to each NAICS parent (3- or
-  # 4-digit), then weight = that count / total 6-digit classes in the
-  # NACE cell. Assumes each 6-digit class contributes equally to its
-  # NACE parent -- wrong in detail but acceptable as a prior. This is
-  # the FATS half of the two parallel weighting systems described in
-  # the architectural block at top of file.
-  long[, total_6dig_in_nace_cell := sum(n_naics_6dig),
-       by = .(nace_code, naics_depth)]
-  long[, weight := n_naics_6dig / total_6dig_in_nace_cell]
-
-  # Attach NAICS titles
-  titles_all <- rbind(
-    ns$titles_3[, .(naics_code, naics_depth = "3-digit", naics_title)],
-    ns$titles_4[, .(naics_code, naics_depth = "4-digit", naics_title)]
-  )
-  long <- merge(long, titles_all, by = c("naics_code","naics_depth"), all.x = TRUE)
-
-  long[, .(naics_code, naics_depth, naics_title, nace_code,
-           weight, n_naics_6dig, any_partial)]
-}
-
-# ============================================================================
-# STEP 4: BUILD UNIFIED LONG TABLE OF (naics_code, depth, nace_code) FIRM ROWS
-# ============================================================================
-# Three components, all with the same column schema:
-#   FATS rows:       per (nace_code, naics_code, depth), allocated = nace_total * weight
-#   BEA gap-fill:    per (bucket, naics_code, depth), allocated = bucket_eu27 * weight
-#   Horizontal:      one row, naics_code = "ALL", nace_code = "B-S_X_O_S94"
-
-build_firm_rows_long <- function(config, fats, bea_long, concord_long) {
-  message("\n=== STEP 4: BUILD UNIFIED FIRM-ROWS TABLE ===")
-
-  # Indicators other than "firms" that need to propagate alongside.
-  extra_indicators <- setdiff(unname(unlist(config$fats_indicators)), "firms")
-
-  # --- FATS rows ---
-  # Join the concordance to FATS values on the NACE cell.
-  fats_join <- merge(concord_long, fats$eu27,
-                     by = "nace_code", all.x = TRUE)
-  fats_rows <- fats_join[!is.na(nace_total_firms), .(
-    naics_code, naics_depth, naics_title,
-    nace_code,
-    source = "FATS",
-    weight,
-    nace_total_firms,
-    allocated_firms = nace_total_firms * weight,
-    any_partial,
-    any_suppressed = !is.na(nace_total_firms_flag) & nace_total_firms_flag == "C",
-    bea_source_label = NA_character_,
-    eu27_share_applied = NA_real_,
-    gap_reason = NA_character_
-  )]
-
-  # Propagate extra indicators: add nace_total_<ind> and allocated_<ind> per row.
-  # NA propagation: if Eurostat suppressed the indicator for a NACE cell, the
-  # allocated value is NA, but the firm count and the row still exist.
-  for (ind in extra_indicators) {
-    nace_col  <- paste0("nace_total_", ind)
-    alloc_col <- paste0("allocated_",  ind)
-    flag_col  <- paste0(nace_col, "_flag")
-    # Pull values from the joined table back into fats_rows by row position
-    # (fats_join was filtered to non-NA nace_total_firms; rows align)
-    fj <- fats_join[!is.na(nace_total_firms)]
-    fats_rows[, (nace_col)  := fj[[nace_col]]]
-    fats_rows[, (alloc_col) := fj[[nace_col]] * weight]
-    # Track suppression: any_suppressed becomes TRUE if any pulled indicator
-    # was suppressed, not just firms
-    if (flag_col %in% names(fj)) {
-      fats_rows[, any_suppressed := any_suppressed |
-                  (!is.na(fj[[flag_col]]) & fj[[flag_col]] == "C")]
-    }
-  }
-
-  # --- DROP FATS rows for NAICS in gap_naics_map (BEA is authoritative there) ---
-  gap_keys <- gap_naics_map[, .(naics_code, naics_depth = crosswalk_depth)]
-  before <- nrow(fats_rows)
-  fats_rows <- fats_rows[!gap_keys, on = .(naics_code, naics_depth)]
-  message(sprintf("  FATS rows after dropping BEA-gap NAICS: %d (dropped %d)",
-                  nrow(fats_rows), before - nrow(fats_rows)))
-
-  # --- BEA rows ---
-  # bea_long now provides BOTH affiliate-count gap-fill AND sales (turnover)
-  # gap-fill columns. Sales values may be NA for buckets where BEA suppressed
-  # worldwide sales with "(D)" -- those rows keep NA turnover but populated
-  # firm counts. We preserve whatever bea_long provides for any extra
-  # indicators it knows about; only fill NA placeholders for indicators it
-  # doesn't carry (future-proofing if config adds e.g. value-added indicator
-  # before BEA supports it).
-  bea_rows <- copy(bea_long)
-  bea_rows[, any_partial := FALSE]
-  bea_rows[, any_suppressed := FALSE]
-  for (ind in extra_indicators) {
-    nace_col  <- paste0("nace_total_", ind)
-    alloc_col <- paste0("allocated_",  ind)
-    if (!(nace_col %in% names(bea_rows))) {
-      bea_rows[, (nace_col) := NA_real_]
-    }
-    if (!(alloc_col %in% names(bea_rows))) {
-      bea_rows[, (alloc_col) := NA_real_]
-    }
-  }
-
-  # --- Horizontal aggregate ---
-  horiz_row <- data.table(
-    naics_code = "ALL",
-    naics_depth = "ALL",
-    naics_title = "Horizontal -- total business economy (NACE B-S_X_O_S94)",
-    nace_code = config$horizontal_nace_code,
-    source = "FATS_horizontal_aggregate",
-    weight = 1.0,
-    nace_total_firms = as.numeric(fats$horizontal_firms),
-    allocated_firms  = as.numeric(fats$horizontal_firms),
-    any_partial = FALSE,
-    any_suppressed = !is.na(fats$horizontal_firms_flag) &
-                     fats$horizontal_firms_flag == "C",
-    bea_source_label = NA_character_,
-    eu27_share_applied = NA_real_,
-    gap_reason = NA_character_
-  )
-  # Add horizontal values for extra indicators (may be NA if not published)
-  for (ind in extra_indicators) {
-    val <- fats$horizontal_extras[[ind]]$value
-    flg <- fats$horizontal_extras[[ind]]$flag
-    horiz_row[, (paste0("nace_total_", ind)) := as.numeric(val)]
-    horiz_row[, (paste0("allocated_",  ind)) := as.numeric(val)]
-    if (!is.na(flg) && flg == "C") {
-      horiz_row[, any_suppressed := TRUE]
-    }
-  }
-
-  # --- Structural-zero rows ---
-  # NAICS 922 (Justice, Public Order, and Safety Activities) appears in the
-  # crosswalk for AI Act (and possibly other regulations covering public
-  # administration). FATS excludes NACE Section O (public administration)
-  # because no US firm commercially operates EU public administration; BEA
-  # has no equivalent bucket. The substantively correct firm count is zero,
-  # not unknown. Without this sentinel, the row would left-join to NA and
-  # propagate NAs through the output CSV.
-  structural_zero_rows <- data.table(
-    naics_code  = c("922","921","923","924","925","926","927","928"),
-    naics_depth = "3-digit",
-    naics_title = c("Justice, Public Order, and Safety Activities",
-                    "Executive, Legislative, and Other General Government Support",
-                    "Administration of Human Resource Programs",
-                    "Administration of Environmental Quality Programs",
-                    "Administration of Housing Programs, Urban Planning, and Community Development",
-                    "Administration of Economic Programs",
-                    "Space Research and Technology",
-                    "National Security and International Affairs"),
-    nace_code = "NACE_Section_O_excluded",
-    source = "structural_zero",
-    weight = 0.0,
-    nace_total_firms = 0,
-    allocated_firms  = 0,
-    any_partial = FALSE,
-    any_suppressed = FALSE,
-    bea_source_label = NA_character_,
-    eu27_share_applied = NA_real_,
-    gap_reason = NA_character_
-  )
-  # Add structural-zero values for extra indicators (also zero)
-  for (ind in extra_indicators) {
-    structural_zero_rows[, (paste0("nace_total_", ind)) := 0]
-    structural_zero_rows[, (paste0("allocated_",  ind)) := 0]
-  }
-
-  out <- rbind(fats_rows, bea_rows, horiz_row, structural_zero_rows,
-               use.names = TRUE, fill = TRUE)
-  message(sprintf("  Combined firm-rows table: %d rows (FATS=%d, BEA=%d, horizontal=%d, structural-zero=%d)",
-                  nrow(out), nrow(fats_rows), nrow(bea_rows), 1L,
-                  nrow(structural_zero_rows)))
-  out
-}
-
-# ============================================================================
-# STEP 5: RESOLVE CROSSWALK + JOIN
-# ============================================================================
-# Output: one row per (regulation_name, naics_code, naics_depth, nace_code)
-
-resolve_crosswalk <- function(crosswalk) {
-  cw <- copy(crosswalk)
-  setnames(cw, names(cw), tolower(names(cw)))
-  required <- c("eu_regulation","naics_3digit","naics_4digit","assigned_depth")
-  miss <- setdiff(required, names(cw))
-  if (length(miss) > 0) stop("Crosswalk missing columns: ", paste(miss, collapse = ", "))
-
-  # Primary grouping key: eu_regulation_standard (short stable ID like "DMA",
-  # "GDPR"). Falls back to eu_regulation (the descriptive name) if the
-  # standard ID column is absent or has NA values.
-  if (!"eu_regulation_standard" %in% names(cw)) {
-    warning("Crosswalk has no 'EU_Regulation_Standard'; falling back to ",
-            "EU_Regulation as the primary grouping key.")
-    cw[, eu_regulation_standard := NA_character_]
-  }
-  cw[is.na(eu_regulation_standard),
-     eu_regulation_standard := eu_regulation]
-
-  cw[, assigned_depth_int := suppressWarnings(as.integer(assigned_depth))]
-  cw[, naics_4digit_chr := fifelse(
-    is.na(naics_4digit), NA_character_,
-    as.character(as.integer(suppressWarnings(as.numeric(naics_4digit))))
-  )]
-  cw[, naics_code := fifelse(
-    !is.na(assigned_depth_int) & assigned_depth_int == 4L,
-    naics_4digit_chr, as.character(naics_3digit)
-  )]
-  cw[, naics_depth := fcase(
-    toupper(naics_code) == "ALL", "ALL",
-    !is.na(assigned_depth_int) & assigned_depth_int == 4L, "4-digit",
-    default = "3-digit"
-  )]
-
-  cw_long <- cw[!is.na(naics_code) & naics_code != "" &
-                  !is.na(eu_regulation_standard),
-                .(regulation_name      = eu_regulation_standard,
-                  regulation_name_full = as.character(eu_regulation),
-                  naics_code, naics_depth)]
-
-  # Collapse descriptive names per standard ID + (code, depth) so audit info
-  # survives without inflating row counts. Different rows of the same
-  # standard ID may have slightly different EU_Regulation values (the whole
-  # reason the standard ID exists), so we collapse with " | ".
-  cw_long[, .(regulation_name_full =
-                paste(sort(unique(regulation_name_full)), collapse = " | ")),
-          by = .(regulation_name, naics_code, naics_depth)]
-}
-
-# Join the crosswalk to the firm-rows table. This explodes per crosswalk row
-# to one row per contributing NACE cell (FATS) or BEA bucket sentinel.
-join_crosswalk_to_firm_rows <- function(cw_long, firm_rows_long) {
-  message("\n=== STEP 5: REGULATION JOIN ===")
-  joined <- merge(cw_long, firm_rows_long,
-                  by = c("naics_code","naics_depth"),
-                  all.x = TRUE, allow.cartesian = TRUE)
-
-  # Build per-row notes from gap_reason + suppression flags. Branches for
-  # dropped gap_reasons (fats_scope_excluded_section_a, fats_suppressed_n77,
-  # fats_suppressed_q87_q88) removed along with their gap_naics_map blocks.
-  joined[, notes := ""]
-  joined[!is.na(gap_reason),
-         notes := fcase(
-           gap_reason == "fats_depth_limited_within_section_d",
-             "FATS publishes NACE D at section level only; BEA Utilities bucket used (overstates electricity-only).",
-           gap_reason == "fats_depth_limited_within_h49",
-             "FATS H49 covers all land transport; BEA Transport bucket used (overstates pipelines only).",
-           gap_reason == "fats_suppressed_section_k",
-             "FATS EU27 K aggregate suppressed (IE/LU concentration); BEA gap-fill applied.",
-           gap_reason == "fats_suppressed_c26",
-             "FATS EU27 C26 suppressed; BEA Computers/electronic-products bucket used.",
-           gap_reason == "fats_suppressed_h50",
-             "FATS EU27 H50 suppressed; BEA Transport bucket used (overstates water transport).",
-           default = ""
-         )]
-  joined[any_suppressed == TRUE & source == "FATS",
-         notes := fifelse(
-           notes == "",
-           "FATS cell flagged 'C' (suppressed); EU27 aggregate undercounts IE/LU.",
-           paste(notes,
-                 "FATS cell flagged 'C' (suppressed); EU27 aggregate undercounts IE/LU.")
-         )]
-  # Append BEA sales/concept-mismatch note for BEA gap-fill rows (the note
-  # was attached per-row in build_bea_allocated based on bucket type and
-  # suppression state).
-  if ("bea_sales_note" %in% names(joined)) {
-    joined[source == "BEA_gap_fill" & !is.na(bea_sales_note),
-           notes := fifelse(
-             notes == "", bea_sales_note,
-             paste(notes, bea_sales_note)
-           )]
-  }
-  joined[source == "structural_zero",
-         notes := paste0("NAICS ", naics_code, " is in NACE Section O (public ",
-                         "administration). FATS does not cover this section; ",
-                         "no US firm commercially operates EU public administration. ",
-                         "Firm count is a substantive zero, not a data gap.")]
-
-  # Diagnose unmatched
-  unmatched <- joined[is.na(allocated_firms),
-                      .(regulation_name, naics_code, naics_depth)]
-  if (nrow(unmatched) > 0) {
-    summ <- unmatched[, .(n = .N,
-                          regs = paste(head(unique(regulation_name), 5), collapse = "; ")),
-                      by = .(naics_code, naics_depth)]
-    message(sprintf("  Crosswalk rows with no firm-count match: %d (across %d (NAICS,depth) keys)",
-                    nrow(unmatched), nrow(summ)))
-    for (i in seq_len(min(nrow(summ), 8))) {
-      message(sprintf("    %s (%s) - %d rows: %s",
-                      summ$naics_code[i], summ$naics_depth[i],
-                      summ$n[i], summ$regs[i]))
-    }
-  }
-
-  # Base output columns, ordered for readability. Extra indicator columns
-  # (e.g. allocated_turnover_meur) are appended after allocated_firms so the
-  # firm count remains the leftmost firm-level value.
-  base_cols <- c("regulation_name","regulation_name_full",
-                 "naics_code","naics_depth","naics_title",
-                 "nace_code","source","allocated_firms")
-  extra_alloc <- grep("^allocated_", names(joined), value = TRUE)
-  extra_alloc <- setdiff(extra_alloc, "allocated_firms")
-  total_cols  <- c("weight","nace_total_firms",
-                   grep("^nace_total_", names(joined), value = TRUE))
-  total_cols  <- unique(total_cols)
-  total_cols  <- total_cols[!endsWith(total_cols, "_flag")]
-  tail_cols   <- c("any_partial","any_suppressed",
-                   "bea_source_label","eu27_share_applied","notes")
-  out_cols <- c(base_cols, extra_alloc, total_cols, tail_cols)
-  out_cols <- intersect(out_cols, names(joined))
-  joined <- joined[, ..out_cols]
-  setorder(joined, regulation_name, naics_depth, naics_code, source, nace_code)
-  joined[]
-}
-
-# ============================================================================
-# OPTIONAL: ROLL UP TO REGULATION-LEVEL SUMMARY
-# ============================================================================
-# Provided as a helper if you want one-row-per-regulation totals with the
-# horizontal-override rule applied. NOT written to disk by default.
-
-compute_regulation_summary <- function(long_df) {
-  # Detect extra indicator columns (allocated_<ind> other than allocated_firms)
-  extra_alloc <- setdiff(grep("^allocated_", names(long_df), value = TRUE),
-                         "allocated_firms")
-
-  base <- long_df[, {
-    has_horiz <- any(source == "FATS_horizontal_aggregate", na.rm = TRUE)
-    horiz_val <- if (has_horiz) {
-      sum(allocated_firms[source == "FATS_horizontal_aggregate"], na.rm = TRUE)
-    } else NA_real_
-    sectoral_only <- sum(allocated_firms[source != "FATS_horizontal_aggregate"],
-                         na.rm = TRUE)
-    .(
-      scope_type = fcase(
-        has_horiz & sectoral_only > 0, "mixed",
-        has_horiz, "horizontal",
-        sectoral_only > 0, "sectoral",
-        default = "unmatched"
+# -----------------------------------------------------------------------------
+# 2. AGGREGATE ZHEN UP TO OA GROUPS (with propagated SEs)
+# -----------------------------------------------------------------------------
+zhen_at_oa_level <- zhen_categories %>%
+  mutate(avg_exp = W_LOW * exp_low + W_HIGH * exp_high) %>%
+  group_by(oa_group) %>%
+  summarise(
+    zhen_elast_raw       = sum(elast * avg_exp) / sum(avg_exp),
+    # SE on a weighted sum: sqrt(sum(w_i^2 * se_i^2)), with w_i normalized.
+    # This treats Zhen's category SEs as independent (conservative; ignores
+    # cross-equation covariance which would typically shrink the joint SE).
+    zhen_elast_se        = sqrt(sum((avg_exp / sum(avg_exp))^2 * elast_se^2)),
+    n_zhen_subcategories = n(),
+    .groups = "drop"
+  ) %>%
+  rename(group = oa_group)
+
+# -----------------------------------------------------------------------------
+# 3. AGGREGATE LUKE MEAT TO OA GROUP LEVEL
+# -----------------------------------------------------------------------------
+luke_meat_aggregated <- luke_meat %>%
+  summarise(
+    luke_elast = sum(within_meat_share * marshallian_elast),
+    luke_se    = sqrt(sum(within_meat_share^2 * marshallian_se^2))
+  ) %>%
+  mutate(group = "meat_and_eggs")
+
+cat("=== Luke, Tonsor & Schroeder (2026) meat estimates ===\n")
+cat("Hicksian elasticities (Table 3):\n")
+print(luke_meat %>% select(meat, hicksian_elast, hicksian_se, exp_share, exp_elast) %>%
+        mutate(across(where(is.numeric), ~ round(.x, 3))))
+cat("\nMarshallian (Slutsky-converted) and within-meat shares:\n")
+print(luke_meat %>% select(meat, marshallian_elast, marshallian_se, within_meat_share) %>%
+        mutate(across(where(is.numeric), ~ round(.x, 3))))
+cat(sprintf("\nLuke meat group Marshallian elasticity: %+.3f (SE %.3f)\n",
+            luke_meat_aggregated$luke_elast, luke_meat_aggregated$luke_se))
+cat("Caveat: Luke covers beef + chicken + pork only — no eggs, fish, or other meat.\n")
+cat("Eggs and fish are typically less elastic, so this is likely an upper bound.\n")
+
+# -----------------------------------------------------------------------------
+# 4. ASSEMBLE THE MASTER TABLE
+# -----------------------------------------------------------------------------
+build_master <- function(alpha_scanner = ALPHA_SCANNER_DEFAULT) {
+  oa_shares %>%
+    left_join(oa_elasticities, by = "group") %>%
+    left_join(zhen_at_oa_level %>% select(group, zhen_elast_raw, zhen_elast_se),
+              by = "group") %>%
+    left_join(luke_meat_aggregated %>% select(group, luke_elast, luke_se),
+              by = "group") %>%
+    left_join(coverage_classification, by = "group") %>%
+    mutate(
+      share_fah = share_pct_total_budget / sum(share_pct_total_budget),
+      # Apply Jeon adjustment to Zhen estimates (positive alpha = less elastic)
+      zhen_elast_adjusted = zhen_elast_raw + alpha_scanner,
+      # Luke is also scanner-based, so apply the same adjustment
+      luke_elast_adjusted = luke_elast + alpha_scanner,
+      # Hybrid: pick the source on a per-group basis
+      hybrid_elast = case_when(
+        hybrid_source == "zhen" ~ zhen_elast_adjusted,
+        hybrid_source == "luke" ~ luke_elast_adjusted,
+        hybrid_source == "oa"   ~ oa_elast_instore
       ),
-      us_firms_total          = if (has_horiz) horiz_val else sectoral_only,
-      us_firms_sectoral_only  = sectoral_only,
-      us_firms_fats           = sum(allocated_firms[source == "FATS"], na.rm = TRUE),
-      us_firms_bea_gap        = sum(allocated_firms[source == "BEA_gap_fill"], na.rm = TRUE),
-      n_rows                  = .N,
-      n_naics                 = uniqueN(paste(naics_code, naics_depth)),
-      n_unmatched             = sum(is.na(source)),
-      any_partial             = any(any_partial, na.rm = TRUE),
-      any_suppressed          = any(any_suppressed, na.rm = TRUE)
-    )
-  }, by = regulation_name]
-
-  # Roll up extra indicators applying the same horizontal-override rule.
-  # Note: rolling up a monetary indicator at the regulation level only makes
-  # sense if downstream uses care about the aggregate; for sector-level
-  # turnover analysis, read the long-form CSV directly.
-  for (alloc_col in extra_alloc) {
-    ind_name <- sub("^allocated_", "", alloc_col)
-    rollup_col       <- paste0("us_", ind_name, "_total")
-    sectoral_col     <- paste0("us_", ind_name, "_sectoral_only")
-    fats_col         <- paste0("us_", ind_name, "_fats")
-    bea_col          <- paste0("us_", ind_name, "_bea_gap")
-    ind_rollup <- long_df[, {
-      has_horiz <- any(source == "FATS_horizontal_aggregate", na.rm = TRUE)
-      horiz_val <- if (has_horiz) {
-        sum(.SD[[1]][source == "FATS_horizontal_aggregate"], na.rm = TRUE)
-      } else NA_real_
-      sectoral_only <- sum(.SD[[1]][source != "FATS_horizontal_aggregate"],
-                           na.rm = TRUE)
-      .(
-        total         = if (has_horiz && !is.na(horiz_val) && horiz_val > 0)
-                          horiz_val else sectoral_only,
-        sectoral_only = sectoral_only,
-        fats_total    = sum(.SD[[1]][source == "FATS"], na.rm = TRUE),
-        bea_gap_total = sum(.SD[[1]][source == "BEA_gap_fill"], na.rm = TRUE)
+      hybrid_se = case_when(
+        hybrid_source == "zhen" ~ zhen_elast_se,
+        hybrid_source == "luke" ~ luke_se,
+        hybrid_source == "oa"   ~ oa_se
       )
-    }, by = regulation_name, .SDcols = alloc_col]
-    setnames(ind_rollup, c("total","sectoral_only","fats_total","bea_gap_total"),
-             c(rollup_col, sectoral_col, fats_col, bea_col))
-    base <- merge(base, ind_rollup, by = "regulation_name")
-  }
-
-  base[]
+    )
 }
 
-# ============================================================================
-# MAIN
-# ============================================================================
-
-main <- function(config = pipeline_config) {
-  message("===================================================")
-  message(sprintf("PROJECT DIR: %s", config$project_dir))
-  message("===================================================")
-
-  fats         <- pull_fats(config)
-  bea_long     <- build_bea_allocated(config)
-  concord_long <- build_concordance_long(config, fats$nace_codes)
-  firm_rows    <- build_firm_rows_long(config, fats, bea_long, concord_long)
-
-  message("\nLoading crosswalk...")
-  crosswalk <- as.data.table(read_xlsx(config$crosswalk_file, sheet = "Crosswalk"))
-  cw_long   <- resolve_crosswalk(crosswalk)
-  message(sprintf("  %d crosswalk rows resolved across %d standardized regulations",
-                  nrow(cw_long), uniqueN(cw_long$regulation_name)))
-
-  long <- join_crosswalk_to_firm_rows(cw_long, firm_rows)
-
-  fwrite(long, config$output_csv)
-  message(sprintf("\nWrote %s (%d rows)", config$output_csv, nrow(long)))
-
-  message("\n===================================================")
-  message("PIPELINE COMPLETE")
-  message("===================================================")
-
-  invisible(long)
+# -----------------------------------------------------------------------------
+# 5. CORE COMPUTATION
+# -----------------------------------------------------------------------------
+compute_all_aggregates <- function(omega_online    = OMEGA_ONLINE_DEFAULT,
+                                   mu_online       = MU_ONLINE_DEFAULT,
+                                   alpha_scanner   = ALPHA_SCANNER_DEFAULT,
+                                   coverage_w_zhen = 0.50,
+                                   n_mc            = 50000,
+                                   seed            = 20260521) {
+  
+  df <- build_master(alpha_scanner = alpha_scanner)
+  
+  # Channel-blending multiplier (applied uniformly within each source)
+  blend_mult <- omega_online * mu_online + (1 - omega_online)
+  
+  # Point estimates
+  headline <- df %>%
+    summarise(
+      eps_oa_instore       = sum(share_fah * oa_elast_instore),
+      eps_zhen_instore     = sum(share_fah * zhen_elast_adjusted),
+      eps_hybrid_instore   = sum(share_fah * hybrid_elast),
+      eps_oa_blended       = eps_oa_instore     * blend_mult,
+      eps_zhen_blended     = eps_zhen_instore   * blend_mult,
+      eps_hybrid_blended   = eps_hybrid_instore * blend_mult,
+      eps_covwt_blended    = coverage_w_zhen * eps_zhen_blended +
+        (1 - coverage_w_zhen) * eps_oa_blended
+    )
+  
+  # Monte Carlo CIs propagating each source's SEs through blending and weighting
+  if (!is.null(seed)) set.seed(seed)
+  n_groups <- nrow(df)
+  
+  draws_oa     <- replicate(n_mc,
+                            sum(df$share_fah * rnorm(n_groups, df$oa_elast_instore, df$oa_se))) * blend_mult
+  draws_zhen   <- replicate(n_mc,
+                            sum(df$share_fah * (rnorm(n_groups, df$zhen_elast_raw, df$zhen_elast_se) +
+                                                  alpha_scanner))) * blend_mult
+  draws_hybrid <- replicate(n_mc,
+                            sum(df$share_fah * rnorm(n_groups, df$hybrid_elast, df$hybrid_se))) * blend_mult
+  draws_covwt  <- coverage_w_zhen * draws_zhen + (1 - coverage_w_zhen) * draws_oa
+  
+  ci <- tibble(
+    estimator = c("oa", "zhen", "hybrid", "coverage_weighted"),
+    point     = c(headline$eps_oa_blended, headline$eps_zhen_blended,
+                  headline$eps_hybrid_blended, headline$eps_covwt_blended),
+    mc_mean   = c(mean(draws_oa), mean(draws_zhen),
+                  mean(draws_hybrid), mean(draws_covwt)),
+    mc_sd     = c(sd(draws_oa), sd(draws_zhen),
+                  sd(draws_hybrid), sd(draws_covwt)),
+    ci_low_95 = c(quantile(draws_oa, 0.025), quantile(draws_zhen, 0.025),
+                  quantile(draws_hybrid, 0.025), quantile(draws_covwt, 0.025)),
+    ci_up_95  = c(quantile(draws_oa, 0.975), quantile(draws_zhen, 0.975),
+                  quantile(draws_hybrid, 0.975), quantile(draws_covwt, 0.975))
+  )
+  
+  list(table = df, headline = headline, ci = ci,
+       draws = list(oa = draws_oa, zhen = draws_zhen,
+                    hybrid = draws_hybrid, covwt = draws_covwt))
 }
 
-# ============================================================================
-# RUN
-# ============================================================================
+# -----------------------------------------------------------------------------
+# 6. RUN AT DEFAULTS
+# -----------------------------------------------------------------------------
+res <- compute_all_aggregates()
 
-result <- main()
+cat("\n=== Group-level inputs (with Jeon adjustment alpha = 0.219) ===\n\n")
+print(res$table %>%
+        select(group, share_fah, oa_elast_instore, zhen_elast_adjusted,
+               luke_elast_adjusted, hybrid_source, hybrid_elast, hybrid_se) %>%
+        mutate(across(where(is.numeric), ~ round(.x, 3))))
 
-cat("\n--- Row counts by source ---\n")
-print(result[, .N, by = source])
+cat(sprintf("\n=== Headline numbers (omega=%.2f, mu=%.2f, alpha=%.3f) ===\n",
+            OMEGA_ONLINE_DEFAULT, MU_ONLINE_DEFAULT, ALPHA_SCANNER_DEFAULT))
+print(res$ci %>% mutate(across(where(is.numeric), ~ round(.x, 3))))
 
-cat("\n--- Sample: 8 regulations x rows ---\n")
-print(result[, .(n_rows = .N,
-                 sectoral_firms = sum(allocated_firms[source != "FATS_horizontal_aggregate"],
-                                      na.rm = TRUE),
-                 has_horizontal = any(source == "FATS_horizontal_aggregate")),
-             by = regulation_name][1:8])
+# -----------------------------------------------------------------------------
+# 7. SENSITIVITY GRID (fixed: single call per row, list-column unpacking)
+# -----------------------------------------------------------------------------
+omega_grid <- c(0.05, 0.10, 0.15, 0.20, 0.25)
+mu_grid    <- c(0.33, 0.50, 0.67, 1.00)
 
-cat("\n--- Optional regulation-level rollup ---\n")
-print(compute_regulation_summary(result))
+sens <- expand_grid(omega_online = omega_grid, mu_online = mu_grid) %>%
+  mutate(
+    headline = pmap(list(omega_online, mu_online),
+                    ~ compute_all_aggregates(omega_online = ..1,
+                                             mu_online    = ..2,
+                                             n_mc         = 1,
+                                             seed         = NULL)$headline),
+    eps_hybrid = map_dbl(headline, "eps_hybrid_blended")
+  ) %>%
+  select(-headline)
+
+cat("\n=== Sensitivity grid: HYBRID blended FAH elasticity ===\n")
+print(sens %>%
+        pivot_wider(names_from = mu_online, values_from = eps_hybrid,
+                    names_prefix = "mu_") %>%
+        mutate(across(where(is.numeric), ~ round(.x, 3))))
+
+# -----------------------------------------------------------------------------
+# 8. JEON ADJUSTMENT SENSITIVITY
+# -----------------------------------------------------------------------------
+alpha_grid <- c(0.0, 0.1, 0.2, 0.219, 0.3, 0.4, 0.5)
+
+alpha_sens <- tibble(alpha_scanner = alpha_grid) %>%
+  mutate(
+    headline = map(alpha_scanner,
+                   ~ compute_all_aggregates(alpha_scanner = .,
+                                            n_mc = 1, seed = NULL)$headline),
+    eps_zhen_blended     = map_dbl(headline, "eps_zhen_blended"),
+    eps_hybrid_blended   = map_dbl(headline, "eps_hybrid_blended"),
+    eps_covwt_blended    = map_dbl(headline, "eps_covwt_blended"),
+    eps_oa_blended       = map_dbl(headline, "eps_oa_blended")
+  ) %>%
+  select(-headline)
+
+cat("\n=== Jeon adjustment sensitivity ===\n")
+cat("alpha_scanner = positive shift applied to scanner-based estimates.\n")
+cat("Default 0.219 comes from Jeon et al. (2023) per Luke, Tonsor & Schroeder.\n\n")
+print(alpha_sens %>% mutate(across(where(is.numeric), ~ round(.x, 3))))
+
+# -----------------------------------------------------------------------------
+# 9. SUMMARY
+# -----------------------------------------------------------------------------
+cat(sprintf("\n=== Summary of headline estimators (omega=%.2f, mu=%.2f, alpha=%.3f) ===\n",
+            OMEGA_ONLINE_DEFAULT, MU_ONLINE_DEFAULT, ALPHA_SCANNER_DEFAULT))
+for (i in seq_len(nrow(res$ci))) {
+  cat(sprintf("  %-20s %+.3f  [%+.3f, %+.3f]\n",
+              res$ci$estimator[i],
+              res$ci$point[i],
+              res$ci$ci_low_95[i],
+              res$ci$ci_up_95[i]))
+}
+
+cat("\nDone.\n")
